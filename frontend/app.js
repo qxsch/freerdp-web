@@ -30,21 +30,9 @@
     let isAudioPlaying = false;
     let isMuted = false;
     let audioGainNode = null;
-    
-    // H.264 video decoder state (WebCodecs API)
-    let videoDecoder = null;
-    let h264Initialized = false;
-    let pendingFrames = [];
-    let frameWidth = 0;
-    let frameHeight = 0;
 
     // Audio frame magic header: "AUDI" (0x41, 0x55, 0x44, 0x49)
     const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49];
-    
-    // H.264 frame magic header: "H264" (0x48, 0x32, 0x36, 0x34)
-    const H264_MAGIC = [0x48, 0x32, 0x36, 0x34];
-    const H264_KEYFRAME = 0x01;
-    const H264_DELTA = 0x02;
 
     // DOM Elements
     const elements = {
@@ -237,9 +225,6 @@
         
         // Cleanup audio
         cleanupAudio();
-        
-        // Cleanup H.264 decoder
-        cleanupH264Decoder();
     }
 
     /**
@@ -249,14 +234,6 @@
         // Binary data = frame update or audio
         if (event.data instanceof ArrayBuffer) {
             const bytes = new Uint8Array(event.data);
-            
-            // Check for H.264 frame magic header: "H264" (0x48, 0x32, 0x36, 0x34)
-            if (bytes.length > 13 &&
-                bytes[0] === H264_MAGIC[0] && bytes[1] === H264_MAGIC[1] &&
-                bytes[2] === H264_MAGIC[2] && bytes[3] === H264_MAGIC[3]) {
-                handleH264Frame(bytes);
-                return;
-            }
             
             // Check for audio frame magic header: "AUDI" (0x41, 0x55, 0x44, 0x49)
             if (bytes.length > 12 &&
@@ -474,188 +451,6 @@
         } catch (e) {
             console.error('[RDP Client] Failed to initialize audio:', e);
         }
-    }
-
-    /**
-     * Initialize H.264 video decoder using WebCodecs API
-     */
-    function initH264Decoder(width, height) {
-        // Check if WebCodecs is supported
-        if (typeof VideoDecoder === 'undefined') {
-            console.error('[RDP Client] WebCodecs API not supported in this browser');
-            return false;
-        }
-        
-        // Clean up existing decoder
-        if (videoDecoder) {
-            try {
-                videoDecoder.close();
-            } catch (e) {
-                // Ignore close errors
-            }
-        }
-        
-        frameWidth = width;
-        frameHeight = height;
-        
-        try {
-            videoDecoder = new VideoDecoder({
-                output: handleDecodedFrame,
-                error: (e) => {
-                    console.error('[RDP Client] H.264 decoder error:', e.message || e);
-                    h264Initialized = false;
-                    // Request keyframe on error to recover
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        sendMessage({ type: 'request_keyframe' });
-                    }
-                }
-            });
-            
-            // Configure for H.264 Baseline Profile Level 3.1
-            // Codec string format: avc1.PPCCLL (PP=profile, CC=constraints, LL=level)
-            // From SPS: 67 42 c0 1f -> profile=0x42, constraints=0xc0, level=0x1f
-            // So codec = avc1.42c01f
-            const codecString = 'avc1.42c01f';
-            console.log('[RDP Client] Configuring H.264 decoder with codec:', codecString);
-            
-            videoDecoder.configure({
-                codec: codecString,
-                codedWidth: width,
-                codedHeight: height,
-                hardwareAcceleration: 'prefer-hardware',
-                optimizeForLatency: true
-            });
-            
-            h264Initialized = true;
-            console.log('[RDP Client] H.264 decoder initialized:', width, 'x', height, 'state:', videoDecoder.state);
-            return true;
-            
-        } catch (e) {
-            console.error('[RDP Client] Failed to initialize H.264 decoder:', e);
-            h264Initialized = false;
-            return false;
-        }
-    }
-
-    /**
-     * Handle H.264 encoded frame from server
-     * Format: [H264 magic (4)] [frame_type (1)] [width (2)] [height (2)] [size (4)] [NAL data...]
-     */
-    function handleH264Frame(bytes) {
-        try {
-            // Parse header
-            const frameType = bytes[4];
-            const width = bytes[5] | (bytes[6] << 8);  // little-endian
-            const height = bytes[7] | (bytes[8] << 8);
-            const size = bytes[9] | (bytes[10] << 8) | (bytes[11] << 16) | (bytes[12] << 24);
-            
-            // Extract NAL data
-            const nalData = bytes.slice(13, 13 + size);
-            
-            if (nalData.length !== size) {
-                console.error('[RDP Client] H.264 frame size mismatch:', nalData.length, 'vs', size);
-                return;
-            }
-            
-            // Debug: log first few bytes of NAL data to verify format
-            const isKeyframe = frameType === H264_KEYFRAME;
-            if (isKeyframe || !h264Initialized) {
-                const preview = Array.from(nalData.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-                console.log('[RDP Client] H.264 frame:', size, 'bytes, keyframe:', isKeyframe, 'NAL start:', preview);
-            }
-            
-            // Initialize decoder if needed or dimensions changed
-            if (!h264Initialized || width !== frameWidth || height !== frameHeight) {
-                if (!initH264Decoder(width, height)) {
-                    console.error('[RDP Client] Cannot decode H.264 - decoder init failed');
-                    return;
-                }
-            }
-            
-            // Check decoder state
-            if (videoDecoder.state !== 'configured') {
-                console.warn('[RDP Client] Decoder not configured, state:', videoDecoder.state);
-                return;
-            }
-            
-            // Create EncodedVideoChunk
-            const chunk = new EncodedVideoChunk({
-                type: isKeyframe ? 'key' : 'delta',
-                timestamp: performance.now() * 1000,  // microseconds
-                data: nalData
-            });
-            
-            // Decode the frame
-            try {
-                videoDecoder.decode(chunk);
-            } catch (decodeError) {
-                console.error('[RDP Client] decode() threw:', decodeError);
-            }
-            
-        } catch (e) {
-            console.error('[RDP Client] H.264 frame handling error:', e);
-        }
-    }
-
-    /**
-     * Handle decoded video frame from WebCodecs
-     */
-    let decodedFrameCount = 0;
-    function handleDecodedFrame(frame) {
-        try {
-            decodedFrameCount++;
-            if (decodedFrameCount <= 10 || decodedFrameCount % 100 === 0) {
-                console.log('[RDP Client] Decoded frame #' + decodedFrameCount + ':', 
-                    frame.displayWidth + 'x' + frame.displayHeight,
-                    'canvas:', canvas.width + 'x' + canvas.height,
-                    'format:', frame.format, 'timestamp:', frame.timestamp);
-            }
-            
-            // Ensure canvas dimensions match
-            if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-                console.log('[RDP Client] Adjusting canvas size to match frame');
-                canvas.width = frame.displayWidth;
-                canvas.height = frame.displayHeight;
-            }
-            
-            // Draw frame to canvas at origin, using frame's native size
-            ctx.drawImage(frame, 0, 0);
-            
-            // Debug: Check if canvas has any non-black pixels on first few frames
-            if (decodedFrameCount <= 3) {
-                const imageData = ctx.getImageData(0, 0, 100, 100);
-                let nonBlack = 0;
-                for (let i = 0; i < imageData.data.length; i += 4) {
-                    if (imageData.data[i] > 5 || imageData.data[i+1] > 5 || imageData.data[i+2] > 5) {
-                        nonBlack++;
-                    }
-                }
-                console.log('[RDP Client] Canvas sample: non-black pixels in 100x100:', nonBlack);
-            }
-            
-            // Close the frame to release resources
-            frame.close();
-            
-        } catch (e) {
-            console.error('[RDP Client] Frame drawing error:', e);
-            frame.close();
-        }
-    }
-
-    /**
-     * Cleanup H.264 decoder
-     */
-    function cleanupH264Decoder() {
-        if (videoDecoder) {
-            try {
-                videoDecoder.close();
-            } catch (e) {
-                console.error('[RDP Client] Failed to initialize audio:', e);
-            }
-            videoDecoder = null;
-        }
-        h264Initialized = false;
-        pendingFrames = [];
     }
 
     /**
