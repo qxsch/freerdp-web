@@ -15,6 +15,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FREERDP3 REQUIRED freerdp3)
 pkg_check_modules(FREERDP_CLIENT3 REQUIRED freerdp-client3)
 pkg_check_modules(WINPR3 REQUIRED winpr3)
+pkg_check_modules(OPUS REQUIRED opus)
 
 # Create the shared library
 add_library(rdp_bridge SHARED
@@ -26,6 +27,7 @@ target_include_directories(rdp_bridge PRIVATE
     ${FREERDP3_INCLUDE_DIRS}
     ${FREERDP_CLIENT3_INCLUDE_DIRS}
     ${WINPR3_INCLUDE_DIRS}
+    ${OPUS_INCLUDE_DIRS}
 )
 
 # Link directories
@@ -33,6 +35,7 @@ target_link_directories(rdp_bridge PRIVATE
     ${FREERDP3_LIBRARY_DIRS}
     ${FREERDP_CLIENT3_LIBRARY_DIRS}
     ${WINPR3_LIBRARY_DIRS}
+    ${OPUS_LIBRARY_DIRS}
 )
 
 # Link libraries
@@ -40,6 +43,7 @@ target_link_libraries(rdp_bridge PRIVATE
     ${FREERDP3_LIBRARIES}
     ${FREERDP_CLIENT3_LIBRARIES}
     ${WINPR3_LIBRARIES}
+    ${OPUS_LIBRARIES}
     pthread
 )
 
@@ -48,6 +52,7 @@ target_compile_options(rdp_bridge PRIVATE
     ${FREERDP3_CFLAGS_OTHER}
     ${FREERDP_CLIENT3_CFLAGS_OTHER}
     ${WINPR3_CFLAGS_OTHER}
+    ${OPUS_CFLAGS_OTHER}
     -Wall
     -Wextra
     -O2

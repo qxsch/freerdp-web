@@ -64,6 +64,9 @@ RDP_STATE_ERROR = 3
 # Delta frame magic header
 DELTA_FRAME_MAGIC = b'DELT'
 
+# Audio frame magic header
+AUDIO_FRAME_MAGIC = b'AUDI'
+
 
 class RdpRect(Structure):
     """Dirty rectangle structure (matches C struct)"""
@@ -226,6 +229,20 @@ class NativeLibrary:
         # rdp_version
         lib.rdp_version.argtypes = []
         lib.rdp_version.restype = c_char_p
+        
+        # rdp_has_audio_data
+        lib.rdp_has_audio_data.argtypes = [c_void_p]
+        lib.rdp_has_audio_data.restype = c_bool
+        
+        # rdp_get_audio_format
+        lib.rdp_get_audio_format.argtypes = [
+            c_void_p, POINTER(c_int), POINTER(c_int), POINTER(c_int)
+        ]
+        lib.rdp_get_audio_format.restype = c_int
+        
+        # rdp_get_audio_data
+        lib.rdp_get_audio_data.argtypes = [c_void_p, POINTER(c_uint8), c_int]
+        lib.rdp_get_audio_data.restype = c_int
     
     def __getattr__(self, name):
         """Proxy attribute access to the underlying library"""
@@ -250,6 +267,7 @@ class RDPBridge:
         self._lib: Optional[NativeLibrary] = None
         self.running = False
         self._frame_task: Optional[asyncio.Task] = None
+        self._audio_task: Optional[asyncio.Task] = None
         self._frame_count = 0
         
         # Frame rate control
@@ -259,6 +277,10 @@ class RDPBridge:
         # WebP encoding settings
         self._webp_quality = 80  # 0-100, higher = better quality
         self._webp_method = 0   # 0-6, 0 = fastest
+        
+        # Audio settings
+        self._audio_enabled = True
+        self._audio_buffer_size = 8192  # PCM buffer size for reading
     
     async def connect(self) -> bool:
         """Connect to the RDP server"""
@@ -307,6 +329,10 @@ class RDPBridge:
             
             # Start frame streaming
             self._frame_task = asyncio.create_task(self._stream_frames())
+            
+            # Start audio streaming
+            if self._audio_enabled:
+                self._audio_task = asyncio.create_task(self._stream_audio())
             
             return True
             
@@ -510,6 +536,81 @@ class RDPBridge:
         except Exception as e:
             logger.error(f"Delta frame encoding error: {e}")
     
+    async def _stream_audio(self):
+        """Stream audio by capturing from PulseAudio's null sink monitor"""
+        logger.info("Starting audio streaming from PulseAudio monitor")
+        
+        # Audio format settings
+        sample_rate = 48000
+        channels = 2
+        bits = 16
+        
+        # Frame size: 50ms of audio at 48kHz stereo 16-bit = 9600 bytes
+        # Larger frames = fewer packets = smoother playback
+        frame_size = int(sample_rate * channels * (bits // 8) * 0.05)
+        
+        try:
+            # Use parec to capture from the null sink's monitor
+            # The monitor source is named "virtual_sink.monitor"
+            process = await asyncio.create_subprocess_exec(
+                'parec',
+                '--rate', str(sample_rate),
+                '--channels', str(channels),
+                '--format', 's16le',
+                '--device', 'virtual_sink.monitor',
+                '--raw',
+                '--latency-msec', '50',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            
+            logger.info("parec process started for audio capture")
+            
+            while self.running and process.returncode is None:
+                try:
+                    # Read a frame of audio data
+                    audio_data = await asyncio.wait_for(
+                        process.stdout.read(frame_size),
+                        timeout=0.2
+                    )
+                    
+                    if audio_data and len(audio_data) > 0:
+                        # Quick silence check using sum of absolute values
+                        # This is faster than iterating byte by byte
+                        is_silent = sum(audio_data[:200:2]) == 0
+                        
+                        if not is_silent:
+                            # Send audio packet
+                            # Format: [AUDI magic (4)] [sample_rate (4)] [channels (2)] [bits (2)] [PCM data...]
+                            message = io.BytesIO()
+                            message.write(AUDIO_FRAME_MAGIC)
+                            message.write(struct.pack('<I', sample_rate))
+                            message.write(struct.pack('<H', channels))
+                            message.write(struct.pack('<H', bits))
+                            message.write(audio_data)
+                            
+                            await self.websocket.send(message.getvalue())
+                    
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Audio read error: {e}")
+                    await asyncio.sleep(0.1)
+            
+            # Clean up process
+            if process.returncode is None:
+                process.terminate()
+                await process.wait()
+                
+        except FileNotFoundError:
+            logger.warning("parec not found - audio capture disabled")
+        except Exception as e:
+            logger.error(f"Audio streaming error: {e}")
+        
+        logger.info("Audio streaming ended")
+    
     async def disconnect(self):
         """Disconnect from the RDP server"""
         self.running = False
@@ -518,6 +619,13 @@ class RDPBridge:
             self._frame_task.cancel()
             try:
                 await self._frame_task
+            except asyncio.CancelledError:
+                pass
+        
+        if self._audio_task:
+            self._audio_task.cancel()
+            try:
+                await self._audio_task
             except asyncio.CancelledError:
                 pass
         

@@ -23,6 +23,28 @@
     let pingStart = 0;
     let resizeTimeout = null;
     let pendingResize = false;
+    
+    // Audio state
+    let audioContext = null;
+    let audioQueue = [];
+    let isAudioPlaying = false;
+    let isMuted = false;
+    let audioGainNode = null;
+    
+    // H.264 video decoder state (WebCodecs API)
+    let videoDecoder = null;
+    let h264Initialized = false;
+    let pendingFrames = [];
+    let frameWidth = 0;
+    let frameHeight = 0;
+
+    // Audio frame magic header: "AUDI" (0x41, 0x55, 0x44, 0x49)
+    const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49];
+    
+    // H.264 frame magic header: "H264" (0x48, 0x32, 0x36, 0x34)
+    const H264_MAGIC = [0x48, 0x32, 0x36, 0x34];
+    const H264_KEYFRAME = 0x01;
+    const H264_DELTA = 0x02;
 
     // DOM Elements
     const elements = {
@@ -33,6 +55,7 @@
         statusText: document.getElementById('statusText'),
         connectBtn: document.getElementById('connectBtn'),
         disconnectBtn: document.getElementById('disconnectBtn'),
+        muteBtn: document.getElementById('muteBtn'),
         fullscreenBtn: document.getElementById('fullscreenBtn'),
         connectModal: document.getElementById('connectModal'),
         modalConnectBtn: document.getElementById('modalConnectBtn'),
@@ -63,6 +86,7 @@
         // UI Controls
         elements.connectBtn.addEventListener('click', showConnectModal);
         elements.disconnectBtn.addEventListener('click', disconnect);
+        elements.muteBtn.addEventListener('click', toggleMute);
         elements.fullscreenBtn.addEventListener('click', toggleFullscreen);
         elements.modalConnectBtn.addEventListener('click', handleConnect);
         elements.modalCancelBtn.addEventListener('click', hideConnectModal);
@@ -209,14 +233,39 @@
         elements.loading.querySelector('p').textContent = 'Click Connect to start';
         elements.connectBtn.disabled = false;
         elements.disconnectBtn.disabled = true;
+        elements.muteBtn.disabled = true;
+        
+        // Cleanup audio
+        cleanupAudio();
+        
+        // Cleanup H.264 decoder
+        cleanupH264Decoder();
     }
 
     /**
      * Handle incoming WebSocket messages
      */
     function handleMessage(event) {
-        // Binary data = frame update
+        // Binary data = frame update or audio
         if (event.data instanceof ArrayBuffer) {
+            const bytes = new Uint8Array(event.data);
+            
+            // Check for H.264 frame magic header: "H264" (0x48, 0x32, 0x36, 0x34)
+            if (bytes.length > 13 &&
+                bytes[0] === H264_MAGIC[0] && bytes[1] === H264_MAGIC[1] &&
+                bytes[2] === H264_MAGIC[2] && bytes[3] === H264_MAGIC[3]) {
+                handleH264Frame(bytes);
+                return;
+            }
+            
+            // Check for audio frame magic header: "AUDI" (0x41, 0x55, 0x44, 0x49)
+            if (bytes.length > 12 &&
+                bytes[0] === AUDIO_MAGIC[0] && bytes[1] === AUDIO_MAGIC[1] &&
+                bytes[2] === AUDIO_MAGIC[2] && bytes[3] === AUDIO_MAGIC[3]) {
+                handleAudioFrame(bytes);
+                return;
+            }
+            
             handleFrameUpdate(event.data);
             return;
         }
@@ -263,7 +312,11 @@
         elements.loading.style.display = 'none';
         elements.connectBtn.disabled = true;
         elements.disconnectBtn.disabled = false;
+        elements.muteBtn.disabled = false;
         canvas.focus();
+        
+        // Initialize audio on first user interaction (required by browsers)
+        initAudio();
 
         if (msg.width && msg.height) {
             handleResize(msg.width, msg.height);
@@ -404,6 +457,327 @@
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         };
         img.src = 'data:image/jpeg;base64,' + base64Data;
+    }
+
+    /**
+     * Initialize audio context (must be called after user interaction)
+     */
+    function initAudio() {
+        if (audioContext) return;
+        
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            audioGainNode = audioContext.createGain();
+            audioGainNode.connect(audioContext.destination);
+            audioGainNode.gain.value = isMuted ? 0 : 1;
+            console.log('[RDP Client] Audio context initialized:', audioContext.sampleRate, 'Hz');
+        } catch (e) {
+            console.error('[RDP Client] Failed to initialize audio:', e);
+        }
+    }
+
+    /**
+     * Initialize H.264 video decoder using WebCodecs API
+     */
+    function initH264Decoder(width, height) {
+        // Check if WebCodecs is supported
+        if (typeof VideoDecoder === 'undefined') {
+            console.error('[RDP Client] WebCodecs API not supported in this browser');
+            return false;
+        }
+        
+        // Clean up existing decoder
+        if (videoDecoder) {
+            try {
+                videoDecoder.close();
+            } catch (e) {
+                // Ignore close errors
+            }
+        }
+        
+        frameWidth = width;
+        frameHeight = height;
+        
+        try {
+            videoDecoder = new VideoDecoder({
+                output: handleDecodedFrame,
+                error: (e) => {
+                    console.error('[RDP Client] H.264 decoder error:', e.message || e);
+                    h264Initialized = false;
+                    // Request keyframe on error to recover
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        sendMessage({ type: 'request_keyframe' });
+                    }
+                }
+            });
+            
+            // Configure for H.264 Baseline Profile Level 3.1
+            // Codec string format: avc1.PPCCLL (PP=profile, CC=constraints, LL=level)
+            // From SPS: 67 42 c0 1f -> profile=0x42, constraints=0xc0, level=0x1f
+            // So codec = avc1.42c01f
+            const codecString = 'avc1.42c01f';
+            console.log('[RDP Client] Configuring H.264 decoder with codec:', codecString);
+            
+            videoDecoder.configure({
+                codec: codecString,
+                codedWidth: width,
+                codedHeight: height,
+                hardwareAcceleration: 'prefer-hardware',
+                optimizeForLatency: true
+            });
+            
+            h264Initialized = true;
+            console.log('[RDP Client] H.264 decoder initialized:', width, 'x', height, 'state:', videoDecoder.state);
+            return true;
+            
+        } catch (e) {
+            console.error('[RDP Client] Failed to initialize H.264 decoder:', e);
+            h264Initialized = false;
+            return false;
+        }
+    }
+
+    /**
+     * Handle H.264 encoded frame from server
+     * Format: [H264 magic (4)] [frame_type (1)] [width (2)] [height (2)] [size (4)] [NAL data...]
+     */
+    function handleH264Frame(bytes) {
+        try {
+            // Parse header
+            const frameType = bytes[4];
+            const width = bytes[5] | (bytes[6] << 8);  // little-endian
+            const height = bytes[7] | (bytes[8] << 8);
+            const size = bytes[9] | (bytes[10] << 8) | (bytes[11] << 16) | (bytes[12] << 24);
+            
+            // Extract NAL data
+            const nalData = bytes.slice(13, 13 + size);
+            
+            if (nalData.length !== size) {
+                console.error('[RDP Client] H.264 frame size mismatch:', nalData.length, 'vs', size);
+                return;
+            }
+            
+            // Debug: log first few bytes of NAL data to verify format
+            const isKeyframe = frameType === H264_KEYFRAME;
+            if (isKeyframe || !h264Initialized) {
+                const preview = Array.from(nalData.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+                console.log('[RDP Client] H.264 frame:', size, 'bytes, keyframe:', isKeyframe, 'NAL start:', preview);
+            }
+            
+            // Initialize decoder if needed or dimensions changed
+            if (!h264Initialized || width !== frameWidth || height !== frameHeight) {
+                if (!initH264Decoder(width, height)) {
+                    console.error('[RDP Client] Cannot decode H.264 - decoder init failed');
+                    return;
+                }
+            }
+            
+            // Check decoder state
+            if (videoDecoder.state !== 'configured') {
+                console.warn('[RDP Client] Decoder not configured, state:', videoDecoder.state);
+                return;
+            }
+            
+            // Create EncodedVideoChunk
+            const chunk = new EncodedVideoChunk({
+                type: isKeyframe ? 'key' : 'delta',
+                timestamp: performance.now() * 1000,  // microseconds
+                data: nalData
+            });
+            
+            // Decode the frame
+            try {
+                videoDecoder.decode(chunk);
+            } catch (decodeError) {
+                console.error('[RDP Client] decode() threw:', decodeError);
+            }
+            
+        } catch (e) {
+            console.error('[RDP Client] H.264 frame handling error:', e);
+        }
+    }
+
+    /**
+     * Handle decoded video frame from WebCodecs
+     */
+    let decodedFrameCount = 0;
+    function handleDecodedFrame(frame) {
+        try {
+            decodedFrameCount++;
+            if (decodedFrameCount <= 10 || decodedFrameCount % 100 === 0) {
+                console.log('[RDP Client] Decoded frame #' + decodedFrameCount + ':', 
+                    frame.displayWidth + 'x' + frame.displayHeight,
+                    'canvas:', canvas.width + 'x' + canvas.height,
+                    'format:', frame.format, 'timestamp:', frame.timestamp);
+            }
+            
+            // Ensure canvas dimensions match
+            if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+                console.log('[RDP Client] Adjusting canvas size to match frame');
+                canvas.width = frame.displayWidth;
+                canvas.height = frame.displayHeight;
+            }
+            
+            // Draw frame to canvas at origin, using frame's native size
+            ctx.drawImage(frame, 0, 0);
+            
+            // Debug: Check if canvas has any non-black pixels on first few frames
+            if (decodedFrameCount <= 3) {
+                const imageData = ctx.getImageData(0, 0, 100, 100);
+                let nonBlack = 0;
+                for (let i = 0; i < imageData.data.length; i += 4) {
+                    if (imageData.data[i] > 5 || imageData.data[i+1] > 5 || imageData.data[i+2] > 5) {
+                        nonBlack++;
+                    }
+                }
+                console.log('[RDP Client] Canvas sample: non-black pixels in 100x100:', nonBlack);
+            }
+            
+            // Close the frame to release resources
+            frame.close();
+            
+        } catch (e) {
+            console.error('[RDP Client] Frame drawing error:', e);
+            frame.close();
+        }
+    }
+
+    /**
+     * Cleanup H.264 decoder
+     */
+    function cleanupH264Decoder() {
+        if (videoDecoder) {
+            try {
+                videoDecoder.close();
+            } catch (e) {
+                console.error('[RDP Client] Failed to initialize audio:', e);
+            }
+            videoDecoder = null;
+        }
+        h264Initialized = false;
+        pendingFrames = [];
+    }
+
+    /**
+     * Handle audio frame from server
+     * Format: [AUDI magic (4)] [sample_rate (4)] [channels (2)] [bits (2)] [PCM data...]
+     */
+    function handleAudioFrame(bytes) {
+        if (!audioContext || isMuted) return;
+        
+        try {
+            // Resume audio context if suspended (browser autoplay policy)
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+            
+            // Parse header
+            const dataView = new DataView(bytes.buffer, bytes.byteOffset);
+            const sampleRate = dataView.getUint32(4, true);  // little-endian
+            const channels = dataView.getUint16(8, true);
+            const bits = dataView.getUint16(10, true);
+            
+            // Extract PCM data
+            const pcmData = bytes.slice(12);
+            
+            if (pcmData.length === 0) return;
+            
+            // Convert PCM to AudioBuffer
+            const bytesPerSample = bits / 8;
+            const numSamples = Math.floor(pcmData.length / (channels * bytesPerSample));
+            
+            if (numSamples === 0) return;
+            
+            // Create audio buffer at source sample rate
+            const audioBuffer = audioContext.createBuffer(channels, numSamples, sampleRate);
+            
+            // Convert PCM bytes to float samples
+            for (let ch = 0; ch < channels; ch++) {
+                const channelData = audioBuffer.getChannelData(ch);
+                
+                for (let i = 0; i < numSamples; i++) {
+                    const sampleIndex = i * channels + ch;
+                    const byteOffset = sampleIndex * bytesPerSample;
+                    
+                    let sample;
+                    if (bits === 16) {
+                        // 16-bit signed PCM (little-endian)
+                        const int16 = pcmData[byteOffset] | (pcmData[byteOffset + 1] << 8);
+                        sample = int16 > 32767 ? (int16 - 65536) / 32768 : int16 / 32768;
+                    } else if (bits === 8) {
+                        // 8-bit unsigned PCM
+                        sample = (pcmData[byteOffset] - 128) / 128;
+                    } else {
+                        sample = 0;
+                    }
+                    
+                    channelData[i] = sample;
+                }
+            }
+            
+            // Queue audio for playback
+            queueAudioBuffer(audioBuffer);
+            
+        } catch (e) {
+            console.error('[RDP Client] Audio frame error:', e);
+        }
+    }
+
+    /**
+     * Queue audio buffer for playback with minimal latency
+     */
+    function queueAudioBuffer(audioBuffer) {
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioGainNode);
+        
+        // Calculate when to start this buffer
+        const currentTime = audioContext.currentTime;
+        const bufferDuration = audioBuffer.duration;
+        
+        // Clean up finished buffers first
+        audioQueue = audioQueue.filter(item => item.endTime > currentTime);
+        
+        // Calculate start time for new buffer
+        const lastEndTime = audioQueue.length > 0 
+            ? Math.max(...audioQueue.map(item => item.endTime))
+            : currentTime;
+        
+        // Add small buffer time on first packet to prevent underruns
+        const bufferDelay = audioQueue.length === 0 ? 0.1 : 0;
+        
+        // Limit queue size to prevent latency buildup (allow up to 500ms)
+        if (audioQueue.length < 10) {
+            const startTime = Math.max(currentTime + bufferDelay, lastEndTime);
+            source.start(startTime);
+            audioQueue.push({ endTime: startTime + bufferDuration });
+        }
+    }
+
+    /**
+     * Toggle audio mute
+     */
+    function toggleMute() {
+        isMuted = !isMuted;
+        
+        if (audioGainNode) {
+            audioGainNode.gain.value = isMuted ? 0 : 1;
+        }
+        
+        elements.muteBtn.textContent = isMuted ? '🔇' : '🔊';
+        console.log('[RDP Client] Audio', isMuted ? 'muted' : 'unmuted');
+    }
+
+    /**
+     * Cleanup audio resources
+     */
+    function cleanupAudio() {
+        audioQueue = [];
+        if (audioContext) {
+            audioContext.close();
+            audioContext = null;
+            audioGainNode = null;
+        }
     }
 
     /**

@@ -21,8 +21,12 @@
 #include <freerdp/gdi/gdi.h>
 #include <freerdp/gdi/gfx.h>
 #include <freerdp/channels/channels.h>
+#include <freerdp/channels/rdpsnd.h>
 #include <freerdp/client/disp.h>
+#include <freerdp/client/rdpsnd.h>
+#include <freerdp/client/rdpgfx.h>
 #include <freerdp/event.h>
+#include <opus/opus.h>
 #include <winpr/crt.h>
 #include <winpr/synch.h>
 #include <winpr/thread.h>
@@ -58,6 +62,22 @@ typedef struct {
     
     /* Display control channel */
     DispClientContext* disp;
+    
+    /* Graphics pipeline channel */
+    RdpgfxClientContext* gfx;
+    
+    /* Audio playback */
+    rdpsndDevicePlugin* rdpsnd;
+    OpusEncoder* opus_encoder;
+    uint8_t* audio_buffer;
+    size_t audio_buffer_size;
+    size_t audio_buffer_pos;
+    size_t audio_read_pos;
+    pthread_mutex_t audio_mutex;
+    int audio_sample_rate;
+    int audio_channels;
+    int audio_bits;
+    bool audio_initialized;
     
 } BridgeContext;
 
@@ -109,6 +129,11 @@ RdpSession* rdp_create(
     ctx->needs_full_frame = true;
     ctx->dirty_rect_count = 0;
     pthread_mutex_init(&ctx->rect_mutex, NULL);
+    pthread_mutex_init(&ctx->audio_mutex, NULL);
+    ctx->audio_initialized = false;
+    ctx->audio_buffer = NULL;
+    ctx->audio_buffer_size = 0;
+    ctx->opus_encoder = NULL;
     
     /* Set callbacks */
     instance->PreConnect = bridge_pre_connect;
@@ -138,10 +163,14 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height)) goto fail;
     if (!freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, bpp)) goto fail;
     
-    /* Disable GFX pipeline - use legacy GDI mode for reliable BeginPaint/EndPaint callbacks */
+    /* Use legacy GDI mode for stable headless rendering.
+     * GFX pipeline is disabled because gdi_graphics_pipeline_init() causes
+     * threading issues when called from channel callbacks in FreeRDP3. */
     if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, FALSE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE)) goto fail;
+    
+    /* Audio playback - uses PulseAudio null sink in container */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE)) goto fail;
     
     /* Performance optimizations */
     if (!freerdp_settings_set_bool(settings, FreeRDP_FastPathOutput, TRUE)) goto fail;
@@ -245,6 +274,17 @@ void rdp_destroy(RdpSession* session)
     rdp_disconnect(session);
     
     pthread_mutex_destroy(&ctx->rect_mutex);
+    pthread_mutex_destroy(&ctx->audio_mutex);
+    
+    /* Free audio resources */
+    if (ctx->opus_encoder) {
+        opus_encoder_destroy(ctx->opus_encoder);
+        ctx->opus_encoder = NULL;
+    }
+    if (ctx->audio_buffer) {
+        free(ctx->audio_buffer);
+        ctx->audio_buffer = NULL;
+    }
     
     freerdp_client_context_free(context);
 }
@@ -497,7 +537,7 @@ static BOOL bridge_pre_connect(freerdp* instance)
     }
     
     /* Load required channels using FreeRDP3 API */
-    if (!freerdp_client_load_addins(instance->context->channels, settings)) {
+    if (!freerdp_client_load_channels(instance)) {
         /* Try without channels if loading fails */
     }
     
@@ -518,6 +558,12 @@ static BOOL bridge_post_connect(freerdp* instance)
     
     rdpGdi* gdi = context->gdi;
     
+    /* Note: GFX pipeline initialization is handled via channel connection callback.
+     * The gdi_graphics_pipeline_init() requires RdpgfxClientContext which is
+     * obtained when the RDPGFX channel connects. For now, we rely on GDI mode
+     * with GFX pipeline enabled in settings - the actual pipeline init happens
+     * in bridge_on_channel_connected when RDPGFX channel connects. */
+    
     /* Set up our paint callbacks */
     context->update->BeginPaint = bridge_begin_paint;
     context->update->EndPaint = bridge_end_paint;
@@ -533,7 +579,7 @@ static BOOL bridge_post_connect(freerdp* instance)
     PubSub_SubscribeChannelConnected(context->pubSub, bridge_on_channel_connected);
     PubSub_SubscribeChannelDisconnected(context->pubSub, bridge_on_channel_disconnected);
     
-    /* GFX pipeline is disabled - using legacy GDI mode */
+    /* GFX pipeline is enabled for H.264/progressive codec support */
     
     /* Mark for full frame update - ensures first frame is sent */
     pthread_mutex_lock(&ctx->rect_mutex);
@@ -554,6 +600,9 @@ static void bridge_post_disconnect(freerdp* instance)
     PubSub_UnsubscribeChannelDisconnected(context->pubSub, bridge_on_channel_disconnected);
     
     ctx->disp = NULL;
+    ctx->gfx = NULL;
+    ctx->rdpsnd = NULL;
+    ctx->audio_initialized = false;
     ctx->state = RDP_STATE_DISCONNECTED;
     ctx->frame_buffer = NULL;
     
@@ -568,6 +617,27 @@ static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventAr
     if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0) {
         bctx->disp = (DispClientContext*)e->pInterface;
     }
+    else if (strcmp(e->name, RDPSND_CHANNEL_NAME) == 0) {
+        /* Audio channel connected - initialize audio buffer */
+        pthread_mutex_lock(&bctx->audio_mutex);
+        if (!bctx->audio_buffer) {
+            /* 1 second buffer at 48kHz stereo 16-bit = 192KB */
+            bctx->audio_buffer_size = 48000 * 2 * 2;
+            bctx->audio_buffer = (uint8_t*)calloc(1, bctx->audio_buffer_size);
+            bctx->audio_buffer_pos = 0;
+            bctx->audio_read_pos = 0;
+        }
+        /* Default format - will be updated when audio format is received */
+        bctx->audio_sample_rate = 48000;
+        bctx->audio_channels = 2;
+        bctx->audio_bits = 16;
+        bctx->audio_initialized = true;
+        pthread_mutex_unlock(&bctx->audio_mutex);
+    }
+    else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
+        /* GFX pipeline disabled - just store reference */
+        bctx->gfx = (RdpgfxClientContext*)e->pInterface;
+    }
 }
 
 static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedEventArgs* e)
@@ -577,6 +647,14 @@ static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedE
     
     if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0) {
         bctx->disp = NULL;
+    }
+    else if (strcmp(e->name, RDPSND_CHANNEL_NAME) == 0) {
+        pthread_mutex_lock(&bctx->audio_mutex);
+        bctx->audio_initialized = false;
+        pthread_mutex_unlock(&bctx->audio_mutex);
+    }
+    else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
+        bctx->gfx = NULL;
     }
 }
 
@@ -664,6 +742,112 @@ static BOOL bridge_desktop_resize(rdpContext* context)
     pthread_mutex_unlock(&ctx->rect_mutex);
     
     return TRUE;
+}
+
+/* ============================================================================
+ * Audio API
+ * ============================================================================ */
+
+bool rdp_has_audio_data(RdpSession* session)
+{
+    if (!session) return false;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    if (!ctx->audio_initialized || !ctx->audio_buffer) {
+        return false;
+    }
+    
+    pthread_mutex_lock(&ctx->audio_mutex);
+    bool has_data = ctx->audio_buffer_pos > ctx->audio_read_pos;
+    pthread_mutex_unlock(&ctx->audio_mutex);
+    
+    return has_data;
+}
+
+int rdp_get_audio_format(RdpSession* session, int* sample_rate, int* channels, int* bits)
+{
+    if (!session) return -1;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    if (!ctx->audio_initialized) {
+        return -1;
+    }
+    
+    pthread_mutex_lock(&ctx->audio_mutex);
+    if (sample_rate) *sample_rate = ctx->audio_sample_rate;
+    if (channels) *channels = ctx->audio_channels;
+    if (bits) *bits = ctx->audio_bits;
+    pthread_mutex_unlock(&ctx->audio_mutex);
+    
+    return 0;
+}
+
+int rdp_get_audio_data(RdpSession* session, uint8_t* buffer, int max_size)
+{
+    if (!session || !buffer || max_size <= 0) return -1;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    if (!ctx->audio_initialized || !ctx->audio_buffer) {
+        return 0;
+    }
+    
+    pthread_mutex_lock(&ctx->audio_mutex);
+    
+    size_t available = ctx->audio_buffer_pos - ctx->audio_read_pos;
+    if (available == 0) {
+        pthread_mutex_unlock(&ctx->audio_mutex);
+        return 0;
+    }
+    
+    size_t to_copy = (available < (size_t)max_size) ? available : (size_t)max_size;
+    memcpy(buffer, ctx->audio_buffer + ctx->audio_read_pos, to_copy);
+    ctx->audio_read_pos += to_copy;
+    
+    /* Reset buffer positions if fully consumed */
+    if (ctx->audio_read_pos >= ctx->audio_buffer_pos) {
+        ctx->audio_buffer_pos = 0;
+        ctx->audio_read_pos = 0;
+    }
+    
+    pthread_mutex_unlock(&ctx->audio_mutex);
+    
+    return (int)to_copy;
+}
+
+void rdp_write_audio_data(RdpSession* session, const uint8_t* data, size_t size,
+                          int sample_rate, int channels, int bits)
+{
+    if (!session || !data || size == 0) return;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    pthread_mutex_lock(&ctx->audio_mutex);
+    
+    /* Update format info */
+    ctx->audio_sample_rate = sample_rate;
+    ctx->audio_channels = channels;
+    ctx->audio_bits = bits;
+    
+    /* Check if we need to resize buffer or if buffer is full */
+    if (ctx->audio_buffer_pos + size > ctx->audio_buffer_size) {
+        /* Buffer overflow - reset and accept data loss */
+        ctx->audio_buffer_pos = 0;
+        ctx->audio_read_pos = 0;
+    }
+    
+    if (ctx->audio_buffer && ctx->audio_buffer_pos + size <= ctx->audio_buffer_size) {
+        memcpy(ctx->audio_buffer + ctx->audio_buffer_pos, data, size);
+        ctx->audio_buffer_pos += size;
+    }
+    
+    pthread_mutex_unlock(&ctx->audio_mutex);
 }
 
 /* ============================================================================

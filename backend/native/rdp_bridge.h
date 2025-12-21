@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -194,6 +195,50 @@ void rdp_send_unicode(RdpSession* session, uint16_t flags, uint16_t code);
  * @return          0 on success, negative on error
  */
 int rdp_resize(RdpSession* session, uint32_t width, uint32_t height);
+
+/**
+ * Check if audio data is available
+ * 
+ * @param session   Session handle
+ * @return          true if audio data is available
+ */
+bool rdp_has_audio_data(RdpSession* session);
+
+/**
+ * Get the current audio format
+ * 
+ * @param session       Session handle
+ * @param sample_rate   Output: sample rate in Hz (e.g., 48000)
+ * @param channels      Output: number of channels (1=mono, 2=stereo)
+ * @param bits          Output: bits per sample (8, 16, or 32)
+ * @return              0 on success, negative if audio not initialized
+ */
+int rdp_get_audio_format(RdpSession* session, int* sample_rate, int* channels, int* bits);
+
+/**
+ * Get available audio data
+ * 
+ * Reads PCM audio data from the internal buffer.
+ * 
+ * @param session   Session handle
+ * @param buffer    Output buffer for audio data
+ * @param max_size  Maximum bytes to read
+ * @return          Number of bytes read, 0 if no data, negative on error
+ */
+int rdp_get_audio_data(RdpSession* session, uint8_t* buffer, int max_size);
+
+/**
+ * Write audio data to the buffer (internal use by rdpsnd callback)
+ * 
+ * @param session       Session handle
+ * @param data          Audio PCM data
+ * @param size          Size in bytes
+ * @param sample_rate   Sample rate in Hz
+ * @param channels      Number of channels
+ * @param bits          Bits per sample
+ */
+void rdp_write_audio_data(RdpSession* session, const uint8_t* data, size_t size,
+                          int sample_rate, int channels, int bits);
 
 /**
  * Disconnect from the RDP server

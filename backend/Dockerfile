@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwinpr3-dev \
     zlib1g-dev \
     libssl-dev \
+    libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy native source code
@@ -47,6 +48,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfreerdp-client3-3 \
     libwinpr3-3 \
     libwebp7 \
+    libopus0 \
+    pulseaudio \
+    pulseaudio-utils \
+    libasound2t64 \
+    libasound2-plugins \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -84,7 +90,21 @@ COPY .env.example .env.example
 RUN cp -n .env.example .env 2>/dev/null || true
 
 # Set library path
-ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# Configure PulseAudio for headless operation with null sink
+RUN mkdir -p /run/pulse /var/run/pulse ~/.config/pulse && \
+    echo 'load-module module-null-sink sink_name=virtual_sink sink_properties=device.description="Virtual_Sink"' > /etc/pulse/default.pa.d/virtual-sink.pa && \
+    echo 'set-default-sink virtual_sink' >> /etc/pulse/default.pa.d/virtual-sink.pa && \
+    echo 'autospawn = no' > ~/.config/pulse/client.conf && \
+    echo 'daemon-binary = /bin/true' >> ~/.config/pulse/client.conf
+
+# Create startup script that runs PulseAudio then the server
+RUN echo '#!/bin/bash\n\
+rm -rf /run/pulse/* /var/run/pulse/* 2>/dev/null\n\
+pulseaudio --daemonize --disallow-exit --exit-idle-time=-1 --system=false --log-level=error 2>/dev/null || true\n\
+sleep 1\n\
+exec python server.py' > /app/start.sh && chmod +x /app/start.sh
 
 # Expose WebSocket port
 EXPOSE 8765
@@ -93,5 +113,5 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python3 -c "import socket; s=socket.socket(); s.connect(('127.0.0.1', 8765)); s.close()" || exit 1
 
-# Run the server
-CMD ["python", "server.py"]
+# Run the server with PulseAudio
+CMD ["/bin/bash", "/app/start.sh"]
