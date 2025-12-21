@@ -209,6 +209,3 @@ The backend exposes `/health` endpoint. Test with:
 curl http://localhost:8765/health
 ```
 
-## License
-
-MIT
