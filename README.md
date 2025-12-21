@@ -202,6 +202,7 @@ The native library wasn't built or installed. Use Docker which handles this auto
 - The native library uses WebP compression for bandwidth efficiency
 - Delta frame updates reduce data transfer for static screens
 - Check network connectivity between backend and VM
+- Not yet optimized for video playback scenarios (e.g. YouTube), but GFX integration is planned
 
 ### Container health check failing
 The backend exposes `/health` endpoint. Test with:
