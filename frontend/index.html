@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remote Desktop Client</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .header {
+            background: #16213e;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            border-bottom: 1px solid #0f3460;
+        }
+
+        .header h1 {
+            font-size: 1.2rem;
+            font-weight: 500;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ff6b6b;
+            transition: background 0.3s;
+        }
+
+        .status-dot.connected {
+            background: #51cf66;
+        }
+
+        .controls {
+            margin-left: auto;
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            background: #0f3460;
+            border: none;
+            color: #eee;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: background 0.2s;
+        }
+
+        .btn:hover {
+            background: #1a4a7a;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .main-container {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: stretch; /* Stretch children to fill height */
+            padding: 20px;
+            overflow: hidden;
+            min-height: 0; /* Allow flex child to shrink below content size */
+        }
+
+        #vmScreen {
+            background: #000;
+            border: 2px solid #0f3460;
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+            /* Fill available space */
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        #vmScreen canvas {
+            display: block;
+        }
+
+        #vmScreen .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+        }
+
+        #vmScreen .loading .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid #333;
+            border-top-color: #51cf66;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .footer {
+            background: #16213e;
+            padding: 10px 20px;
+            font-size: 0.8rem;
+            color: #888;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: #16213e;
+            padding: 30px;
+            border-radius: 8px;
+            max-width: 400px;
+            width: 90%;
+        }
+
+        .modal-content h2 {
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9rem;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            background: #1a1a2e;
+            color: #eee;
+            font-size: 1rem;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #51cf66;
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>🖥️ Remote Desktop Client</h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Disconnected</span>
+        </div>
+        <div class="controls">
+            <button class="btn" id="connectBtn">Connect</button>
+            <button class="btn" id="disconnectBtn" disabled>Disconnect</button>
+            <button class="btn" id="fullscreenBtn">Fullscreen</button>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <div id="vmScreen">
+            <div class="loading" id="loadingIndicator">
+                <div class="spinner"></div>
+                <p>Click Connect to start</p>
+            </div>
+            <canvas id="rdpCanvas" width="1280" height="720" style="display: none;"></canvas>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span id="resolution">Resolution: 1280x720</span>
+        <span id="latency">Latency: --</span>
+    </footer>
+
+    <!-- Connection Modal -->
+    <div class="modal" id="connectModal">
+        <div class="modal-content">
+            <h2>Connect to VM</h2>
+            <div class="form-group">
+                <label for="vmHost">VM Host</label>
+                <input type="text" id="vmHost" placeholder="192.168.1.100" value="">
+            </div>
+            <div class="form-group">
+                <label for="vmPort">RDP Port</label>
+                <input type="number" id="vmPort" placeholder="3389" value="3389">
+            </div>
+            <div class="form-group">
+                <label for="vmUser">Username</label>
+                <input type="text" id="vmUser" placeholder="Administrator" value="">
+            </div>
+            <div class="form-group">
+                <label for="vmPass">Password</label>
+                <input type="password" id="vmPass" placeholder="Password" value="">
+            </div>
+            <div style="display: flex; gap: 10px; margin-top: 20px;">
+                <button class="btn" id="modalConnectBtn" style="flex: 1; background: #51cf66;">Connect</button>
+                <button class="btn" id="modalCancelBtn" style="flex: 1;">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

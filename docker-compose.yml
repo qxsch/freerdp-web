@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rdp-backend
+    ports:
+      - "8765:8765"
+    environment:
+      - WS_HOST=0.0.0.0
+      - WS_PORT=8765
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rdp-frontend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - backend
+    restart: unless-stopped
