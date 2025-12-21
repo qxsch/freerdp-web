@@ -28,6 +28,13 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 🩺 Health check endpoint (`/health`)
 - 🐳 Docker support with multi-stage builds
 
+## Todo (Best Effort)
+- GDX pipeline integration for better graphics performance
+- Clipboard support (copy/paste)
+- Audio redirection
+- File transfer support
+- Better JS API
+
 ## Tech Stack
 
 ### Backend
