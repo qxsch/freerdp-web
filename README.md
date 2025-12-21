@@ -71,7 +71,7 @@ cd backend
 
 # Using Docker (recommended)
 docker build -t rdp-backend .
-docker run -p 8765:8765 rdp-backend
+docker run --rm -it -p 8765:8765 rdp-backend
 ```
 
 For local development without Docker (requires FreeRDP3 dev libraries):
@@ -101,7 +101,7 @@ cd frontend
 
 # Using Docker
 docker build -t rdp-frontend .
-docker run -p 8000:8000 rdp-frontend
+docker run --rm -it -p 8000:8000 rdp-frontend
 
 # Or using Python's built-in server
 python -m http.server 8000
