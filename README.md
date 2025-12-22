@@ -5,10 +5,10 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ## Architecture
 
 ```
-┌─────────────┐      WebSocket      ┌─────────────────┐      RDP       ┌──────────────┐
-│   Browser   │ ◄─────────────────► │  Python Proxy   │ ◄────────────► │  Windows VM  │
-│  (HTML/JS)  │   frames + input    │ (Native FreeRDP)│                │              │
-└─────────────┘                     └─────────────────┘                └──────────────┘
+┌─────────────┐      WebSocket          ┌─────────────────┐      RDP       ┌──────────────┐
+│   Browser   │ ◄─────────────────────► │  Python Proxy   │ ◄────────────► │  Windows VM  │
+│  (HTML/JS)  │   frames + sound        │ (Native FreeRDP)│                │              │
+└─────────────┘   + input(keys,mouse)   └─────────────────┘                └──────────────┘
 ```
 
 ### Components
@@ -41,7 +41,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ### Backend
 - **Python 3.x** with `websockets` for async WebSocket server
 - **Native C library** built with FreeRDP3 SDK
-- **RDPSND bridge plugin** for direct audio capture (no PulseAudio)
+- **RDPSND bridge plugin** for direct audio capture (no PulseAudio or Alsa required)
 - **libopus** for Opus audio encoding (64kbps, 20ms frames)
 - **PIL/Pillow** for image processing
 - **Ubuntu 24.04** base image (provides FreeRDP3 runtime)
@@ -53,8 +53,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - **nginx:alpine** for static file serving
 
 ### Browser Requirements
-- **Chrome 94+** or **Edge 94+** (required for WebCodecs AudioDecoder)
-- Firefox/Safari: Audio not yet supported (WebCodecs not available)
+- **Chrome 94+** or **Edge 94+** or **Safari 26+** or **Firefox 130+** (required for WebCodecs AudioDecoder)
 
 ## Quick Start with Docker (Recommended)
 
