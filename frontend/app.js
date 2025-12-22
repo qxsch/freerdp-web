@@ -30,9 +30,16 @@
     let isAudioPlaying = false;
     let isMuted = false;
     let audioGainNode = null;
+    
+    // Opus decoder state
+    let opusDecoder = null;
+    let opusInitialized = false;
+    let opusSampleRate = 48000;
+    let opusChannels = 2;
 
-    // Audio frame magic header: "AUDI" (0x41, 0x55, 0x44, 0x49)
-    const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49];
+    // Audio frame magic headers
+    const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49];  // "AUDI" (PCM - legacy)
+    const OPUS_MAGIC = [0x4F, 0x50, 0x55, 0x53];   // "OPUS" (Opus encoded)
 
     // DOM Elements
     const elements = {
@@ -235,7 +242,15 @@
         if (event.data instanceof ArrayBuffer) {
             const bytes = new Uint8Array(event.data);
             
-            // Check for audio frame magic header: "AUDI" (0x41, 0x55, 0x44, 0x49)
+            // Check for Opus audio frame magic header: "OPUS" (0x4F, 0x50, 0x55, 0x53)
+            if (bytes.length > 12 &&
+                bytes[0] === OPUS_MAGIC[0] && bytes[1] === OPUS_MAGIC[1] &&
+                bytes[2] === OPUS_MAGIC[2] && bytes[3] === OPUS_MAGIC[3]) {
+                handleOpusFrame(bytes);
+                return;
+            }
+            
+            // Check for legacy PCM audio frame magic header: "AUDI" (0x41, 0x55, 0x44, 0x49)
             if (bytes.length > 12 &&
                 bytes[0] === AUDIO_MAGIC[0] && bytes[1] === AUDIO_MAGIC[1] &&
                 bytes[2] === AUDIO_MAGIC[2] && bytes[3] === AUDIO_MAGIC[3]) {
@@ -454,6 +469,193 @@
     }
 
     /**
+     * Initialize Opus decoder using WebCodecs API
+     */
+    async function initOpusDecoder(sampleRate, channels) {
+        // Check WebCodecs support
+        if (typeof AudioDecoder === 'undefined') {
+            console.warn('[RDP Client] WebCodecs AudioDecoder not supported, Opus audio disabled');
+            return false;
+        }
+        
+        // Close existing decoder if format changed
+        if (opusDecoder && (opusSampleRate !== sampleRate || opusChannels !== channels)) {
+            opusDecoder.close();
+            opusDecoder = null;
+            opusInitialized = false;
+        }
+        
+        if (opusDecoder) return true;
+        
+        try {
+            opusSampleRate = sampleRate;
+            opusChannels = channels;
+            
+            opusDecoder = new AudioDecoder({
+                output: (audioData) => {
+                    // Convert AudioData to AudioBuffer and queue for playback
+                    handleDecodedOpusAudio(audioData);
+                },
+                error: (e) => {
+                    console.error('[RDP Client] Opus decode error:', e);
+                }
+            });
+            
+            await opusDecoder.configure({
+                codec: 'opus',
+                sampleRate: sampleRate,
+                numberOfChannels: channels,
+            });
+            
+            opusInitialized = true;
+            console.log('[RDP Client] Opus decoder initialized:', sampleRate, 'Hz,', channels, 'ch');
+            return true;
+            
+        } catch (e) {
+            console.error('[RDP Client] Failed to initialize Opus decoder:', e);
+            opusDecoder = null;
+            return false;
+        }
+    }
+
+    /**
+     * Handle decoded Opus audio data
+     */
+    function handleDecodedOpusAudio(audioData) {
+        if (!audioContext || isMuted) {
+            audioData.close();
+            return;
+        }
+        
+        try {
+            // Resume audio context if suspended (browser autoplay policy)
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+            
+            // Create AudioBuffer from AudioData
+            const numFrames = audioData.numberOfFrames;
+            const numChannels = audioData.numberOfChannels;
+            const sampleRate = audioData.sampleRate;
+            
+            const audioBuffer = audioContext.createBuffer(numChannels, numFrames, sampleRate);
+            
+            // AudioData.copyTo expects format and planeIndex options
+            // The format depends on how the decoder outputs data
+            const format = audioData.format; // e.g., 'f32-planar', 'f32', 's16', etc.
+            
+            if (format && format.includes('planar')) {
+                // Planar format - copy each channel separately
+                for (let ch = 0; ch < numChannels; ch++) {
+                    const channelData = audioBuffer.getChannelData(ch);
+                    audioData.copyTo(channelData, { planeIndex: ch });
+                }
+            } else {
+                // Interleaved format - need to copy all data and de-interleave
+                // Create a buffer large enough for all samples
+                const totalSamples = numFrames * numChannels;
+                let tempBuffer;
+                
+                // Determine the format and create appropriate buffer
+                if (format === 'f32' || format === 'f32-planar') {
+                    tempBuffer = new Float32Array(totalSamples);
+                } else if (format === 's16' || format === 's16-planar') {
+                    tempBuffer = new Int16Array(totalSamples);
+                } else if (format === 's32' || format === 's32-planar') {
+                    tempBuffer = new Int32Array(totalSamples);
+                } else {
+                    // Default to float32
+                    tempBuffer = new Float32Array(totalSamples);
+                }
+                
+                try {
+                    audioData.copyTo(tempBuffer, { planeIndex: 0 });
+                    
+                    // De-interleave if needed
+                    for (let ch = 0; ch < numChannels; ch++) {
+                        const channelData = audioBuffer.getChannelData(ch);
+                        for (let i = 0; i < numFrames; i++) {
+                            let sample = tempBuffer[i * numChannels + ch];
+                            // Convert to float if needed
+                            if (format === 's16' || format === 's16-planar') {
+                                sample = sample / 32768.0;
+                            } else if (format === 's32' || format === 's32-planar') {
+                                sample = sample / 2147483648.0;
+                            }
+                            channelData[i] = sample;
+                        }
+                    }
+                } catch (copyError) {
+                    // If copyTo fails, try alternative approach - copy per channel
+                    for (let ch = 0; ch < numChannels; ch++) {
+                        const channelData = audioBuffer.getChannelData(ch);
+                        try {
+                            audioData.copyTo(channelData, { planeIndex: ch, format: 'f32-planar' });
+                        } catch (e2) {
+                            // Last resort: try to copy without options
+                            console.warn('[RDP Client] Audio copy fallback for channel', ch);
+                        }
+                    }
+                }
+            }
+            
+            // Queue for playback
+            queueAudioBuffer(audioBuffer);
+            
+        } catch (e) {
+            console.error('[RDP Client] Decoded audio error:', e);
+        } finally {
+            audioData.close();
+        }
+    }
+
+    /**
+     * Handle Opus audio frame from server
+     * Format: [OPUS magic (4)] [sample_rate (4)] [channels (2)] [frame_size (2)] [Opus data...]
+     */
+    async function handleOpusFrame(bytes) {
+        if (!audioContext) {
+            initAudio();
+        }
+        
+        if (isMuted) return;
+        
+        try {
+            // Resume audio context if suspended
+            if (audioContext && audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+            
+            // Parse header
+            const dataView = new DataView(bytes.buffer, bytes.byteOffset);
+            const sampleRate = dataView.getUint32(4, true);  // little-endian
+            const channels = dataView.getUint16(8, true);
+            const frameSize = dataView.getUint16(10, true);
+            
+            // Initialize decoder if needed
+            if (!opusInitialized) {
+                const success = await initOpusDecoder(sampleRate, channels);
+                if (!success) return;
+            }
+            
+            // Extract Opus frame data
+            const opusData = bytes.slice(12, 12 + frameSize);
+            
+            if (opusData.length === 0) return;
+            
+            // Decode Opus frame
+            opusDecoder.decode(new EncodedAudioChunk({
+                type: 'key',
+                timestamp: performance.now() * 1000,  // microseconds
+                data: opusData
+            }));
+            
+        } catch (e) {
+            console.error('[RDP Client] Opus frame error:', e);
+        }
+    }
+
+    /**
      * Handle audio frame from server
      * Format: [AUDI magic (4)] [sample_rate (4)] [channels (2)] [bits (2)] [PCM data...]
      */
@@ -519,7 +721,7 @@
     }
 
     /**
-     * Queue audio buffer for playback with minimal latency
+     * Queue audio buffer for playback with jitter buffering
      */
     function queueAudioBuffer(audioBuffer) {
         const source = audioContext.createBufferSource();
@@ -538,14 +740,29 @@
             ? Math.max(...audioQueue.map(item => item.endTime))
             : currentTime;
         
-        // Add small buffer time on first packet to prevent underruns
-        const bufferDelay = audioQueue.length === 0 ? 0.1 : 0;
+        // Jitter buffer: add initial delay to absorb network jitter
+        // Use 150ms initial buffer, then schedule seamlessly
+        const initialBufferDelay = audioQueue.length === 0 ? 0.15 : 0;
         
-        // Limit queue size to prevent latency buildup (allow up to 500ms)
-        if (audioQueue.length < 10) {
-            const startTime = Math.max(currentTime + bufferDelay, lastEndTime);
+        // Limit queue size to prevent excessive latency buildup
+        // With 20ms Opus frames, 25 buffers = 500ms max latency
+        const maxQueueSize = 25;
+        
+        if (audioQueue.length < maxQueueSize) {
+            // Schedule buffer to play after previous one ends
+            const startTime = Math.max(currentTime + initialBufferDelay, lastEndTime);
             source.start(startTime);
-            audioQueue.push({ endTime: startTime + bufferDuration });
+            audioQueue.push({ endTime: startTime + bufferDuration, source: source });
+        } else {
+            // Queue full - drop oldest buffer to reduce latency
+            // This shouldn't happen often if encoding/decoding keeps up
+            const oldest = audioQueue.shift();
+            if (oldest && oldest.source) {
+                try { oldest.source.stop(); } catch(e) {}
+            }
+            const startTime = Math.max(currentTime, lastEndTime);
+            source.start(startTime);
+            audioQueue.push({ endTime: startTime + bufferDuration, source: source });
         }
     }
 
@@ -568,6 +785,18 @@
      */
     function cleanupAudio() {
         audioQueue = [];
+        
+        // Clean up Opus decoder
+        if (opusDecoder) {
+            try {
+                opusDecoder.close();
+            } catch (e) {
+                // Ignore errors during cleanup
+            }
+            opusDecoder = null;
+            opusInitialized = false;
+        }
+        
         if (audioContext) {
             audioContext.close();
             audioContext = null;

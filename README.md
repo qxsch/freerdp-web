@@ -20,6 +20,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ## Features
 
 - 🖥️ Real-time screen streaming via WebSocket (WebP encoded frames)
+- 🔊 Native audio streaming with Opus encoding (per-session isolation)
 - ⌨️ Full keyboard support with scan code translation
 - 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
 - 📺 Fullscreen mode with dynamic resolution
@@ -27,11 +28,11 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 📊 Latency monitoring (ping/pong)
 - 🩺 Health check endpoint (`/health`)
 - 🐳 Docker support with multi-stage builds
+- 👥 Multi-user support (isolated RDP sessions per WebSocket connection)
 
 ## Todo (Best Effort)
-- GDX pipeline integration for better graphics performance
+- GFX pipeline integration for better graphics performance
 - Clipboard support (copy/paste)
-- Audio redirection
 - File transfer support
 - Better JS API
 
@@ -40,13 +41,20 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ### Backend
 - **Python 3.x** with `websockets` for async WebSocket server
 - **Native C library** built with FreeRDP3 SDK
+- **RDPSND bridge plugin** for direct audio capture (no PulseAudio)
+- **libopus** for Opus audio encoding (64kbps, 20ms frames)
 - **PIL/Pillow** for image processing
 - **Ubuntu 24.04** base image (provides FreeRDP3 runtime)
 
 ### Frontend
 - **Vanilla JavaScript** (no frameworks)
 - **HTML5 Canvas** for rendering RDP frames
+- **WebCodecs AudioDecoder** for Opus decoding
 - **nginx:alpine** for static file serving
+
+### Browser Requirements
+- **Chrome 94+** or **Edge 94+** (required for WebCodecs AudioDecoder)
+- Firefox/Safari: Audio not yet supported (WebCodecs not available)
 
 ## Quick Start with Docker (Recommended)
 
@@ -182,14 +190,38 @@ const config = {
 │   ├── requirements.txt    # Python dependencies
 │   └── native/
 │       ├── CMakeLists.txt  # CMake build configuration
-│       ├── rdp_bridge.c    # FreeRDP3 C implementation
-│       └── rdp_bridge.h    # Library header
+│       ├── rdp_bridge.c    # FreeRDP3 C implementation (+ Opus buffer)
+│       ├── rdp_bridge.h    # Library header
+│       └── rdpsnd_bridge.c # RDPSND audio plugin (Opus encoding)
 └── frontend/
     ├── Dockerfile          # nginx:alpine image
     ├── index.html          # SPA entry point
-    ├── app.js              # RDP client logic
+    ├── app.js              # RDP client logic (+ Opus decoding)
     └── nginx.conf          # nginx configuration
 ```
+
+## Audio Architecture
+
+Audio uses a custom RDPSND device plugin that captures PCM directly from FreeRDP and encodes to Opus:
+
+```
+┌─────────────┐      RDPSND       ┌─────────────────┐      Opus        ┌──────────────┐
+│  Windows VM │ ──────────────►   │  rdpsnd-bridge  │ ────────────────►│  Ring Buffer │
+│   (Audio)   │   PCM 44.1kHz     │  (Opus Encoder) │   64kbps frames  │  (per-user)  │
+└─────────────┘                   └─────────────────┘                  └──────────────┘
+                                                                              │
+                                                                              ▼
+┌─────────────┐      WebSocket    ┌─────────────────┐     WebCodecs    ┌──────────────┐
+│   Browser   │ ◄───────────────  │  Python Proxy   │ ◄────────────────│ AudioDecoder │
+│  (Speakers) │   OPUS frames     │  (rdp_bridge)   │   Opus→PCM       │              │
+└─────────────┘                   └─────────────────┘                  └──────────────┘
+```
+
+**Key benefits:**
+- **Per-session isolation**: Each RDP connection has its own audio buffer (no mixing)
+- **No PulseAudio**: Direct capture eliminates shared audio daemon
+- **Bandwidth efficient**: Opus at 64kbps vs ~1.4Mbps raw PCM
+- **Low latency**: 20ms frame size
 
 ## Troubleshooting
 
@@ -210,6 +242,12 @@ The native library wasn't built or installed. Use Docker which handles this auto
 - Delta frame updates reduce data transfer for static screens
 - Check network connectivity between backend and VM
 - Not yet optimized for video playback scenarios (e.g. YouTube), but GFX integration is planned
+
+### No audio in browser
+- **Check browser compatibility**: Audio requires Chrome 94+ or Edge 94+ (WebCodecs API)
+- **Check RDP server settings**: Ensure audio redirection is enabled on the Windows VM
+- **Check console logs**: Look for `[OPUS]` messages confirming audio frames are received
+- **Firefox/Safari**: Audio not currently supported (WebCodecs unavailable)
 
 ### Container health check failing
 The backend exposes `/health` endpoint. Test with:

@@ -240,6 +240,69 @@ int rdp_get_audio_data(RdpSession* session, uint8_t* buffer, int max_size);
 void rdp_write_audio_data(RdpSession* session, const uint8_t* data, size_t size,
                           int sample_rate, int channels, int bits);
 
+/* ============================================================================
+ * Opus Audio API (for native audio streaming without PulseAudio)
+ * ============================================================================ */
+
+/**
+ * AudioContext structure for RDPSND bridge plugin
+ * 
+ * This is exposed so the rdpsnd_bridge.so plugin can access the audio buffer.
+ * The plugin is dynamically loaded by FreeRDP, so we use this as a shared
+ * interface between rdp_bridge.so and rdpsnd_bridge.so.
+ */
+typedef struct {
+    uint8_t* opus_buffer;           /* Ring buffer for Opus frames */
+    size_t opus_buffer_size;        /* Total buffer size */
+    size_t opus_write_pos;          /* Write position */
+    size_t opus_read_pos;           /* Read position */
+    void* opus_mutex;               /* pthread_mutex_t* for thread-safe access */
+    int sample_rate;                /* Current sample rate (e.g., 48000) */
+    int channels;                   /* Current channel count (1 or 2) */
+    volatile int initialized;       /* Non-zero when audio is ready */
+} RdpAudioContext;
+
+/**
+ * Set the audio context for the RDPSND bridge plugin
+ * 
+ * Must be called before rdp_connect() to allow the dynamically loaded
+ * rdpsnd_bridge.so plugin to access the audio buffer.
+ * 
+ * @param session   Session handle
+ */
+void rdp_set_audio_context(RdpSession* session);
+
+/**
+ * Check if Opus audio data is available
+ * 
+ * @param session   Session handle
+ * @return          true if Opus frames are available
+ */
+bool rdp_has_opus_data(RdpSession* session);
+
+/**
+ * Get Opus audio format information
+ * 
+ * @param session       Session handle
+ * @param sample_rate   Output: sample rate in Hz (e.g., 48000)
+ * @param channels      Output: number of channels (1 or 2)
+ * @return              0 on success, negative if audio not initialized
+ */
+int rdp_get_opus_format(RdpSession* session, int* sample_rate, int* channels);
+
+/**
+ * Get next Opus frame from the buffer
+ * 
+ * Each Opus frame is a self-contained encoded packet that can be decoded
+ * independently by the browser's WebCodecs AudioDecoder.
+ * 
+ * @param session   Session handle
+ * @param buffer    Output buffer for Opus frame data
+ * @param max_size  Maximum bytes to read
+ * @return          Size of Opus frame, 0 if no data, negative on error
+ */
+int rdp_get_opus_frame(RdpSession* session, uint8_t* buffer, int max_size);
+
 /**
  * Disconnect from the RDP server
  */

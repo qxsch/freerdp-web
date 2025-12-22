@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY native/ ./native/
 
-# Build the library
+# Build the libraries (main library + RDPSND bridge plugin)
 WORKDIR /build/native
 RUN cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
@@ -30,16 +30,17 @@ RUN cmake -B build \
     && cmake --build build --parallel $(nproc) \
     && cmake --install build
 
-# Verify the library was built
+# Verify the libraries were built
 RUN ls -la /usr/local/lib/librdp_bridge.so* \
-    && echo "Native library built successfully"
+    && ls -la /usr/local/lib/freerdp3/librdpsnd-client-bridge.so \
+    && echo "Native libraries built successfully"
 
 # ==============================================================================
 # Stage 2: Runtime image (Ubuntu 24.04 for FreeRDP3 runtime libs)
 # ==============================================================================
 FROM ubuntu:24.04
 
-# Install Python and FreeRDP3 runtime libraries
+# Install Python and FreeRDP3 runtime libraries (no PulseAudio needed)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
@@ -49,22 +50,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwinpr3-3 \
     libwebp7 \
     libopus0 \
-    pulseaudio \
-    pulseaudio-utils \
-    libasound2t64 \
-    libasound2-plugins \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the native library from builder
+# Copy the native libraries from builder
 COPY --from=builder /usr/local/lib/librdp_bridge.so* /usr/local/lib/
 COPY --from=builder /usr/local/include/rdp_bridge.h /usr/local/include/
+
+# Copy the RDPSND bridge plugin to FreeRDP plugin directory
+# FreeRDP3 searches for plugins in /usr/lib/x86_64-linux-gnu/freerdp3
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/freerdp3
+COPY --from=builder /usr/local/lib/freerdp3/librdpsnd-client-bridge.so /usr/lib/x86_64-linux-gnu/freerdp3/
 
 # Update library cache with explicit path
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
 
-# Verify library is loadable (use full path)
+# Verify libraries are loadable
 RUN python3 -c "import ctypes; ctypes.CDLL('/usr/local/lib/librdp_bridge.so'); print('Native library loaded successfully')"
+RUN ls -la /usr/lib/x86_64-linux-gnu/freerdp3/ && echo "RDPSND bridge plugin installed"
 
 # Set working directory
 WORKDIR /app
@@ -89,22 +92,9 @@ COPY .env.example .env.example
 # Create .env if not exists
 RUN cp -n .env.example .env 2>/dev/null || true
 
-# Set library path
+# Set library path (include FreeRDP plugin path)
 ENV LD_LIBRARY_PATH=/usr/local/lib
-
-# Configure PulseAudio for headless operation with null sink
-RUN mkdir -p /run/pulse /var/run/pulse ~/.config/pulse && \
-    echo 'load-module module-null-sink sink_name=virtual_sink sink_properties=device.description="Virtual_Sink"' > /etc/pulse/default.pa.d/virtual-sink.pa && \
-    echo 'set-default-sink virtual_sink' >> /etc/pulse/default.pa.d/virtual-sink.pa && \
-    echo 'autospawn = no' > ~/.config/pulse/client.conf && \
-    echo 'daemon-binary = /bin/true' >> ~/.config/pulse/client.conf
-
-# Create startup script that runs PulseAudio then the server
-RUN echo '#!/bin/bash\n\
-rm -rf /run/pulse/* /var/run/pulse/* 2>/dev/null\n\
-pulseaudio --daemonize --disallow-exit --exit-idle-time=-1 --system=false --log-level=error 2>/dev/null || true\n\
-sleep 1\n\
-exec python server.py' > /app/start.sh && chmod +x /app/start.sh
+ENV FREERDP_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/freerdp3
 
 # Expose WebSocket port
 EXPOSE 8765
@@ -113,5 +103,5 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python3 -c "import socket; s=socket.socket(); s.connect(('127.0.0.1', 8765)); s.close()" || exit 1
 
-# Run the server with PulseAudio
-CMD ["/bin/bash", "/app/start.sh"]
+# Run the server directly (no PulseAudio needed - native Opus audio streaming)
+CMD ["python", "server.py"]

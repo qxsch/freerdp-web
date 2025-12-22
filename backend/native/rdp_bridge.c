@@ -14,10 +14,12 @@
 #include <string.h>
 #include <pthread.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 /* FreeRDP3 headers */
 #include <freerdp/freerdp.h>
 #include <freerdp/client.h>
+#include <freerdp/addin.h>
 #include <freerdp/gdi/gdi.h>
 #include <freerdp/gdi/gfx.h>
 #include <freerdp/channels/channels.h>
@@ -25,6 +27,7 @@
 #include <freerdp/client/disp.h>
 #include <freerdp/client/rdpsnd.h>
 #include <freerdp/client/rdpgfx.h>
+#include <freerdp/client/channels.h>
 #include <freerdp/event.h>
 #include <opus/opus.h>
 #include <winpr/crt.h>
@@ -79,6 +82,16 @@ typedef struct {
     int audio_bits;
     bool audio_initialized;
     
+    /* Opus audio buffer (for native audio streaming) */
+    uint8_t* opus_buffer;
+    size_t opus_buffer_size;
+    size_t opus_write_pos;
+    size_t opus_read_pos;
+    pthread_mutex_t opus_mutex;
+    int opus_sample_rate;
+    int opus_channels;
+    volatile int opus_initialized;
+    
 } BridgeContext;
 
 /* Forward declarations */
@@ -90,6 +103,22 @@ static BOOL bridge_end_paint(rdpContext* context);
 static BOOL bridge_desktop_resize(rdpContext* context);
 static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventArgs* e);
 static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedEventArgs* e);
+
+/* Global audio context structure for plugin communication.
+ * This is a regular global (not thread-local) because the rdpsnd plugin
+ * runs in a different thread from the main Python thread, and we need
+ * both threads to access the same buffer.
+ * Note: For multi-session support, this would need to be session-specific. */
+static struct {
+    uint8_t* opus_buffer;
+    size_t opus_buffer_size;
+    size_t opus_write_pos;
+    size_t opus_read_pos;
+    void* opus_mutex;
+    int sample_rate;
+    int channels;
+    volatile int initialized;
+} g_audio_ctx;
 
 /* ============================================================================
  * Session Lifecycle
@@ -130,10 +159,31 @@ RdpSession* rdp_create(
     ctx->dirty_rect_count = 0;
     pthread_mutex_init(&ctx->rect_mutex, NULL);
     pthread_mutex_init(&ctx->audio_mutex, NULL);
+    pthread_mutex_init(&ctx->opus_mutex, NULL);
     ctx->audio_initialized = false;
     ctx->audio_buffer = NULL;
     ctx->audio_buffer_size = 0;
     ctx->opus_encoder = NULL;
+    
+    /* Initialize Opus buffer for native audio streaming */
+    ctx->opus_buffer_size = 64 * 1024;  /* 64KB for ~1 second of Opus at 64kbps */
+    ctx->opus_buffer = (uint8_t*)calloc(1, ctx->opus_buffer_size);
+    ctx->opus_write_pos = 0;
+    ctx->opus_read_pos = 0;
+    ctx->opus_sample_rate = 48000;
+    ctx->opus_channels = 2;
+    ctx->opus_initialized = 0;
+    
+    /* Pre-populate the thread-local audio context so the plugin can access it
+     * when its Open callback is called during freerdp_connect() */
+    g_audio_ctx.opus_buffer = ctx->opus_buffer;
+    g_audio_ctx.opus_buffer_size = ctx->opus_buffer_size;
+    g_audio_ctx.opus_write_pos = 0;
+    g_audio_ctx.opus_read_pos = 0;
+    g_audio_ctx.opus_mutex = &ctx->opus_mutex;
+    g_audio_ctx.sample_rate = ctx->opus_sample_rate;
+    g_audio_ctx.channels = ctx->opus_channels;
+    g_audio_ctx.initialized = 0;
     
     /* Set callbacks */
     instance->PreConnect = bridge_pre_connect;
@@ -168,9 +218,39 @@ RdpSession* rdp_create(
      * threading issues when called from channel callbacks in FreeRDP3. */
     if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, FALSE)) goto fail;
     
-    /* Audio playback - uses PulseAudio null sink in container */
+    /* Audio playback - configure rdpsnd with our bridge device plugin.
+     * We add rdpsnd to BOTH static and dynamic channel collections with sys:bridge
+     * to ensure our bridge plugin is used regardless of which channel Windows prefers.
+     * AudioPlayback must be TRUE for the server to send audio data. */
     if (!freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, FALSE)) goto fail;
+    
+    /* Add rdpsnd to STATIC channel collection with sys:bridge */
+    {
+        ADDIN_ARGV* args = freerdp_addin_argv_new(2, (const char*[]){"rdpsnd", "sys:bridge"});
+        if (args) {
+            if (!freerdp_static_channel_collection_add(settings, args)) {
+                fprintf(stderr, "[rdp_bridge] Warning: Could not add rdpsnd static channel\n");
+                freerdp_addin_argv_free(args);
+            } else {
+                fprintf(stderr, "[rdp_bridge] Added rdpsnd static channel with sys:bridge\n");
+            }
+        }
+    }
+    
+    /* Add rdpsnd to DYNAMIC channel collection with sys:bridge */
+    {
+        ADDIN_ARGV* args = freerdp_addin_argv_new(2, (const char*[]){"rdpsnd", "sys:bridge"});
+        if (args) {
+            if (!freerdp_dynamic_channel_collection_add(settings, args)) {
+                fprintf(stderr, "[rdp_bridge] Warning: Could not add rdpsnd dynamic channel\n");
+                freerdp_addin_argv_free(args);
+            } else {
+                fprintf(stderr, "[rdp_bridge] Added rdpsnd dynamic channel with sys:bridge\n");
+            }
+        }
+    }
     
     /* Performance optimizations */
     if (!freerdp_settings_set_bool(settings, FreeRDP_FastPathOutput, TRUE)) goto fail;
@@ -232,6 +312,11 @@ int rdp_connect(RdpSession* session)
         return -1;
     }
     
+    /* Set up audio context for the RDPSND bridge plugin AFTER connecting.
+     * The plugin is loaded by FreeRDP during freerdp_connect(), so we need
+     * to call rdp_set_audio_context after the plugin is available. */
+    rdp_set_audio_context(session);
+    
     ctx->state = RDP_STATE_CONNECTED;
     return 0;
 }
@@ -275,6 +360,7 @@ void rdp_destroy(RdpSession* session)
     
     pthread_mutex_destroy(&ctx->rect_mutex);
     pthread_mutex_destroy(&ctx->audio_mutex);
+    pthread_mutex_destroy(&ctx->opus_mutex);
     
     /* Free audio resources */
     if (ctx->opus_encoder) {
@@ -284,6 +370,10 @@ void rdp_destroy(RdpSession* session)
     if (ctx->audio_buffer) {
         free(ctx->audio_buffer);
         ctx->audio_buffer = NULL;
+    }
+    if (ctx->opus_buffer) {
+        free(ctx->opus_buffer);
+        ctx->opus_buffer = NULL;
     }
     
     freerdp_client_context_free(context);
@@ -633,6 +723,11 @@ static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventAr
         bctx->audio_bits = 16;
         bctx->audio_initialized = true;
         pthread_mutex_unlock(&bctx->audio_mutex);
+        
+        /* Mark Opus audio as initialized for native streaming */
+        pthread_mutex_lock(&bctx->opus_mutex);
+        bctx->opus_initialized = 1;
+        pthread_mutex_unlock(&bctx->opus_mutex);
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
         /* GFX pipeline disabled - just store reference */
@@ -652,6 +747,10 @@ static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedE
         pthread_mutex_lock(&bctx->audio_mutex);
         bctx->audio_initialized = false;
         pthread_mutex_unlock(&bctx->audio_mutex);
+        
+        pthread_mutex_lock(&bctx->opus_mutex);
+        bctx->opus_initialized = 0;
+        pthread_mutex_unlock(&bctx->opus_mutex);
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
         bctx->gfx = NULL;
@@ -848,6 +947,142 @@ void rdp_write_audio_data(RdpSession* session, const uint8_t* data, size_t size,
     }
     
     pthread_mutex_unlock(&ctx->audio_mutex);
+}
+
+/* ============================================================================
+ * Opus Audio API (for native audio streaming without PulseAudio)
+ * ============================================================================ */
+
+void rdp_set_audio_context(RdpSession* session)
+{
+    if (!session) return;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    /* Point to our BridgeContext's Opus buffer */
+    g_audio_ctx.opus_buffer = ctx->opus_buffer;
+    g_audio_ctx.opus_buffer_size = ctx->opus_buffer_size;
+    g_audio_ctx.opus_write_pos = 0;
+    g_audio_ctx.opus_read_pos = 0;
+    g_audio_ctx.opus_mutex = &ctx->opus_mutex;
+    g_audio_ctx.sample_rate = ctx->opus_sample_rate;
+    g_audio_ctx.channels = ctx->opus_channels;
+    g_audio_ctx.initialized = 0;
+    
+    /* Try to find and call the plugin's context setter using dlsym.
+     * The plugin is loaded dynamically by FreeRDP during connect,
+     * so we use RTLD_DEFAULT to search all loaded libraries. */
+    typedef void (*set_context_fn)(void*);
+    set_context_fn set_ctx = (set_context_fn)dlsym(RTLD_DEFAULT, "rdpsnd_bridge_set_context");
+    if (set_ctx) {
+        set_ctx(&g_audio_ctx);
+        fprintf(stderr, "[rdp_bridge] Audio context passed to rdpsnd plugin\n");
+    } else {
+        fprintf(stderr, "[rdp_bridge] rdpsnd_bridge_set_context not found (plugin not loaded yet)\n");
+    }
+}
+
+/* Exported function for the plugin to get the current audio context.
+ * The plugin can call this via dlsym(RTLD_DEFAULT, "rdp_get_current_audio_context") */
+__attribute__((visibility("default")))
+void* rdp_get_current_audio_context(void)
+{
+    return &g_audio_ctx;
+}
+
+bool rdp_has_opus_data(RdpSession* session)
+{
+    (void)session; /* We use the global context since plugin writes there */
+    
+    /* The rdpsnd plugin writes to g_audio_ctx, so we check there */
+    if (!g_audio_ctx.initialized || !g_audio_ctx.opus_buffer || !g_audio_ctx.opus_mutex) {
+        return false;
+    }
+    
+    pthread_mutex_lock(g_audio_ctx.opus_mutex);
+    bool has_data = g_audio_ctx.opus_write_pos > g_audio_ctx.opus_read_pos;
+    pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+    
+    return has_data;
+}
+
+int rdp_get_opus_format(RdpSession* session, int* sample_rate, int* channels)
+{
+    (void)session; /* We use the global context since plugin writes there */
+    
+    if (!g_audio_ctx.initialized) {
+        return -1;
+    }
+    
+    pthread_mutex_lock(g_audio_ctx.opus_mutex);
+    if (sample_rate) *sample_rate = g_audio_ctx.sample_rate;
+    if (channels) *channels = g_audio_ctx.channels;
+    pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+    
+    return 0;
+}
+
+int rdp_get_opus_frame(RdpSession* session, uint8_t* buffer, int max_size)
+{
+    (void)session; /* We use the global context since plugin writes there */
+    
+    if (!buffer || max_size <= 0) return -1;
+    
+    if (!g_audio_ctx.initialized || !g_audio_ctx.opus_buffer || !g_audio_ctx.opus_mutex) {
+        return 0;
+    }
+    
+    pthread_mutex_lock(g_audio_ctx.opus_mutex);
+    
+    /* Check if we have any data */
+    if (g_audio_ctx.opus_write_pos <= g_audio_ctx.opus_read_pos) {
+        pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+        return 0;
+    }
+    
+    /* Read frame header (2 bytes: little-endian size) */
+    size_t read_pos = g_audio_ctx.opus_read_pos % g_audio_ctx.opus_buffer_size;
+    uint16_t frame_size = g_audio_ctx.opus_buffer[read_pos];
+    read_pos = (read_pos + 1) % g_audio_ctx.opus_buffer_size;
+    frame_size |= (uint16_t)g_audio_ctx.opus_buffer[read_pos] << 8;
+    read_pos = (read_pos + 1) % g_audio_ctx.opus_buffer_size;
+    
+    if (frame_size == 0 || frame_size > 4000) {
+        /* Invalid frame - reset buffer */
+        g_audio_ctx.opus_write_pos = 0;
+        g_audio_ctx.opus_read_pos = 0;
+        pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+        return 0;
+    }
+    
+    if (frame_size > max_size) {
+        /* Buffer too small - skip this frame */
+        g_audio_ctx.opus_read_pos += 2 + frame_size;
+        pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+        return -2;  /* Buffer too small error */
+    }
+    
+    /* Read Opus frame data (handle wrap-around) */
+    size_t first_chunk = g_audio_ctx.opus_buffer_size - read_pos;
+    if (first_chunk >= frame_size) {
+        memcpy(buffer, g_audio_ctx.opus_buffer + read_pos, frame_size);
+    } else {
+        memcpy(buffer, g_audio_ctx.opus_buffer + read_pos, first_chunk);
+        memcpy(buffer + first_chunk, g_audio_ctx.opus_buffer, frame_size - first_chunk);
+    }
+    
+    g_audio_ctx.opus_read_pos += 2 + frame_size;
+    
+    /* Reset positions if buffer is empty */
+    if (g_audio_ctx.opus_read_pos >= g_audio_ctx.opus_write_pos) {
+        g_audio_ctx.opus_write_pos = 0;
+        g_audio_ctx.opus_read_pos = 0;
+    }
+    
+    pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+    
+    return frame_size;
 }
 
 /* ============================================================================

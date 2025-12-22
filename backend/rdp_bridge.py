@@ -64,8 +64,11 @@ RDP_STATE_ERROR = 3
 # Delta frame magic header
 DELTA_FRAME_MAGIC = b'DELT'
 
-# Audio frame magic header
+# Audio frame magic header (PCM - legacy)
 AUDIO_FRAME_MAGIC = b'AUDI'
+
+# Opus audio frame magic header
+OPUS_AUDIO_MAGIC = b'OPUS'
 
 
 class RdpRect(Structure):
@@ -143,7 +146,10 @@ class NativeLibrary:
         
         for path in lib_paths:
             try:
-                self._lib = ctypes.CDLL(path)
+                # Use RTLD_GLOBAL so symbols are visible to plugins loaded by FreeRDP
+                # The rdpsnd bridge plugin uses dlsym(RTLD_DEFAULT, ...) to find
+                # rdp_get_current_audio_context() exported by this library
+                self._lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
                 logger.info(f"Loaded native library from: {path}")
                 break
             except OSError:
@@ -243,6 +249,21 @@ class NativeLibrary:
         # rdp_get_audio_data
         lib.rdp_get_audio_data.argtypes = [c_void_p, POINTER(c_uint8), c_int]
         lib.rdp_get_audio_data.restype = c_int
+        
+        # Opus audio API functions
+        # rdp_has_opus_data
+        lib.rdp_has_opus_data.argtypes = [c_void_p]
+        lib.rdp_has_opus_data.restype = c_bool
+        
+        # rdp_get_opus_format
+        lib.rdp_get_opus_format.argtypes = [
+            c_void_p, POINTER(c_int), POINTER(c_int)
+        ]
+        lib.rdp_get_opus_format.restype = c_int
+        
+        # rdp_get_opus_frame
+        lib.rdp_get_opus_frame.argtypes = [c_void_p, POINTER(c_uint8), c_int]
+        lib.rdp_get_opus_frame.restype = c_int
     
     def __getattr__(self, name):
         """Proxy attribute access to the underlying library"""
@@ -374,10 +395,7 @@ class RDPBridge:
                     None, self._lib.rdp_poll, self._session, 16  # 16ms timeout
                 )
                 
-                poll_count += 1
-                if poll_count <= 5 or poll_count % 100 == 0:
-                    logger.debug(f"Poll #{poll_count}: result={result}")
-                
+                poll_count += 1                
                 if result < 0:
                     # Error or disconnected
                     error = self._lib.rdp_get_error(self._session)
@@ -537,79 +555,86 @@ class RDPBridge:
             logger.error(f"Delta frame encoding error: {e}")
     
     async def _stream_audio(self):
-        """Stream audio by capturing from PulseAudio's null sink monitor"""
-        logger.info("Starting audio streaming from PulseAudio monitor")
+        """Stream Opus audio from native FreeRDP buffer (no PulseAudio required)"""
+        logger.info("Starting native Opus audio streaming")
         
-        # Audio format settings
-        sample_rate = 48000
-        channels = 2
-        bits = 16
+        # Opus frame buffer (max ~4KB per frame)
+        opus_buffer_size = 4096
+        opus_buffer = (c_uint8 * opus_buffer_size)()
         
-        # Frame size: 50ms of audio at 48kHz stereo 16-bit = 9600 bytes
-        # Larger frames = fewer packets = smoother playback
-        frame_size = int(sample_rate * channels * (bits // 8) * 0.05)
+        # Track format for header
+        sample_rate = c_int()
+        channels = c_int()
+        last_sample_rate = 48000
+        last_channels = 2
         
-        try:
-            # Use parec to capture from the null sink's monitor
-            # The monitor source is named "virtual_sink.monitor"
-            process = await asyncio.create_subprocess_exec(
-                'parec',
-                '--rate', str(sample_rate),
-                '--channels', str(channels),
-                '--format', 's16le',
-                '--device', 'virtual_sink.monitor',
-                '--raw',
-                '--latency-msec', '50',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            
-            logger.info("parec process started for audio capture")
-            
-            while self.running and process.returncode is None:
-                try:
-                    # Read a frame of audio data
-                    audio_data = await asyncio.wait_for(
-                        process.stdout.read(frame_size),
-                        timeout=0.2
+        frames_sent = 0
+        last_frame_time = 0
+        
+        # Target ~20ms between sends (Opus frame duration)
+        target_interval = 0.018  # slightly less than 20ms to avoid underruns
+        
+        while self.running:
+            try:
+                # Check if Opus data is available
+                if not self._lib.rdp_has_opus_data(self._session):
+                    await asyncio.sleep(0.002)  # 2ms polling when idle
+                    continue
+                
+                # Get audio format
+                if self._lib.rdp_get_opus_format(
+                    self._session,
+                    ctypes.byref(sample_rate),
+                    ctypes.byref(channels)
+                ) == 0:
+                    last_sample_rate = sample_rate.value
+                    last_channels = channels.value
+                
+                # Send multiple frames if they've accumulated
+                frames_this_batch = 0
+                max_frames_per_batch = 5  # Limit to avoid large bursts
+                
+                while self._lib.rdp_has_opus_data(self._session) and frames_this_batch < max_frames_per_batch:
+                    # Read Opus frame from native buffer
+                    frame_size = self._lib.rdp_get_opus_frame(
+                        self._session,
+                        opus_buffer,
+                        opus_buffer_size
                     )
                     
-                    if audio_data and len(audio_data) > 0:
-                        # Quick silence check using sum of absolute values
-                        # This is faster than iterating byte by byte
-                        is_silent = sum(audio_data[:200:2]) == 0
+                    if frame_size > 0:
+                        # Build Opus audio message:
+                        # [OPUS magic (4)] [sample_rate (4)] [channels (2)] [frame_size (2)] [Opus data...]
+                        message = io.BytesIO()
+                        message.write(OPUS_AUDIO_MAGIC)
+                        message.write(struct.pack('<I', last_sample_rate))
+                        message.write(struct.pack('<H', last_channels))
+                        message.write(struct.pack('<H', frame_size))
+                        message.write(ctypes.string_at(opus_buffer, frame_size))
                         
-                        if not is_silent:
-                            # Send audio packet
-                            # Format: [AUDI magic (4)] [sample_rate (4)] [channels (2)] [bits (2)] [PCM data...]
-                            message = io.BytesIO()
-                            message.write(AUDIO_FRAME_MAGIC)
-                            message.write(struct.pack('<I', sample_rate))
-                            message.write(struct.pack('<H', channels))
-                            message.write(struct.pack('<H', bits))
-                            message.write(audio_data)
-                            
-                            await self.websocket.send(message.getvalue())
-                    
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Audio read error: {e}")
-                    await asyncio.sleep(0.1)
-            
-            # Clean up process
-            if process.returncode is None:
-                process.terminate()
-                await process.wait()
+                        await self.websocket.send(message.getvalue())
+                        frames_sent += 1
+                        frames_this_batch += 1
+                        
+                        if frames_sent <= 5:
+                            logger.debug(f"Sent Opus frame #{frames_sent}: {frame_size} bytes, "
+                                       f"{last_sample_rate}Hz, {last_channels}ch")
+                    elif frame_size == -2:
+                        logger.warning("Opus frame buffer too small")
+                        break
+                    else:
+                        break
                 
-        except FileNotFoundError:
-            logger.warning("parec not found - audio capture disabled")
-        except Exception as e:
-            logger.error(f"Audio streaming error: {e}")
+                # Small delay to prevent tight loop and allow batching
+                await asyncio.sleep(0.001)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Native audio streaming error: {e}")
+                await asyncio.sleep(0.1)
         
-        logger.info("Audio streaming ended")
+        logger.info(f"Native audio streaming ended after {frames_sent} frames")
     
     async def disconnect(self):
         """Disconnect from the RDP server"""

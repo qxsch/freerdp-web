@@ -17,6 +17,10 @@ pkg_check_modules(FREERDP_CLIENT3 REQUIRED freerdp-client3)
 pkg_check_modules(WINPR3 REQUIRED winpr3)
 pkg_check_modules(OPUS REQUIRED opus)
 
+# ==============================================================================
+# Main RDP Bridge Library
+# ==============================================================================
+
 # Create the shared library
 add_library(rdp_bridge SHARED
     rdp_bridge.c
@@ -45,6 +49,7 @@ target_link_libraries(rdp_bridge PRIVATE
     ${WINPR3_LIBRARIES}
     ${OPUS_LIBRARIES}
     pthread
+    dl
 )
 
 # Compiler flags
@@ -65,13 +70,78 @@ set_target_properties(rdp_bridge PROPERTIES
     PUBLIC_HEADER rdp_bridge.h
 )
 
+# ==============================================================================
+# RDPSND Bridge Plugin (standalone, version-independent)
+# ==============================================================================
+
+add_library(rdpsnd-bridge SHARED
+    rdpsnd_bridge.c
+)
+
+# Include directories for plugin
+target_include_directories(rdpsnd-bridge PRIVATE
+    ${FREERDP3_INCLUDE_DIRS}
+    ${FREERDP_CLIENT3_INCLUDE_DIRS}
+    ${WINPR3_INCLUDE_DIRS}
+    ${OPUS_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# Link directories for plugin
+target_link_directories(rdpsnd-bridge PRIVATE
+    ${FREERDP3_LIBRARY_DIRS}
+    ${FREERDP_CLIENT3_LIBRARY_DIRS}
+    ${WINPR3_LIBRARY_DIRS}
+    ${OPUS_LIBRARY_DIRS}
+)
+
+# Link libraries for plugin (minimal - only what we need)
+target_link_libraries(rdpsnd-bridge PRIVATE
+    ${FREERDP3_LIBRARIES}
+    ${FREERDP_CLIENT3_LIBRARIES}
+    ${WINPR3_LIBRARIES}
+    ${OPUS_LIBRARIES}
+    pthread
+    dl
+)
+
+# Compiler flags for plugin
+target_compile_options(rdpsnd-bridge PRIVATE
+    ${FREERDP3_CFLAGS_OTHER}
+    ${FREERDP_CLIENT3_CFLAGS_OTHER}
+    ${WINPR3_CFLAGS_OTHER}
+    ${OPUS_CFLAGS_OTHER}
+    -Wall
+    -Wextra
+    -O2
+    -fvisibility=hidden
+)
+
+# Set plugin properties - must be named librdpsnd-client-bridge.so for FreeRDP to find it
+set_target_properties(rdpsnd-bridge PROPERTIES
+    OUTPUT_NAME "rdpsnd-client-bridge"
+    PREFIX "lib"
+    SUFFIX ".so"
+)
+
+# ==============================================================================
 # Install targets
+# ==============================================================================
+
+# Install main library
 install(TARGETS rdp_bridge
     LIBRARY DESTINATION lib
     PUBLIC_HEADER DESTINATION include
+)
+
+# Install RDPSND plugin to FreeRDP plugin directory
+# FreeRDP3 looks for plugins in /usr/lib/freerdp3 or similar
+install(TARGETS rdpsnd-bridge
+    LIBRARY DESTINATION lib/freerdp3
 )
 
 # Print configuration summary
 message(STATUS "FreeRDP3 include dirs: ${FREERDP3_INCLUDE_DIRS}")
 message(STATUS "FreeRDP3 libraries: ${FREERDP3_LIBRARIES}")
 message(STATUS "WinPR3 libraries: ${WINPR3_LIBRARIES}")
+message(STATUS "Opus libraries: ${OPUS_LIBRARIES}")
