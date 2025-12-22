@@ -26,16 +26,19 @@
  * storage to pass the BridgeContext pointer from the main library.
  * ============================================================================ */
 
-/* Opaque audio context - matches what rdp_bridge.c provides */
+/* Opaque audio context - matches what rdp_bridge.c provides
+ * For multi-session support, write_pos and read_pos are POINTERS
+ * to the actual positions in the BridgeContext, allowing multiple
+ * plugin instances to write to different session buffers correctly. */
 typedef struct {
     uint8_t* opus_buffer;           /* Buffer for Opus frames with headers */
     size_t opus_buffer_size;        /* Total buffer size */
-    size_t opus_write_pos;          /* Write position */
-    size_t opus_read_pos;           /* Read position */
+    size_t* opus_write_pos;         /* POINTER to write position in BridgeContext */
+    size_t* opus_read_pos;          /* POINTER to read position in BridgeContext */
     pthread_mutex_t* opus_mutex;    /* Mutex for thread-safe access */
     int sample_rate;                /* Current sample rate */
     int channels;                   /* Current channel count */
-    volatile int initialized;       /* Initialization flag */
+    volatile int* initialized;      /* POINTER to initialization flag in BridgeContext */
 } AudioContext;
 
 /* Thread-local storage for current audio context */
@@ -106,28 +109,29 @@ typedef struct {
 
 static void write_opus_frame(AudioContext* ctx, const unsigned char* data, int size)
 {
-    if (!ctx || !ctx->opus_buffer || !ctx->opus_mutex || size <= 0 || size > 0xFFFF)
+    if (!ctx || !ctx->opus_buffer || !ctx->opus_mutex || !ctx->opus_write_pos || !ctx->opus_read_pos || size <= 0 || size > 0xFFFF)
         return;
     
     pthread_mutex_lock(ctx->opus_mutex);
     
     size_t total_size = OPUS_FRAME_HEADER_SIZE + size;
     
-    /* Check if we have space (with wrap-around handling) */
+    /* Check if we have space (with wrap-around handling) 
+     * Note: opus_write_pos and opus_read_pos are POINTERS to the actual values */
     size_t available;
-    if (ctx->opus_write_pos >= ctx->opus_read_pos) {
-        available = ctx->opus_buffer_size - (ctx->opus_write_pos - ctx->opus_read_pos);
+    if (*ctx->opus_write_pos >= *ctx->opus_read_pos) {
+        available = ctx->opus_buffer_size - (*ctx->opus_write_pos - *ctx->opus_read_pos);
     } else {
-        available = ctx->opus_read_pos - ctx->opus_write_pos;
+        available = *ctx->opus_read_pos - *ctx->opus_write_pos;
     }
     
     if (available < total_size + 64) {
         /* Buffer full - drop oldest frames by advancing read position */
-        ctx->opus_read_pos = ctx->opus_write_pos;
+        *ctx->opus_read_pos = *ctx->opus_write_pos;
     }
     
     /* Write frame header (2-byte little-endian size) */
-    size_t write_pos = ctx->opus_write_pos % ctx->opus_buffer_size;
+    size_t write_pos = *ctx->opus_write_pos % ctx->opus_buffer_size;
     ctx->opus_buffer[write_pos] = size & 0xFF;
     write_pos = (write_pos + 1) % ctx->opus_buffer_size;
     ctx->opus_buffer[write_pos] = (size >> 8) & 0xFF;
@@ -142,7 +146,7 @@ static void write_opus_frame(AudioContext* ctx, const unsigned char* data, int s
         memcpy(ctx->opus_buffer, data + first_chunk, size - first_chunk);
     }
     
-    ctx->opus_write_pos += total_size;
+    *ctx->opus_write_pos += total_size;
     
     pthread_mutex_unlock(ctx->opus_mutex);
 }
@@ -201,28 +205,50 @@ static BOOL rdpsnd_bridge_open(rdpsndDevicePlugin* device,
     bridge->format = *format;
     bridge->latency = latency;
     
-    /* Get audio context - first check thread-local, then try to fetch from rdp_bridge.so */
-    bridge->audio_ctx = g_current_audio_ctx;
-    if (!bridge->audio_ctx) {
+    /* Get audio context - first check thread-local, then try to fetch from rdp_bridge.so.
+     * IMPORTANT: We COPY the context values at Open time, not just store a pointer,
+     * because the global g_audio_ctx is reused for each connecting session. */
+    AudioContext* src_ctx = g_current_audio_ctx;
+    if (!src_ctx) {
         /* Try to get context from rdp_bridge.so via dlsym */
         typedef void* (*get_ctx_fn)(void);
         get_ctx_fn get_ctx = (get_ctx_fn)dlsym(RTLD_DEFAULT, "rdp_get_current_audio_context");
         if (get_ctx) {
-            bridge->audio_ctx = (AudioContext*)get_ctx();
+            src_ctx = (AudioContext*)get_ctx();
             fprintf(stderr, "[rdpsnd_bridge] Got audio context from rdp_bridge.so: %p\n", 
-                    (void*)bridge->audio_ctx);
+                    (void*)src_ctx);
         }
     }
     
-    if (!bridge->audio_ctx) {
+    if (!src_ctx) {
         fprintf(stderr, "[rdpsnd_bridge] ERROR: No audio context available!\n");
         return FALSE;
     }
     
-    if (!bridge->audio_ctx->opus_buffer) {
+    if (!src_ctx->opus_buffer) {
         fprintf(stderr, "[rdpsnd_bridge] ERROR: Audio context has no buffer!\n");
         return FALSE;
     }
+    
+    /* Allocate our own copy of the audio context to store session-specific pointers */
+    bridge->audio_ctx = malloc(sizeof(AudioContext));
+    if (!bridge->audio_ctx) {
+        fprintf(stderr, "[rdpsnd_bridge] ERROR: Failed to allocate audio context copy!\n");
+        return FALSE;
+    }
+    
+    /* Copy the context values - this captures the session's buffer pointers */
+    bridge->audio_ctx->opus_buffer = src_ctx->opus_buffer;
+    bridge->audio_ctx->opus_buffer_size = src_ctx->opus_buffer_size;
+    bridge->audio_ctx->opus_write_pos = src_ctx->opus_write_pos;
+    bridge->audio_ctx->opus_read_pos = src_ctx->opus_read_pos;
+    bridge->audio_ctx->opus_mutex = src_ctx->opus_mutex;
+    bridge->audio_ctx->sample_rate = src_ctx->sample_rate;
+    bridge->audio_ctx->channels = src_ctx->channels;
+    bridge->audio_ctx->initialized = src_ctx->initialized;
+    
+    fprintf(stderr, "[rdpsnd_bridge] Created session-specific audio context: buffer=%p\n",
+            (void*)bridge->audio_ctx->opus_buffer);
     
     /* Store input sample rate and check if resampling is needed */
     bridge->input_sample_rate = format->nSamplesPerSec;
@@ -289,10 +315,13 @@ static BOOL rdpsnd_bridge_open(rdpsndDevicePlugin* device,
     }
     bridge->pcm_buffer_samples = 0;
     
-    /* Update audio context format - report 48kHz since that's what Opus outputs */
+    /* Update audio context format - report 48kHz since that's what Opus outputs
+     * Note: initialized is a POINTER to the BridgeContext field */
     bridge->audio_ctx->sample_rate = OPUS_SAMPLE_RATE;
     bridge->audio_ctx->channels = format->nChannels;
-    bridge->audio_ctx->initialized = 1;
+    if (bridge->audio_ctx->initialized) {
+        *bridge->audio_ctx->initialized = 1;
+    }
     
     bridge->opened = TRUE;
     
@@ -471,6 +500,12 @@ static void rdpsnd_bridge_free(rdpsndDevicePlugin* device)
     if (bridge->resample_buffer) {
         free(bridge->resample_buffer);
         bridge->resample_buffer = NULL;
+    }
+    
+    /* Free session-specific audio context copy (not the buffer itself) */
+    if (bridge->audio_ctx) {
+        free(bridge->audio_ctx);
+        bridge->audio_ctx = NULL;
     }
     
     free(bridge);

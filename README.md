@@ -167,6 +167,7 @@ python -m http.server 8000
 | `WS_HOST` | `0.0.0.0` | WebSocket bind address |
 | `WS_PORT` | `8765` | WebSocket port |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `RDP_MAX_SESSIONS` | `100` | Maximum concurrent RDP sessions (range: 2-1000) |
 
 ### Frontend Configuration (app.js)
 

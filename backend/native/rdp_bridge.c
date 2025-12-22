@@ -38,6 +38,11 @@
 #define RDP_BRIDGE_VERSION "1.0.0"
 #define MAX_ERROR_LEN 512
 
+/* Session registry limits */
+#define RDP_MAX_SESSIONS_DEFAULT 100
+#define RDP_MAX_SESSIONS_MIN 2
+#define RDP_MAX_SESSIONS_MAX 1000
+
 /* Extended client context */
 typedef struct {
     rdpClientContext common;        /* Must be first */
@@ -108,17 +113,220 @@ static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedE
  * This is a regular global (not thread-local) because the rdpsnd plugin
  * runs in a different thread from the main Python thread, and we need
  * both threads to access the same buffer.
- * Note: For multi-session support, this would need to be session-specific. */
+ * 
+ * MULTI-SESSION NOTE: This global is protected by g_connect_mutex during the
+ * connect phase. Each session has its own audio buffer; this global just
+ * serves as a handoff mechanism to the plugin during Open callback.
+ * 
+ * For multi-session support, write_pos and read_pos are POINTERS to the
+ * actual positions in the BridgeContext. */
 static struct {
     uint8_t* opus_buffer;
     size_t opus_buffer_size;
-    size_t opus_write_pos;
-    size_t opus_read_pos;
+    size_t* opus_write_pos;         /* POINTER to BridgeContext.opus_write_pos */
+    size_t* opus_read_pos;          /* POINTER to BridgeContext.opus_read_pos */
     void* opus_mutex;
     int sample_rate;
     int channels;
-    volatile int initialized;
+    volatile int* initialized;      /* POINTER to BridgeContext.opus_initialized */
 } g_audio_ctx;
+
+/* Mutex to protect the connect phase (g_audio_ctx handoff to plugin) */
+static pthread_mutex_t g_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ============================================================================
+ * Session Registry for Multi-User Audio Isolation
+ * 
+ * Maps rdpContext pointers to BridgeContext pointers so the RDPSND plugin
+ * can look up the correct audio buffer for each session.
+ * ============================================================================ */
+
+typedef struct {
+    rdpContext* rdp_ctx;
+    BridgeContext* bridge_ctx;
+} SessionEntry;
+
+static SessionEntry* g_session_registry = NULL;
+static int g_session_count = 0;
+static int g_max_sessions = RDP_MAX_SESSIONS_DEFAULT;
+static pthread_mutex_t g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_registry_initialized = 0;
+
+/* Set maximum allowed sessions (called from Python at startup) */
+__attribute__((visibility("default")))
+int rdp_set_max_sessions(int limit)
+{
+    pthread_mutex_lock(&g_registry_mutex);
+    
+    if (limit < RDP_MAX_SESSIONS_MIN) {
+        fprintf(stderr, "[rdp_bridge] Warning: RDP_MAX_SESSIONS=%d is below minimum %d, using %d\n",
+                limit, RDP_MAX_SESSIONS_MIN, RDP_MAX_SESSIONS_MIN);
+        limit = RDP_MAX_SESSIONS_MIN;
+    } else if (limit > RDP_MAX_SESSIONS_MAX) {
+        fprintf(stderr, "[rdp_bridge] Warning: RDP_MAX_SESSIONS=%d exceeds maximum %d, using %d\n",
+                limit, RDP_MAX_SESSIONS_MAX, RDP_MAX_SESSIONS_MAX);
+        limit = RDP_MAX_SESSIONS_MAX;
+    }
+    
+    /* Only allow changing if no sessions are active */
+    if (g_session_count > 0) {
+        fprintf(stderr, "[rdp_bridge] Warning: Cannot change max sessions while sessions are active\n");
+        pthread_mutex_unlock(&g_registry_mutex);
+        return -1;
+    }
+    
+    /* Free old registry if it exists */
+    if (g_session_registry) {
+        free(g_session_registry);
+        g_session_registry = NULL;
+    }
+    
+    g_max_sessions = limit;
+    g_session_registry = calloc(g_max_sessions, sizeof(SessionEntry));
+    if (!g_session_registry) {
+        fprintf(stderr, "[rdp_bridge] ERROR: Failed to allocate session registry for %d sessions\n", g_max_sessions);
+        pthread_mutex_unlock(&g_registry_mutex);
+        return -1;
+    }
+    
+    g_registry_initialized = 1;
+    fprintf(stderr, "[rdp_bridge] Session registry initialized: max_sessions=%d\n", g_max_sessions);
+    
+    pthread_mutex_unlock(&g_registry_mutex);
+    return 0;
+}
+
+/* Get current max sessions limit */
+__attribute__((visibility("default")))
+int rdp_get_max_sessions(void)
+{
+    return g_max_sessions;
+}
+
+/* Register a session in the registry */
+static int session_registry_add(rdpContext* rdp_ctx, BridgeContext* bridge_ctx)
+{
+    pthread_mutex_lock(&g_registry_mutex);
+    
+    /* Initialize registry if not done yet */
+    if (!g_registry_initialized) {
+        g_session_registry = calloc(g_max_sessions, sizeof(SessionEntry));
+        if (!g_session_registry) {
+            fprintf(stderr, "[rdp_bridge] ERROR: Failed to allocate session registry\n");
+            pthread_mutex_unlock(&g_registry_mutex);
+            return -1;
+        }
+        g_registry_initialized = 1;
+        fprintf(stderr, "[rdp_bridge] Session registry initialized on first use: max_sessions=%d\n", g_max_sessions);
+    }
+    
+    /* Check if we're at capacity */
+    if (g_session_count >= g_max_sessions) {
+        fprintf(stderr, "[rdp_bridge] ERROR: Session limit reached (%d/%d) - cannot create new session\n",
+                g_session_count, g_max_sessions);
+        pthread_mutex_unlock(&g_registry_mutex);
+        return -2; /* Distinct error code for limit reached */
+    }
+    
+    /* Find empty slot */
+    for (int i = 0; i < g_max_sessions; i++) {
+        if (g_session_registry[i].rdp_ctx == NULL) {
+            g_session_registry[i].rdp_ctx = rdp_ctx;
+            g_session_registry[i].bridge_ctx = bridge_ctx;
+            g_session_count++;
+            fprintf(stderr, "[rdp_bridge] Session registered: %d/%d active\n", 
+                    g_session_count, g_max_sessions);
+            pthread_mutex_unlock(&g_registry_mutex);
+            return 0;
+        }
+    }
+    
+    fprintf(stderr, "[rdp_bridge] ERROR: No empty slot found in session registry\n");
+    pthread_mutex_unlock(&g_registry_mutex);
+    return -1;
+}
+
+/* Unregister a session from the registry */
+static void session_registry_remove(rdpContext* rdp_ctx)
+{
+    pthread_mutex_lock(&g_registry_mutex);
+    
+    if (!g_session_registry) {
+        pthread_mutex_unlock(&g_registry_mutex);
+        return;
+    }
+    
+    for (int i = 0; i < g_max_sessions; i++) {
+        if (g_session_registry[i].rdp_ctx == rdp_ctx) {
+            g_session_registry[i].rdp_ctx = NULL;
+            g_session_registry[i].bridge_ctx = NULL;
+            g_session_count--;
+            fprintf(stderr, "[rdp_bridge] Session unregistered: %d/%d active\n",
+                    g_session_count, g_max_sessions);
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_registry_mutex);
+}
+
+/* Look up BridgeContext by rdpContext (exported for plugin use) */
+__attribute__((visibility("default")))
+void* rdp_lookup_session_by_rdpcontext(void* rdp_ctx)
+{
+    if (!rdp_ctx) return NULL;
+    
+    pthread_mutex_lock(&g_registry_mutex);
+    
+    if (!g_session_registry) {
+        pthread_mutex_unlock(&g_registry_mutex);
+        return NULL;
+    }
+    
+    for (int i = 0; i < g_max_sessions; i++) {
+        if (g_session_registry[i].rdp_ctx == (rdpContext*)rdp_ctx) {
+            BridgeContext* ctx = g_session_registry[i].bridge_ctx;
+            pthread_mutex_unlock(&g_registry_mutex);
+            return ctx;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_registry_mutex);
+    return NULL;
+}
+
+/* Get audio context for a specific session (exported for plugin use)
+ * Returns a thread-local struct with POINTERS to the BridgeContext fields */
+__attribute__((visibility("default")))
+void* rdp_get_session_audio_context(void* session_ptr)
+{
+    BridgeContext* ctx = (BridgeContext*)session_ptr;
+    if (!ctx) return NULL;
+    
+    /* Return a pointer to a structure matching what the plugin expects
+     * Using pointers for mutable fields so plugin writes update BridgeContext */
+    static __thread struct {
+        uint8_t* opus_buffer;
+        size_t opus_buffer_size;
+        size_t* opus_write_pos;
+        size_t* opus_read_pos;
+        void* opus_mutex;
+        int sample_rate;
+        int channels;
+        volatile int* initialized;
+    } session_audio_ctx;
+    
+    session_audio_ctx.opus_buffer = ctx->opus_buffer;
+    session_audio_ctx.opus_buffer_size = ctx->opus_buffer_size;
+    session_audio_ctx.opus_write_pos = &ctx->opus_write_pos;
+    session_audio_ctx.opus_read_pos = &ctx->opus_read_pos;
+    session_audio_ctx.opus_mutex = &ctx->opus_mutex;
+    session_audio_ctx.sample_rate = ctx->opus_sample_rate;
+    session_audio_ctx.channels = ctx->opus_channels;
+    session_audio_ctx.initialized = &ctx->opus_initialized;
+    
+    return &session_audio_ctx;
+}
 
 /* ============================================================================
  * Session Lifecycle
@@ -174,16 +382,8 @@ RdpSession* rdp_create(
     ctx->opus_channels = 2;
     ctx->opus_initialized = 0;
     
-    /* Pre-populate the thread-local audio context so the plugin can access it
-     * when its Open callback is called during freerdp_connect() */
-    g_audio_ctx.opus_buffer = ctx->opus_buffer;
-    g_audio_ctx.opus_buffer_size = ctx->opus_buffer_size;
-    g_audio_ctx.opus_write_pos = 0;
-    g_audio_ctx.opus_read_pos = 0;
-    g_audio_ctx.opus_mutex = &ctx->opus_mutex;
-    g_audio_ctx.sample_rate = ctx->opus_sample_rate;
-    g_audio_ctx.channels = ctx->opus_channels;
-    g_audio_ctx.initialized = 0;
+    /* NOTE: g_audio_ctx is now set in rdp_connect() under g_connect_mutex lock
+     * to ensure thread-safe handoff to the plugin during connect */
     
     /* Set callbacks */
     instance->PreConnect = bridge_pre_connect;
@@ -284,6 +484,19 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate, TRUE)) goto fail;
     
+    /* Register session in the registry for multi-user audio isolation */
+    int reg_result = session_registry_add(context, ctx);
+    if (reg_result == -2) {
+        /* Session limit reached */
+        snprintf(ctx->error_msg, MAX_ERROR_LEN, "Session limit reached (%d max)", g_max_sessions);
+        ctx->state = RDP_STATE_ERROR;
+        goto fail;
+    } else if (reg_result != 0) {
+        snprintf(ctx->error_msg, MAX_ERROR_LEN, "Failed to register session");
+        ctx->state = RDP_STATE_ERROR;
+        goto fail;
+    }
+    
     /* Return context cast as session (context contains instance pointer) */
     return (RdpSession*)context;
     
@@ -304,7 +517,26 @@ int rdp_connect(RdpSession* session)
     
     ctx->state = RDP_STATE_CONNECTING;
     
+    /* Lock to protect g_audio_ctx handoff to the plugin during connect.
+     * The plugin's Open callback reads g_audio_ctx, so we must ensure
+     * no other session overwrites it during our connect operation. */
+    pthread_mutex_lock(&g_connect_mutex);
+    
+    /* Set up the global audio context to point to THIS session's buffer.
+     * The plugin will read this during its Open callback.
+     * Use POINTERS for write_pos, read_pos, initialized so the plugin
+     * can update the actual values in BridgeContext. */
+    g_audio_ctx.opus_buffer = ctx->opus_buffer;
+    g_audio_ctx.opus_buffer_size = ctx->opus_buffer_size;
+    g_audio_ctx.opus_write_pos = &ctx->opus_write_pos;
+    g_audio_ctx.opus_read_pos = &ctx->opus_read_pos;
+    g_audio_ctx.opus_mutex = &ctx->opus_mutex;
+    g_audio_ctx.sample_rate = ctx->opus_sample_rate;
+    g_audio_ctx.channels = ctx->opus_channels;
+    g_audio_ctx.initialized = &ctx->opus_initialized;
+    
     if (!freerdp_connect(instance)) {
+        pthread_mutex_unlock(&g_connect_mutex);
         UINT32 error = freerdp_get_last_error(context);
         snprintf(ctx->error_msg, MAX_ERROR_LEN, 
                  "Connection failed: 0x%08X", error);
@@ -316,6 +548,8 @@ int rdp_connect(RdpSession* session)
      * The plugin is loaded by FreeRDP during freerdp_connect(), so we need
      * to call rdp_set_audio_context after the plugin is available. */
     rdp_set_audio_context(session);
+    
+    pthread_mutex_unlock(&g_connect_mutex);
     
     ctx->state = RDP_STATE_CONNECTED;
     return 0;
@@ -355,6 +589,9 @@ void rdp_destroy(RdpSession* session)
     if (!session) return;
     rdpContext* context = (rdpContext*)session;
     BridgeContext* ctx = (BridgeContext*)context;
+    
+    /* Unregister from session registry BEFORE cleanup */
+    session_registry_remove(context);
     
     rdp_disconnect(session);
     
@@ -960,15 +1197,15 @@ void rdp_set_audio_context(RdpSession* session)
     rdpContext* context = (rdpContext*)session;
     BridgeContext* ctx = (BridgeContext*)context;
     
-    /* Point to our BridgeContext's Opus buffer */
+    /* Point to our BridgeContext's Opus buffer using POINTERS for mutable state */
     g_audio_ctx.opus_buffer = ctx->opus_buffer;
     g_audio_ctx.opus_buffer_size = ctx->opus_buffer_size;
-    g_audio_ctx.opus_write_pos = 0;
-    g_audio_ctx.opus_read_pos = 0;
+    g_audio_ctx.opus_write_pos = &ctx->opus_write_pos;
+    g_audio_ctx.opus_read_pos = &ctx->opus_read_pos;
     g_audio_ctx.opus_mutex = &ctx->opus_mutex;
     g_audio_ctx.sample_rate = ctx->opus_sample_rate;
     g_audio_ctx.channels = ctx->opus_channels;
-    g_audio_ctx.initialized = 0;
+    g_audio_ctx.initialized = &ctx->opus_initialized;
     
     /* Try to find and call the plugin's context setter using dlsym.
      * The plugin is loaded dynamically by FreeRDP during connect,
@@ -984,7 +1221,8 @@ void rdp_set_audio_context(RdpSession* session)
 }
 
 /* Exported function for the plugin to get the current audio context.
- * The plugin can call this via dlsym(RTLD_DEFAULT, "rdp_get_current_audio_context") */
+ * The plugin can call this via dlsym(RTLD_DEFAULT, "rdp_get_current_audio_context")
+ * Note: This is a legacy interface. For multi-session, use rdp_lookup_session_by_rdpcontext */
 __attribute__((visibility("default")))
 void* rdp_get_current_audio_context(void)
 {
@@ -993,94 +1231,100 @@ void* rdp_get_current_audio_context(void)
 
 bool rdp_has_opus_data(RdpSession* session)
 {
-    (void)session; /* We use the global context since plugin writes there */
+    if (!session) return false;
     
-    /* The rdpsnd plugin writes to g_audio_ctx, so we check there */
-    if (!g_audio_ctx.initialized || !g_audio_ctx.opus_buffer || !g_audio_ctx.opus_mutex) {
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    if (!ctx->opus_initialized || !ctx->opus_buffer) {
         return false;
     }
     
-    pthread_mutex_lock(g_audio_ctx.opus_mutex);
-    bool has_data = g_audio_ctx.opus_write_pos > g_audio_ctx.opus_read_pos;
-    pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+    pthread_mutex_lock(&ctx->opus_mutex);
+    bool has_data = ctx->opus_write_pos > ctx->opus_read_pos;
+    pthread_mutex_unlock(&ctx->opus_mutex);
     
     return has_data;
 }
 
 int rdp_get_opus_format(RdpSession* session, int* sample_rate, int* channels)
 {
-    (void)session; /* We use the global context since plugin writes there */
+    if (!session) return -1;
     
-    if (!g_audio_ctx.initialized) {
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    if (!ctx->opus_initialized) {
         return -1;
     }
     
-    pthread_mutex_lock(g_audio_ctx.opus_mutex);
-    if (sample_rate) *sample_rate = g_audio_ctx.sample_rate;
-    if (channels) *channels = g_audio_ctx.channels;
-    pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+    pthread_mutex_lock(&ctx->opus_mutex);
+    if (sample_rate) *sample_rate = ctx->opus_sample_rate;
+    if (channels) *channels = ctx->opus_channels;
+    pthread_mutex_unlock(&ctx->opus_mutex);
     
     return 0;
 }
 
 int rdp_get_opus_frame(RdpSession* session, uint8_t* buffer, int max_size)
 {
-    (void)session; /* We use the global context since plugin writes there */
+    if (!session || !buffer || max_size <= 0) return -1;
     
-    if (!buffer || max_size <= 0) return -1;
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
     
-    if (!g_audio_ctx.initialized || !g_audio_ctx.opus_buffer || !g_audio_ctx.opus_mutex) {
+    if (!ctx->opus_initialized || !ctx->opus_buffer) {
         return 0;
     }
     
-    pthread_mutex_lock(g_audio_ctx.opus_mutex);
+    pthread_mutex_lock(&ctx->opus_mutex);
     
     /* Check if we have any data */
-    if (g_audio_ctx.opus_write_pos <= g_audio_ctx.opus_read_pos) {
-        pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+    if (ctx->opus_write_pos <= ctx->opus_read_pos) {
+        pthread_mutex_unlock(&ctx->opus_mutex);
         return 0;
     }
     
     /* Read frame header (2 bytes: little-endian size) */
-    size_t read_pos = g_audio_ctx.opus_read_pos % g_audio_ctx.opus_buffer_size;
-    uint16_t frame_size = g_audio_ctx.opus_buffer[read_pos];
-    read_pos = (read_pos + 1) % g_audio_ctx.opus_buffer_size;
-    frame_size |= (uint16_t)g_audio_ctx.opus_buffer[read_pos] << 8;
-    read_pos = (read_pos + 1) % g_audio_ctx.opus_buffer_size;
+    size_t read_pos = ctx->opus_read_pos % ctx->opus_buffer_size;
+    uint16_t frame_size = ctx->opus_buffer[read_pos];
+    read_pos = (read_pos + 1) % ctx->opus_buffer_size;
+    frame_size |= (uint16_t)ctx->opus_buffer[read_pos] << 8;
+    read_pos = (read_pos + 1) % ctx->opus_buffer_size;
     
     if (frame_size == 0 || frame_size > 4000) {
         /* Invalid frame - reset buffer */
-        g_audio_ctx.opus_write_pos = 0;
-        g_audio_ctx.opus_read_pos = 0;
-        pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+        ctx->opus_write_pos = 0;
+        ctx->opus_read_pos = 0;
+        pthread_mutex_unlock(&ctx->opus_mutex);
         return 0;
     }
     
     if (frame_size > max_size) {
         /* Buffer too small - skip this frame */
-        g_audio_ctx.opus_read_pos += 2 + frame_size;
-        pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+        ctx->opus_read_pos += 2 + frame_size;
+        pthread_mutex_unlock(&ctx->opus_mutex);
         return -2;  /* Buffer too small error */
     }
     
     /* Read Opus frame data (handle wrap-around) */
-    size_t first_chunk = g_audio_ctx.opus_buffer_size - read_pos;
+    size_t first_chunk = ctx->opus_buffer_size - read_pos;
     if (first_chunk >= frame_size) {
-        memcpy(buffer, g_audio_ctx.opus_buffer + read_pos, frame_size);
+        memcpy(buffer, ctx->opus_buffer + read_pos, frame_size);
     } else {
-        memcpy(buffer, g_audio_ctx.opus_buffer + read_pos, first_chunk);
-        memcpy(buffer + first_chunk, g_audio_ctx.opus_buffer, frame_size - first_chunk);
+        memcpy(buffer, ctx->opus_buffer + read_pos, first_chunk);
+        memcpy(buffer + first_chunk, ctx->opus_buffer, frame_size - first_chunk);
     }
     
-    g_audio_ctx.opus_read_pos += 2 + frame_size;
+    ctx->opus_read_pos += 2 + frame_size;
     
     /* Reset positions if buffer is empty */
-    if (g_audio_ctx.opus_read_pos >= g_audio_ctx.opus_write_pos) {
-        g_audio_ctx.opus_write_pos = 0;
-        g_audio_ctx.opus_read_pos = 0;
+    if (ctx->opus_read_pos >= ctx->opus_write_pos) {
+        ctx->opus_write_pos = 0;
+        ctx->opus_read_pos = 0;
     }
     
-    pthread_mutex_unlock(g_audio_ctx.opus_mutex);
+    pthread_mutex_unlock(&ctx->opus_mutex);
     
     return frame_size;
 }

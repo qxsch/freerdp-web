@@ -19,6 +19,11 @@ extern "C" {
 /* Maximum dirty rectangles per frame */
 #define RDP_MAX_DIRTY_RECTS 64
 
+/* Session registry limits (compile-time defaults, runtime configurable) */
+#define RDP_MAX_SESSIONS_DEFAULT 100
+#define RDP_MAX_SESSIONS_MIN 2
+#define RDP_MAX_SESSIONS_MAX 1000
+
 /* Mouse button flags (compatible with FreeRDP PTR_FLAGS_*) */
 #define RDP_MOUSE_FLAG_MOVE     0x0800
 #define RDP_MOUSE_FLAG_BUTTON1  0x1000  /* Left */
@@ -53,6 +58,28 @@ typedef struct {
 
 /* Opaque session handle */
 typedef struct RdpSession RdpSession;
+
+/* ============================================================================
+ * Session Registry API (for multi-user audio isolation)
+ * ============================================================================ */
+
+/**
+ * Set the maximum number of concurrent RDP sessions allowed
+ * 
+ * Must be called before any sessions are created. The limit is clamped to
+ * the range [RDP_MAX_SESSIONS_MIN, RDP_MAX_SESSIONS_MAX].
+ * 
+ * @param limit     Maximum number of sessions (default: 100, range: 2-1000)
+ * @return          0 on success, -1 on failure
+ */
+int rdp_set_max_sessions(int limit);
+
+/**
+ * Get the current maximum sessions limit
+ * 
+ * @return          Current maximum session limit
+ */
+int rdp_get_max_sessions(void);
 
 /**
  * Create a new RDP session (does not connect yet)

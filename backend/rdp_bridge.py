@@ -264,6 +264,58 @@ class NativeLibrary:
         # rdp_get_opus_frame
         lib.rdp_get_opus_frame.argtypes = [c_void_p, POINTER(c_uint8), c_int]
         lib.rdp_get_opus_frame.restype = c_int
+        
+        # Session registry functions
+        # rdp_set_max_sessions
+        lib.rdp_set_max_sessions.argtypes = [c_int]
+        lib.rdp_set_max_sessions.restype = c_int
+        
+        # rdp_get_max_sessions
+        lib.rdp_get_max_sessions.argtypes = []
+        lib.rdp_get_max_sessions.restype = c_int
+        
+        # Initialize session registry with configurable limit
+        self._init_session_registry()
+    
+    def _init_session_registry(self):
+        """Initialize the session registry with configurable limit from RDP_MAX_SESSIONS env var"""
+        # Read environment variable with validation
+        default_max = 100
+        min_max = 2
+        max_max = 1000
+        
+        max_sessions_str = os.environ.get('RDP_MAX_SESSIONS', '')
+        if max_sessions_str:
+            try:
+                max_sessions = int(max_sessions_str)
+                if max_sessions < min_max:
+                    logger.warning(
+                        f"RDP_MAX_SESSIONS={max_sessions} is below minimum {min_max}, using {min_max}"
+                    )
+                    max_sessions = min_max
+                elif max_sessions > max_max:
+                    logger.warning(
+                        f"RDP_MAX_SESSIONS={max_sessions} exceeds maximum {max_max}, using {max_max}"
+                    )
+                    max_sessions = max_max
+                else:
+                    logger.info(f"RDP_MAX_SESSIONS configured: {max_sessions}")
+            except ValueError:
+                logger.warning(
+                    f"RDP_MAX_SESSIONS='{max_sessions_str}' is not a valid integer, using default {default_max}"
+                )
+                max_sessions = default_max
+        else:
+            max_sessions = default_max
+            logger.info(f"RDP_MAX_SESSIONS not set, using default: {max_sessions}")
+        
+        # Initialize the native session registry
+        result = self._lib.rdp_set_max_sessions(max_sessions)
+        if result == 0:
+            actual_max = self._lib.rdp_get_max_sessions()
+            logger.info(f"Session registry initialized: max_sessions={actual_max}")
+        else:
+            logger.error("Failed to initialize session registry")
     
     def __getattr__(self, name):
         """Proxy attribute access to the underlying library"""
