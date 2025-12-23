@@ -17,6 +17,11 @@ pkg_check_modules(FREERDP_CLIENT3 REQUIRED freerdp-client3)
 pkg_check_modules(WINPR3 REQUIRED winpr3)
 pkg_check_modules(OPUS REQUIRED opus)
 
+# FFmpeg for AVC444 transcoding (4:4:4 → 4:2:0)
+pkg_check_modules(LIBAVCODEC REQUIRED libavcodec)
+pkg_check_modules(LIBAVUTIL REQUIRED libavutil)
+pkg_check_modules(LIBSWSCALE REQUIRED libswscale)
+
 # ==============================================================================
 # Main RDP Bridge Library
 # ==============================================================================
@@ -32,6 +37,9 @@ target_include_directories(rdp_bridge PRIVATE
     ${FREERDP_CLIENT3_INCLUDE_DIRS}
     ${WINPR3_INCLUDE_DIRS}
     ${OPUS_INCLUDE_DIRS}
+    ${LIBAVCODEC_INCLUDE_DIRS}
+    ${LIBAVUTIL_INCLUDE_DIRS}
+    ${LIBSWSCALE_INCLUDE_DIRS}
 )
 
 # Link directories
@@ -40,6 +48,9 @@ target_link_directories(rdp_bridge PRIVATE
     ${FREERDP_CLIENT3_LIBRARY_DIRS}
     ${WINPR3_LIBRARY_DIRS}
     ${OPUS_LIBRARY_DIRS}
+    ${LIBAVCODEC_LIBRARY_DIRS}
+    ${LIBAVUTIL_LIBRARY_DIRS}
+    ${LIBSWSCALE_LIBRARY_DIRS}
 )
 
 # Link libraries
@@ -48,6 +59,9 @@ target_link_libraries(rdp_bridge PRIVATE
     ${FREERDP_CLIENT3_LIBRARIES}
     ${WINPR3_LIBRARIES}
     ${OPUS_LIBRARIES}
+    ${LIBAVCODEC_LIBRARIES}
+    ${LIBAVUTIL_LIBRARIES}
+    ${LIBSWSCALE_LIBRARIES}
     pthread
     dl
 )
@@ -58,6 +72,9 @@ target_compile_options(rdp_bridge PRIVATE
     ${FREERDP_CLIENT3_CFLAGS_OTHER}
     ${WINPR3_CFLAGS_OTHER}
     ${OPUS_CFLAGS_OTHER}
+    ${LIBAVCODEC_CFLAGS_OTHER}
+    ${LIBAVUTIL_CFLAGS_OTHER}
+    ${LIBSWSCALE_CFLAGS_OTHER}
     -Wall
     -Wextra
     -O2

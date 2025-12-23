@@ -267,6 +267,12 @@ async def handle_client(websocket: ServerConnection):
                 elif msg_type == 'ping':
                     await websocket.send(json.dumps({'type': 'pong'}))
                 
+                elif msg_type == 'ack_frame':
+                    # Acknowledge H.264 frame to prevent server back-pressure
+                    if rdp_bridge:
+                        frame_id = data.get('frame_id', 0)
+                        await rdp_bridge.ack_h264_frame(frame_id)
+                
                 else:
                     logger.warning(f"Unknown message type: {msg_type}")
                     

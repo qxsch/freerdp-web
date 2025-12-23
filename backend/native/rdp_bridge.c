@@ -2,7 +2,8 @@
  * RDP Bridge Native Library Implementation
  * 
  * Uses FreeRDP3 libfreerdp for direct RDP connection with:
- * - GDI software rendering to memory buffer
+ * - GFX pipeline with H.264/AVC444 support for low-latency video
+ * - GDI software rendering as fallback
  * - Dirty rectangle tracking for delta updates
  * - Direct input injection (no X11/xdotool)
  */
@@ -15,6 +16,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <time.h>
 
 /* FreeRDP3 headers */
 #include <freerdp/freerdp.h>
@@ -24,24 +26,61 @@
 #include <freerdp/gdi/gfx.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/rdpsnd.h>
+#include <freerdp/channels/rdpgfx.h>
 #include <freerdp/client/disp.h>
 #include <freerdp/client/rdpsnd.h>
 #include <freerdp/client/rdpgfx.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/event.h>
+#include <freerdp/codec/clear.h>
+#include <freerdp/codec/planar.h>
+#include <freerdp/codec/progressive.h>
+#include <freerdp/codec/color.h>
 #include <opus/opus.h>
 #include <winpr/crt.h>
 #include <winpr/synch.h>
 #include <winpr/thread.h>
 #include <winpr/collections.h>
+#include <freerdp/codec/region.h>
 
-#define RDP_BRIDGE_VERSION "1.0.0"
+/* FFmpeg for AVC444 transcoding (4:4:4 → 4:2:0) */
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#define RDP_BRIDGE_VERSION "1.6.0"
 #define MAX_ERROR_LEN 512
 
 /* Session registry limits */
 #define RDP_MAX_SESSIONS_DEFAULT 100
 #define RDP_MAX_SESSIONS_MIN 2
 #define RDP_MAX_SESSIONS_MAX 1000
+
+/* Internal H.264 frame queue entry */
+typedef struct {
+    uint32_t frame_id;
+    uint16_t surface_id;
+    RdpGfxCodecId codec_id;
+    RdpH264FrameType frame_type;
+    RdpRect dest_rect;
+    uint32_t nal_size;
+    uint8_t* nal_data;           /* Allocated buffer */
+    uint32_t chroma_nal_size;
+    uint8_t* chroma_nal_data;    /* Allocated buffer for AVC444 */
+    uint64_t timestamp;
+    bool needs_ack;
+    bool valid;                  /* Slot in use */
+} H264FrameEntry;
+
+/* GFX cache entry - for SurfaceToCache/CacheToSurface operations */
+typedef struct {
+    bool valid;
+    uint32_t width;
+    uint32_t height;
+    uint8_t* data;               /* BGRA32 pixel data */
+    size_t data_size;
+} GfxCacheEntry;
 
 /* Extended client context */
 typedef struct {
@@ -51,7 +90,7 @@ typedef struct {
     RdpState state;
     char error_msg[MAX_ERROR_LEN];
     
-    /* Frame buffer */
+    /* Frame buffer (GDI fallback) */
     uint8_t* frame_buffer;
     int frame_width;
     int frame_height;
@@ -73,6 +112,35 @@ typedef struct {
     
     /* Graphics pipeline channel */
     RdpgfxClientContext* gfx;
+    bool gfx_active;                /* GFX pipeline successfully initialized */
+    bool gfx_disconnecting;         /* Connection is being torn down - don't call GDI */
+    RdpGfxCodecId gfx_codec;        /* Negotiated codec */
+    bool gfx_pipeline_needs_init;   /* Deferred GDI pipeline init flag */
+    bool gfx_pipeline_ready;        /* GDI pipeline initialized for decoding */
+    rdpGdi* gdi;                    /* GDI pointer for chaining to GDI handlers */
+    
+    /* Saved GDI pipeline callbacks for chaining */
+    pcRdpgfxSurfaceCommand gdi_surface_command;
+    pcRdpgfxResetGraphics gdi_reset_graphics;
+    pcRdpgfxCreateSurface gdi_create_surface;
+    pcRdpgfxDeleteSurface gdi_delete_surface;
+    pcRdpgfxMapSurfaceToOutput gdi_map_surface;
+    pcRdpgfxStartFrame gdi_start_frame;
+    pcRdpgfxEndFrame gdi_end_frame;
+    
+    /* GFX surfaces */
+    RdpGfxSurface surfaces[RDP_MAX_GFX_SURFACES];
+    uint16_t primary_surface_id;
+    uint32_t current_frame_id;      /* Current frame ID from start_frame */
+    uint32_t frame_cmd_count;       /* Commands received in current frame */
+    pthread_mutex_t gfx_mutex;
+    
+    /* H.264 frame queue (ring buffer) */
+    H264FrameEntry h264_frames[RDP_MAX_H264_FRAMES];
+    int h264_write_idx;
+    int h264_read_idx;
+    int h264_count;
+    pthread_mutex_t h264_mutex;
     
     /* Audio playback */
     rdpsndDevicePlugin* rdpsnd;
@@ -97,6 +165,30 @@ typedef struct {
     int opus_channels;
     volatile int opus_initialized;
     
+    /* AVC444 transcoder (4:4:4 → 4:2:0 for browser compatibility) */
+    AVCodecContext* avc_decoder_luma;
+    AVCodecContext* avc_decoder_chroma;
+    AVCodecContext* avc_encoder;
+    struct SwsContext* sws_ctx;
+    AVFrame* decoded_frame_luma;
+    AVFrame* decoded_frame_chroma;
+    AVFrame* combined_frame;       /* Combined YUV444 */
+    AVFrame* output_frame;         /* Converted YUV420 */
+    AVPacket* encode_pkt;
+    bool transcoder_initialized;
+    
+    /* Codec decoders for non-H.264 GFX codecs (thread-safe, no GDI dependency) */
+    CLEAR_CONTEXT* clear_decoder;
+    BITMAP_PLANAR_CONTEXT* planar_decoder;
+    PROGRESSIVE_CONTEXT* progressive_decoder;
+    
+    /* Per-surface pixel buffers for codec decoding (indexed by surface ID) */
+    uint8_t* surface_buffers[RDP_MAX_GFX_SURFACES];
+    
+    /* GFX bitmap cache for SurfaceToCache/CacheToSurface operations */
+    GfxCacheEntry* gfx_cache;     /* Dynamically allocated cache */
+    int gfx_cache_size;           /* Number of slots allocated */
+    
 } BridgeContext;
 
 /* Forward declarations */
@@ -108,6 +200,37 @@ static BOOL bridge_end_paint(rdpContext* context);
 static BOOL bridge_desktop_resize(rdpContext* context);
 static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventArgs* e);
 static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedEventArgs* e);
+
+/* GFX pipeline callback forward declarations */
+static UINT gfx_on_caps_confirm(RdpgfxClientContext* context, const RDPGFX_CAPS_CONFIRM_PDU* caps);
+static UINT gfx_on_reset_graphics(RdpgfxClientContext* context, const RDPGFX_RESET_GRAPHICS_PDU* reset);
+static UINT gfx_on_create_surface(RdpgfxClientContext* context, const RDPGFX_CREATE_SURFACE_PDU* create);
+static UINT gfx_on_delete_surface(RdpgfxClientContext* context, const RDPGFX_DELETE_SURFACE_PDU* del);
+static UINT gfx_on_map_surface(RdpgfxClientContext* context, const RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU* map);
+static UINT gfx_on_map_surface_scaled(RdpgfxClientContext* context, const RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU* map);
+static UINT gfx_on_map_surface_window(RdpgfxClientContext* context, const RDPGFX_MAP_SURFACE_TO_WINDOW_PDU* map);
+static UINT gfx_on_map_surface_scaled_window(RdpgfxClientContext* context, const RDPGFX_MAP_SURFACE_TO_SCALED_WINDOW_PDU* map);
+static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SURFACE_COMMAND* cmd);
+static UINT gfx_on_start_frame(RdpgfxClientContext* context, const RDPGFX_START_FRAME_PDU* start);
+static UINT gfx_on_end_frame(RdpgfxClientContext* context, const RDPGFX_END_FRAME_PDU* end);
+static UINT gfx_on_solid_fill(RdpgfxClientContext* context, const RDPGFX_SOLID_FILL_PDU* fill);
+static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context, const RDPGFX_SURFACE_TO_SURFACE_PDU* copy);
+static UINT gfx_on_surface_to_cache(RdpgfxClientContext* context, const RDPGFX_SURFACE_TO_CACHE_PDU* cache);
+static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context, const RDPGFX_CACHE_TO_SURFACE_PDU* cache);
+static UINT gfx_on_evict_cache(RdpgfxClientContext* context, const RDPGFX_EVICT_CACHE_ENTRY_PDU* evict);
+static UINT gfx_on_delete_encoding_context(RdpgfxClientContext* context, const RDPGFX_DELETE_ENCODING_CONTEXT_PDU* del);
+static UINT gfx_on_cache_import_reply(RdpgfxClientContext* context, const RDPGFX_CACHE_IMPORT_REPLY_PDU* reply);
+
+/* Transcoder forward declarations */
+static bool init_transcoder(BridgeContext* ctx, int width, int height);
+static void cleanup_transcoder(BridgeContext* ctx);
+static bool transcode_avc444(BridgeContext* ctx,
+                             const uint8_t* luma_data, uint32_t luma_size,
+                             const uint8_t* chroma_data, uint32_t chroma_size,
+                             uint8_t** out_data, uint32_t* out_size);
+
+/* Deferred GDI pipeline initialization - call from main thread */
+static void maybe_init_gfx_pipeline(BridgeContext* bctx);
 
 /* Global audio context structure for plugin communication.
  * This is a regular global (not thread-local) because the rdpsnd plugin
@@ -368,10 +491,33 @@ RdpSession* rdp_create(
     pthread_mutex_init(&ctx->rect_mutex, NULL);
     pthread_mutex_init(&ctx->audio_mutex, NULL);
     pthread_mutex_init(&ctx->opus_mutex, NULL);
+    pthread_mutex_init(&ctx->gfx_mutex, NULL);
+    pthread_mutex_init(&ctx->h264_mutex, NULL);
     ctx->audio_initialized = false;
     ctx->audio_buffer = NULL;
     ctx->audio_buffer_size = 0;
     ctx->opus_encoder = NULL;
+    
+    /* Initialize GFX/H.264 structures */
+    ctx->gfx = NULL;
+    ctx->gfx_active = false;
+    ctx->gfx_codec = RDP_GFX_CODEC_UNCOMPRESSED;
+    ctx->primary_surface_id = 0;
+    memset(ctx->surfaces, 0, sizeof(ctx->surfaces));
+    memset(ctx->surface_buffers, 0, sizeof(ctx->surface_buffers));
+    memset(ctx->h264_frames, 0, sizeof(ctx->h264_frames));
+    ctx->h264_write_idx = 0;
+    ctx->h264_read_idx = 0;
+    ctx->h264_count = 0;
+    
+    /* Initialize codec decoders for non-H.264 GFX codecs */
+    ctx->clear_decoder = clear_context_new(FALSE);  /* FALSE = decompressor */
+    ctx->planar_decoder = freerdp_bitmap_planar_context_new(0, 64, 64);  /* Will resize as needed */
+    ctx->progressive_decoder = progressive_context_new(FALSE);  /* FALSE = decompressor */
+    
+    /* Initialize GFX bitmap cache */
+    ctx->gfx_cache_size = RDP_MAX_GFX_CACHE_SLOTS;
+    ctx->gfx_cache = (GfxCacheEntry*)calloc(ctx->gfx_cache_size, sizeof(GfxCacheEntry));
     
     /* Initialize Opus buffer for native audio streaming */
     ctx->opus_buffer_size = 64 * 1024;  /* 64KB for ~1 second of Opus at 64kbps */
@@ -413,10 +559,24 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height)) goto fail;
     if (!freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, bpp)) goto fail;
     
-    /* Use legacy GDI mode for stable headless rendering.
-     * GFX pipeline is disabled because gdi_graphics_pipeline_init() causes
-     * threading issues when called from channel callbacks in FreeRDP3. */
-    if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, FALSE)) goto fail;
+    /* Enable GFX pipeline with H.264/AVC444 for modern, low-latency graphics.
+     * This enables the RDPEGFX channel which carries H.264-encoded frames.
+     * Server must have "Prioritize H.264/AVC 444" policy enabled for best results. */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE)) goto fail;
+    /* DISABLE progressive codec - it causes crashes in GDI's gdi_OutputUpdate.
+     * The server will use H.264 if available, otherwise fall back to other codecs.
+     * Progressive (codec 0x0008) has a thread-safety issue with FreeRDP's GDI subsystem. */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE)) goto fail;
+    /* Disable legacy codecs - we want H.264 only */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_NSCodec, FALSE)) goto fail;
+    /* GFX options for optimal streaming */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxThinClient, FALSE)) goto fail;
     
     /* Audio playback - configure rdpsnd with our bridge device plugin.
      * We add rdpsnd to BOTH static and dynamic channel collections with sys:bridge
@@ -472,6 +632,14 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_bool(settings, FreeRDP_DisableFullWindowDrag, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_DisableMenuAnims, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_DisableThemes, TRUE)) goto fail;
+    
+    /* Disable device redirection channels we don't need (prevents RDPDR errors) */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectDrives, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectPrinters, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectSmartCards, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectSerialPorts, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectParallelPorts, FALSE)) goto fail;
     
     /* Certificate handling - ignore for simplicity */
     if (!freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, TRUE)) goto fail;
@@ -595,9 +763,24 @@ void rdp_destroy(RdpSession* session)
     
     rdp_disconnect(session);
     
+    /* Cleanup transcoder */
+    cleanup_transcoder(ctx);
+    
     pthread_mutex_destroy(&ctx->rect_mutex);
     pthread_mutex_destroy(&ctx->audio_mutex);
     pthread_mutex_destroy(&ctx->opus_mutex);
+    pthread_mutex_destroy(&ctx->h264_mutex);
+    pthread_mutex_destroy(&ctx->gfx_mutex);
+    
+    /* Free H.264 frame queue */
+    for (int i = 0; i < RDP_MAX_H264_FRAMES; i++) {
+        if (ctx->h264_frames[i].nal_data) {
+            free(ctx->h264_frames[i].nal_data);
+        }
+        if (ctx->h264_frames[i].chroma_nal_data) {
+            free(ctx->h264_frames[i].chroma_nal_data);
+        }
+    }
     
     /* Free audio resources */
     if (ctx->opus_encoder) {
@@ -617,6 +800,63 @@ void rdp_destroy(RdpSession* session)
 }
 
 /* ============================================================================
+ * Deferred GDI Pipeline Initialization
+ * ============================================================================ */
+
+static void maybe_init_gfx_pipeline(BridgeContext* bctx)
+{
+    /* Check if deferred initialization is needed */
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    bool needs_init = bctx->gfx_pipeline_needs_init && !bctx->gfx_pipeline_ready;
+    RdpgfxClientContext* gfx = bctx->gfx;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    if (!needs_init || !gfx) {
+        return;
+    }
+    
+    rdpContext* context = (rdpContext*)bctx;
+    rdpGdi* gdi = context->gdi;
+    
+    if (!gdi) {
+        fprintf(stderr, "[rdp_bridge] Cannot init GFX pipeline: GDI not available\n");
+        return;
+    }
+    
+    fprintf(stderr, "[rdp_bridge] Initializing PURE GFX pipeline (no GDI chaining)\n");
+    
+    /* Check if FreeRDP set up the FrameAcknowledge callback */
+    if (gfx->FrameAcknowledge) {
+        fprintf(stderr, "[rdp_bridge] FrameAcknowledge callback is set by FreeRDP\n");
+    } else {
+        fprintf(stderr, "[rdp_bridge] WARNING: FrameAcknowledge callback is NULL - acks won't be sent!\n");
+    }
+    
+    /* PURE GFX MODE: Do NOT call gdi_graphics_pipeline_init()!
+     * 
+     * Per RDPEGFX spec, when GFX is active we handle graphics ONLY via GFX callbacks.
+     * gdi_graphics_pipeline_init registers GDI handlers that expect to run on the
+     * main thread and call gdi_OutputUpdate(), causing crashes on the GFX thread.
+     * 
+     * Instead, we:
+     * 1. Keep gdi_init() for the primary framebuffer only
+     * 2. Manage GFX surfaces ourselves (surface_buffers array)
+     * 3. Decode ClearCodec/Planar using FreeRDP's standalone codec APIs
+     * 4. Copy decoded pixels directly to primary_buffer
+     * 5. Send FrameAcknowledge ourselves
+     */
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    bctx->gdi = gdi;
+    bctx->gfx_pipeline_needs_init = false;
+    bctx->gfx_pipeline_ready = true;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    /* GFX callbacks are already set in bridge_on_channel_connected */
+    fprintf(stderr, "[rdp_bridge] Pure GFX pipeline ready (surfaces managed internally)\n");
+}
+
+/* ============================================================================
  * Event Processing & Frame Capture
  * ============================================================================ */
 
@@ -625,7 +865,6 @@ int rdp_poll(RdpSession* session, int timeout_ms)
     if (!session) return -1;
     
     rdpContext* context = (rdpContext*)session;
-    freerdp* instance = context->instance;
     BridgeContext* ctx = (BridgeContext*)context;
     
     if (ctx->state != RDP_STATE_CONNECTED) {
@@ -640,15 +879,24 @@ int rdp_poll(RdpSession* session, int timeout_ms)
         return 1;
     }
     
-    /* Handle pending resize - use display control channel if available */
-    if (ctx->resize_pending) {
+    /* Handle pending resize - use display control channel if available.
+     * IMPORTANT: Don't process resize during GFX pipeline init to avoid race conditions. */
+    pthread_mutex_lock(&ctx->gfx_mutex);
+    bool gfx_initializing = ctx->gfx_pipeline_needs_init && !ctx->gfx_pipeline_ready;
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+    
+    if (ctx->resize_pending && !gfx_initializing) {
         ctx->resize_pending = false;
         
         uint32_t new_width = ctx->pending_width;
         uint32_t new_height = ctx->pending_height;
         
+        /* Skip if dimensions haven't actually changed */
+        if (ctx->frame_width == (int)new_width && ctx->frame_height == (int)new_height) {
+            fprintf(stderr, "[rdp_bridge] Skipping redundant resize in poll\n");
+        }
         /* Try to use Display Control channel for dynamic resize */
-        if (ctx->disp && ctx->disp->SendMonitorLayout) {
+        else if (ctx->disp && ctx->disp->SendMonitorLayout) {
             DISPLAY_CONTROL_MONITOR_LAYOUT layout = { 0 };
             layout.Flags = DISPLAY_CONTROL_MONITOR_PRIMARY;
             layout.Left = 0;
@@ -661,14 +909,18 @@ int rdp_poll(RdpSession* session, int timeout_ms)
             layout.DesktopScaleFactor = 100;
             layout.DeviceScaleFactor = 100;
             
+            fprintf(stderr, "[rdp_bridge] Sending MonitorLayout resize to %ux%u\n", new_width, new_height);
             ctx->disp->SendMonitorLayout(ctx->disp, 1, &layout);
+            
+            /* Mark for full frame after resize - only when we actually send a resize */
+            pthread_mutex_lock(&ctx->rect_mutex);
+            ctx->needs_full_frame = true;
+            pthread_mutex_unlock(&ctx->rect_mutex);
         }
-        
-        /* Mark for full frame after resize */
-        pthread_mutex_lock(&ctx->rect_mutex);
-        ctx->needs_full_frame = true;
-        pthread_mutex_unlock(&ctx->rect_mutex);
     }
+    
+    /* Deferred GDI pipeline initialization (safe from main thread) */
+    maybe_init_gfx_pipeline(ctx);
     
     /* Get file descriptors for select/poll */
     HANDLE handles[MAXIMUM_WAIT_OBJECTS] = { 0 };
@@ -693,6 +945,12 @@ int rdp_poll(RdpSession* session, int timeout_ms)
             snprintf(ctx->error_msg, MAX_ERROR_LEN, 
                      "Event handling error: 0x%08X", error);
             ctx->state = RDP_STATE_ERROR;
+            
+            /* Mark as disconnecting to prevent GDI handler calls from other threads */
+            pthread_mutex_lock(&ctx->gfx_mutex);
+            ctx->gfx_disconnecting = true;
+            pthread_mutex_unlock(&ctx->gfx_mutex);
+            
             return -1;
         }
     }
@@ -710,7 +968,6 @@ uint8_t* rdp_get_frame_buffer(RdpSession* session, int* width, int* height, int*
     if (!session) return NULL;
     
     rdpContext* context = (rdpContext*)session;
-    BridgeContext* ctx = (BridgeContext*)context;
     rdpGdi* gdi = context->gdi;
     
     if (!gdi || !gdi->primary_buffer) {
@@ -836,6 +1093,16 @@ int rdp_resize(RdpSession* session, uint32_t width, uint32_t height)
         return -1;
     }
     
+    /* Skip redundant resize requests - these can cause race conditions
+     * with GFX pipeline initialization during early connection */
+    if (ctx->frame_width == (int)width && ctx->frame_height == (int)height) {
+        fprintf(stderr, "[rdp_bridge] Skipping redundant resize to %ux%u\n", width, height);
+        return 0;
+    }
+    
+    fprintf(stderr, "[rdp_bridge] Queuing resize from %dx%d to %ux%u\n",
+            ctx->frame_width, ctx->frame_height, width, height);
+    
     /* Queue resize for next poll - don't set needs_full_frame here!
      * The bridge_desktop_resize callback will set it AFTER the resize completes.
      * This prevents sending a frame before the resize is processed. */
@@ -875,7 +1142,6 @@ static BOOL bridge_post_connect(freerdp* instance)
 {
     BridgeContext* ctx = (BridgeContext*)instance->context;
     rdpContext* context = instance->context;
-    rdpSettings* settings = context->settings;
     
     /* Initialize GDI for software rendering */
     if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) {
@@ -933,6 +1199,39 @@ static void bridge_post_disconnect(freerdp* instance)
     ctx->state = RDP_STATE_DISCONNECTED;
     ctx->frame_buffer = NULL;
     
+    /* Free codec decoders */
+    if (ctx->clear_decoder) {
+        clear_context_free(ctx->clear_decoder);
+        ctx->clear_decoder = NULL;
+    }
+    if (ctx->planar_decoder) {
+        freerdp_bitmap_planar_context_free(ctx->planar_decoder);
+        ctx->planar_decoder = NULL;
+    }
+    if (ctx->progressive_decoder) {
+        progressive_context_free(ctx->progressive_decoder);
+        ctx->progressive_decoder = NULL;
+    }
+    
+    /* Free surface buffers */
+    for (int i = 0; i < RDP_MAX_GFX_SURFACES; i++) {
+        if (ctx->surface_buffers[i]) {
+            free(ctx->surface_buffers[i]);
+            ctx->surface_buffers[i] = NULL;
+        }
+    }
+    
+    /* Free GFX cache */
+    if (ctx->gfx_cache) {
+        for (int i = 0; i < ctx->gfx_cache_size; i++) {
+            if (ctx->gfx_cache[i].data) {
+                free(ctx->gfx_cache[i].data);
+            }
+        }
+        free(ctx->gfx_cache);
+        ctx->gfx_cache = NULL;
+    }
+    
     gdi_free(instance);
 }
 
@@ -967,8 +1266,52 @@ static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventAr
         pthread_mutex_unlock(&bctx->opus_mutex);
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
-        /* GFX pipeline disabled - just store reference */
-        bctx->gfx = (RdpgfxClientContext*)e->pInterface;
+        /* GFX pipeline connected - save context and set deferred init flag.
+         * 
+         * We do NOT call gdi_graphics_pipeline_init() here because it causes
+         * thread-safety issues (GDI reinit in different thread).
+         * Instead, we set a flag and initialize from the main poll thread.
+         */
+        RdpgfxClientContext* gfx = (RdpgfxClientContext*)e->pInterface;
+        bctx->gfx = gfx;
+        
+        if (gfx) {
+            /* Store our context for callbacks */
+            gfx->custom = bctx;
+            
+            pthread_mutex_lock(&bctx->gfx_mutex);
+            bctx->gfx_active = true;
+            bctx->gfx_pipeline_needs_init = true;  /* Deferred init in main thread */
+            pthread_mutex_unlock(&bctx->gfx_mutex);
+            
+            /* Set up ALL GFX callbacks for proper protocol handling.
+             * Missing callbacks can cause the server to abort the connection.
+             * 
+             * PURE GFX MODE: We handle graphics via RDPEGFX callbacks only.
+             * H.264/AVC frames are captured and passed to WebSocket clients.
+             * Non-H.264 codecs are decoded to the primary buffer.
+             */
+            gfx->CapsConfirm = gfx_on_caps_confirm;
+            gfx->ResetGraphics = gfx_on_reset_graphics;
+            gfx->StartFrame = gfx_on_start_frame;
+            gfx->EndFrame = gfx_on_end_frame;
+            gfx->SurfaceCommand = gfx_on_surface_command;
+            gfx->CreateSurface = gfx_on_create_surface;
+            gfx->DeleteSurface = gfx_on_delete_surface;
+            gfx->MapSurfaceToOutput = gfx_on_map_surface;
+            gfx->MapSurfaceToScaledOutput = gfx_on_map_surface_scaled;
+            gfx->MapSurfaceToWindow = gfx_on_map_surface_window;
+            gfx->MapSurfaceToScaledWindow = gfx_on_map_surface_scaled_window;
+            gfx->SolidFill = gfx_on_solid_fill;
+            gfx->SurfaceToSurface = gfx_on_surface_to_surface;
+            gfx->SurfaceToCache = gfx_on_surface_to_cache;
+            gfx->CacheToSurface = gfx_on_cache_to_surface;
+            gfx->EvictCacheEntry = gfx_on_evict_cache;
+            gfx->DeleteEncodingContext = gfx_on_delete_encoding_context;
+            gfx->CacheImportReply = gfx_on_cache_import_reply;
+            
+            fprintf(stderr, "[rdp_bridge] GFX channel connected, all callbacks registered\n");
+        }
     }
 }
 
@@ -990,7 +1333,31 @@ static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedE
         pthread_mutex_unlock(&bctx->opus_mutex);
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
+        pthread_mutex_lock(&bctx->gfx_mutex);
+        if (bctx->gfx_active && context->gdi) {
+            gdi_graphics_pipeline_uninit(context->gdi, bctx->gfx);
+        }
         bctx->gfx = NULL;
+        bctx->gfx_active = false;
+        pthread_mutex_unlock(&bctx->gfx_mutex);
+        
+        /* Clear H.264 frame queue */
+        pthread_mutex_lock(&bctx->h264_mutex);
+        for (int i = 0; i < RDP_MAX_H264_FRAMES; i++) {
+            if (bctx->h264_frames[i].nal_data) {
+                free(bctx->h264_frames[i].nal_data);
+                bctx->h264_frames[i].nal_data = NULL;
+            }
+            if (bctx->h264_frames[i].chroma_nal_data) {
+                free(bctx->h264_frames[i].chroma_nal_data);
+                bctx->h264_frames[i].chroma_nal_data = NULL;
+            }
+            bctx->h264_frames[i].valid = false;
+        }
+        bctx->h264_count = 0;
+        bctx->h264_write_idx = 0;
+        bctx->h264_read_idx = 0;
+        pthread_mutex_unlock(&bctx->h264_mutex);
     }
 }
 
@@ -1050,22 +1417,25 @@ static BOOL bridge_end_paint(rdpContext* context)
 static BOOL bridge_desktop_resize(rdpContext* context)
 {
     BridgeContext* ctx = (BridgeContext*)context;
-    freerdp* instance = context->instance;
-    rdpSettings* settings = context->settings;
     rdpGdi* gdi = context->gdi;
     
-    /* Free old GDI resources */
-    gdi_free(instance);
+    /* NOTE: When called from gdi_ResetGraphics (GFX Reset PDU), the GDI layer
+     * handles its own resize internally. We must NOT call gdi_free/gdi_init here
+     * as that would corrupt the GDI state that gdi_ResetGraphics is still using.
+     * 
+     * When called from standard DesktopResize update (non-GFX), gdi_resize() 
+     * should be used instead of gdi_free/gdi_init.
+     * 
+     * For now, we just update our cached dimensions from the current GDI state. */
     
-    /* Reinitialize GDI with new size */
-    if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) {
-        snprintf(ctx->error_msg, MAX_ERROR_LEN, "GDI resize failed");
+    if (!gdi) {
+        fprintf(stderr, "[rdp_bridge] DesktopResize: GDI not available\n");
         return FALSE;
     }
     
-    gdi = context->gdi;
+    fprintf(stderr, "[rdp_bridge] DesktopResize: %dx%d\n", gdi->width, gdi->height);
     
-    /* Update stored dimensions */
+    /* Update stored dimensions from current GDI state */
     ctx->frame_width = gdi->width;
     ctx->frame_height = gdi->height;
     ctx->frame_stride = gdi->stride;
@@ -1078,6 +1448,1801 @@ static BOOL bridge_desktop_resize(rdpContext* context)
     pthread_mutex_unlock(&ctx->rect_mutex);
     
     return TRUE;
+}
+
+/* ============================================================================
+ * AVC444 Transcoder (4:4:4 → 4:2:0 for browser compatibility)
+ * 
+ * Per MS-RDPEGFX spec, AVC444 uses two H.264 streams:
+ * - Stream 0: Luma (Y plane) encoded as YUV420
+ * - Stream 1: Chroma (U/V planes) encoded separately at full resolution
+ * 
+ * Browsers only decode standard YUV420, so we must:
+ * 1. Decode both streams
+ * 2. Combine into YUV444
+ * 3. Convert to YUV420
+ * 4. Re-encode to H.264
+ * ============================================================================ */
+
+static bool init_transcoder(BridgeContext* ctx, int width, int height)
+{
+    const AVCodec* decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
+    const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
+    
+    if (!decoder || !encoder) {
+        fprintf(stderr, "[rdp_bridge] H.264 codec not found\n");
+        return false;
+    }
+    
+    /* Luma decoder */
+    ctx->avc_decoder_luma = avcodec_alloc_context3(decoder);
+    if (!ctx->avc_decoder_luma) goto fail;
+    
+    ctx->avc_decoder_luma->thread_count = 2;  /* Low latency */
+    ctx->avc_decoder_luma->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    ctx->avc_decoder_luma->flags2 |= AV_CODEC_FLAG2_FAST;
+    
+    if (avcodec_open2(ctx->avc_decoder_luma, decoder, NULL) < 0) {
+        fprintf(stderr, "[rdp_bridge] Failed to open luma decoder\n");
+        goto fail;
+    }
+    
+    /* Chroma decoder (separate instance for AVC444) */
+    ctx->avc_decoder_chroma = avcodec_alloc_context3(decoder);
+    if (!ctx->avc_decoder_chroma) goto fail;
+    
+    ctx->avc_decoder_chroma->thread_count = 2;
+    ctx->avc_decoder_chroma->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    ctx->avc_decoder_chroma->flags2 |= AV_CODEC_FLAG2_FAST;
+    
+    if (avcodec_open2(ctx->avc_decoder_chroma, decoder, NULL) < 0) {
+        fprintf(stderr, "[rdp_bridge] Failed to open chroma decoder\n");
+        goto fail;
+    }
+    
+    /* H.264 encoder for output (4:2:0) */
+    ctx->avc_encoder = avcodec_alloc_context3(encoder);
+    if (!ctx->avc_encoder) goto fail;
+    
+    ctx->avc_encoder->width = width;
+    ctx->avc_encoder->height = height;
+    ctx->avc_encoder->pix_fmt = AV_PIX_FMT_YUV420P;
+    ctx->avc_encoder->time_base = (AVRational){1, 60};
+    ctx->avc_encoder->framerate = (AVRational){60, 1};
+    ctx->avc_encoder->thread_count = 2;
+    ctx->avc_encoder->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    ctx->avc_encoder->max_b_frames = 0;  /* No B-frames for low latency */
+    ctx->avc_encoder->gop_size = 60;     /* Keyframe every 60 frames */
+    
+    /* Tune for low latency (zerolatency preset equivalent) */
+    AVDictionary* opts = NULL;
+    av_dict_set(&opts, "preset", "ultrafast", 0);
+    av_dict_set(&opts, "tune", "zerolatency", 0);
+    av_dict_set(&opts, "crf", "23", 0);
+    
+    if (avcodec_open2(ctx->avc_encoder, encoder, &opts) < 0) {
+        fprintf(stderr, "[rdp_bridge] Failed to open H.264 encoder\n");
+        av_dict_free(&opts);
+        goto fail;
+    }
+    av_dict_free(&opts);
+    
+    /* Allocate frames */
+    ctx->decoded_frame_luma = av_frame_alloc();
+    ctx->decoded_frame_chroma = av_frame_alloc();
+    ctx->combined_frame = av_frame_alloc();
+    ctx->output_frame = av_frame_alloc();
+    ctx->encode_pkt = av_packet_alloc();
+    
+    if (!ctx->decoded_frame_luma || !ctx->decoded_frame_chroma || 
+        !ctx->combined_frame || !ctx->output_frame || !ctx->encode_pkt) {
+        goto fail;
+    }
+    
+    /* Setup output frame (YUV420P) */
+    ctx->output_frame->format = AV_PIX_FMT_YUV420P;
+    ctx->output_frame->width = width;
+    ctx->output_frame->height = height;
+    if (av_frame_get_buffer(ctx->output_frame, 0) < 0) {
+        fprintf(stderr, "[rdp_bridge] Failed to allocate output frame buffer\n");
+        goto fail;
+    }
+    
+    /* Setup combined frame (YUV444P for intermediate) */
+    ctx->combined_frame->format = AV_PIX_FMT_YUV444P;
+    ctx->combined_frame->width = width;
+    ctx->combined_frame->height = height;
+    if (av_frame_get_buffer(ctx->combined_frame, 0) < 0) {
+        fprintf(stderr, "[rdp_bridge] Failed to allocate combined frame buffer\n");
+        goto fail;
+    }
+    
+    /* Create scaler for YUV444 → YUV420 conversion */
+    ctx->sws_ctx = sws_getContext(width, height, AV_PIX_FMT_YUV444P,
+                                   width, height, AV_PIX_FMT_YUV420P,
+                                   SWS_FAST_BILINEAR, NULL, NULL, NULL);
+    if (!ctx->sws_ctx) {
+        fprintf(stderr, "[rdp_bridge] Failed to create scaler context\n");
+        goto fail;
+    }
+    
+    ctx->transcoder_initialized = true;
+    fprintf(stderr, "[rdp_bridge] AVC444 transcoder initialized (%dx%d)\n", width, height);
+    return true;
+    
+fail:
+    /* Cleanup on failure */
+    if (ctx->avc_decoder_luma) { avcodec_free_context(&ctx->avc_decoder_luma); }
+    if (ctx->avc_decoder_chroma) { avcodec_free_context(&ctx->avc_decoder_chroma); }
+    if (ctx->avc_encoder) { avcodec_free_context(&ctx->avc_encoder); }
+    if (ctx->decoded_frame_luma) { av_frame_free(&ctx->decoded_frame_luma); }
+    if (ctx->decoded_frame_chroma) { av_frame_free(&ctx->decoded_frame_chroma); }
+    if (ctx->combined_frame) { av_frame_free(&ctx->combined_frame); }
+    if (ctx->output_frame) { av_frame_free(&ctx->output_frame); }
+    if (ctx->encode_pkt) { av_packet_free(&ctx->encode_pkt); }
+    if (ctx->sws_ctx) { sws_freeContext(ctx->sws_ctx); ctx->sws_ctx = NULL; }
+    return false;
+}
+
+static void cleanup_transcoder(BridgeContext* ctx)
+{
+    if (ctx->avc_decoder_luma) { avcodec_free_context(&ctx->avc_decoder_luma); }
+    if (ctx->avc_decoder_chroma) { avcodec_free_context(&ctx->avc_decoder_chroma); }
+    if (ctx->avc_encoder) { avcodec_free_context(&ctx->avc_encoder); }
+    if (ctx->decoded_frame_luma) { av_frame_free(&ctx->decoded_frame_luma); }
+    if (ctx->decoded_frame_chroma) { av_frame_free(&ctx->decoded_frame_chroma); }
+    if (ctx->combined_frame) { av_frame_free(&ctx->combined_frame); }
+    if (ctx->output_frame) { av_frame_free(&ctx->output_frame); }
+    if (ctx->encode_pkt) { av_packet_free(&ctx->encode_pkt); }
+    if (ctx->sws_ctx) { sws_freeContext(ctx->sws_ctx); ctx->sws_ctx = NULL; }
+    ctx->transcoder_initialized = false;
+}
+
+/* Transcode AVC444 (luma + chroma streams) to standard 4:2:0 H.264 */
+static bool transcode_avc444(BridgeContext* ctx,
+                             const uint8_t* luma_data, uint32_t luma_size,
+                             const uint8_t* chroma_data, uint32_t chroma_size,
+                             uint8_t** out_data, uint32_t* out_size)
+{
+    if (!ctx->transcoder_initialized) {
+        fprintf(stderr, "[rdp_bridge] Transcoder not initialized\n");
+        return false;
+    }
+    
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return false;
+    
+    int ret;
+    bool got_luma = false;
+    bool got_chroma = false;
+    
+    /* Decode luma stream */
+    pkt->data = (uint8_t*)luma_data;
+    pkt->size = luma_size;
+    
+    ret = avcodec_send_packet(ctx->avc_decoder_luma, pkt);
+    if (ret < 0 && ret != AVERROR(EAGAIN)) {
+        av_packet_free(&pkt);
+        return false;
+    }
+    
+    ret = avcodec_receive_frame(ctx->avc_decoder_luma, ctx->decoded_frame_luma);
+    if (ret == 0) {
+        got_luma = true;
+    }
+    
+    /* Decode chroma stream if present */
+    if (chroma_data && chroma_size > 0) {
+        pkt->data = (uint8_t*)chroma_data;
+        pkt->size = chroma_size;
+        
+        ret = avcodec_send_packet(ctx->avc_decoder_chroma, pkt);
+        if (ret == 0 || ret == AVERROR(EAGAIN)) {
+            ret = avcodec_receive_frame(ctx->avc_decoder_chroma, ctx->decoded_frame_chroma);
+            if (ret == 0) {
+                got_chroma = true;
+            }
+        }
+    }
+    
+    av_packet_free(&pkt);
+    
+    if (!got_luma) {
+        /* No frame decoded yet (buffering), pass through luma data as-is
+         * This happens during initial keyframe build-up */
+        *out_data = malloc(luma_size);
+        if (*out_data) {
+            memcpy(*out_data, luma_data, luma_size);
+            *out_size = luma_size;
+            return true;
+        }
+        return false;
+    }
+    
+    /* Combine luma and chroma into YUV444 frame */
+    AVFrame* luma = ctx->decoded_frame_luma;
+    AVFrame* combined = ctx->combined_frame;
+    
+    /* Copy Y plane from luma frame */
+    for (int y = 0; y < luma->height; y++) {
+        memcpy(combined->data[0] + y * combined->linesize[0],
+               luma->data[0] + y * luma->linesize[0],
+               luma->width);
+    }
+    
+    if (got_chroma) {
+        /* AVC444: Use decoded chroma for U/V at full resolution */
+        AVFrame* chroma = ctx->decoded_frame_chroma;
+        
+        /* The chroma stream contains U and V at full resolution */
+        for (int y = 0; y < chroma->height; y++) {
+            /* Copy U plane */
+            memcpy(combined->data[1] + y * combined->linesize[1],
+                   chroma->data[1] + y * chroma->linesize[1],
+                   chroma->width);
+            /* Copy V plane */
+            memcpy(combined->data[2] + y * combined->linesize[2],
+                   chroma->data[2] + y * chroma->linesize[2],
+                   chroma->width);
+        }
+    } else {
+        /* No chroma: upscale 4:2:0 chroma from luma frame to 4:4:4 */
+        for (int y = 0; y < luma->height; y++) {
+            for (int x = 0; x < luma->width; x++) {
+                int src_y = y / 2;
+                int src_x = x / 2;
+                if (src_y < luma->height / 2 && src_x < luma->width / 2) {
+                    combined->data[1][y * combined->linesize[1] + x] =
+                        luma->data[1][src_y * luma->linesize[1] + src_x];
+                    combined->data[2][y * combined->linesize[2] + x] =
+                        luma->data[2][src_y * luma->linesize[2] + src_x];
+                }
+            }
+        }
+    }
+    
+    /* Convert YUV444 → YUV420 */
+    av_frame_make_writable(ctx->output_frame);
+    sws_scale(ctx->sws_ctx,
+              (const uint8_t* const*)combined->data, combined->linesize,
+              0, combined->height,
+              ctx->output_frame->data, ctx->output_frame->linesize);
+    
+    ctx->output_frame->pts = luma->pts;
+    
+    /* Encode to H.264 */
+    ret = avcodec_send_frame(ctx->avc_encoder, ctx->output_frame);
+    if (ret < 0) {
+        fprintf(stderr, "[rdp_bridge] Encode send failed: %d\n", ret);
+        return false;
+    }
+    
+    ret = avcodec_receive_packet(ctx->avc_encoder, ctx->encode_pkt);
+    if (ret == AVERROR(EAGAIN)) {
+        /* Encoder buffering - pass through luma */
+        *out_data = malloc(luma_size);
+        if (*out_data) {
+            memcpy(*out_data, luma_data, luma_size);
+            *out_size = luma_size;
+            return true;
+        }
+        return false;
+    } else if (ret < 0) {
+        fprintf(stderr, "[rdp_bridge] Encode receive failed: %d\n", ret);
+        return false;
+    }
+    
+    /* Copy encoded data */
+    *out_data = malloc(ctx->encode_pkt->size);
+    if (!*out_data) {
+        av_packet_unref(ctx->encode_pkt);
+        return false;
+    }
+    memcpy(*out_data, ctx->encode_pkt->data, ctx->encode_pkt->size);
+    *out_size = ctx->encode_pkt->size;
+    
+    av_packet_unref(ctx->encode_pkt);
+    return true;
+}
+
+/* ============================================================================
+ * GFX Pipeline Callbacks (RDPEGFX for H.264/AVC444)
+ * ============================================================================ */
+
+static UINT gfx_on_caps_confirm(RdpgfxClientContext* context, const RDPGFX_CAPS_CONFIRM_PDU* caps)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    UINT32 version = caps->capsSet->version;
+    UINT32 flags = caps->capsSet->flags;
+    
+    /* Decode version */
+    const char* version_str = "Unknown";
+    switch (version) {
+        case RDPGFX_CAPVERSION_8:    version_str = "8.0"; break;
+        case RDPGFX_CAPVERSION_81:   version_str = "8.1"; break;
+        case RDPGFX_CAPVERSION_10:   version_str = "10.0"; break;
+        case RDPGFX_CAPVERSION_101:  version_str = "10.1"; break;
+        case RDPGFX_CAPVERSION_102:  version_str = "10.2"; break;
+        case RDPGFX_CAPVERSION_103:  version_str = "10.3"; break;
+        case RDPGFX_CAPVERSION_104:  version_str = "10.4"; break;
+        case RDPGFX_CAPVERSION_105:  version_str = "10.5"; break;
+        case RDPGFX_CAPVERSION_106:  version_str = "10.6"; break;
+        case RDPGFX_CAPVERSION_107:  version_str = "10.7"; break;
+    }
+    
+    fprintf(stderr, "[rdp_bridge] GFX Caps confirmed: version=%s (0x%08X) flags=0x%08X\n",
+            version_str, version, flags);
+    
+    /* Decode flags for debugging */
+    bool avc_disabled = (flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) != 0;
+    bool avc420_enabled = (flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) != 0;
+    bool small_cache = (flags & RDPGFX_CAPS_FLAG_SMALL_CACHE) != 0;
+    bool thin_client = (flags & RDPGFX_CAPS_FLAG_THINCLIENT) != 0;
+    
+    fprintf(stderr, "[rdp_bridge] GFX Capabilities: AVC_DISABLED=%d, AVC420_ENABLED=%d, SMALL_CACHE=%d, THINCLIENT=%d\n",
+            avc_disabled, avc420_enabled, small_cache, thin_client);
+    
+    if (!avc_disabled && version >= RDPGFX_CAPVERSION_10) {
+        fprintf(stderr, "[rdp_bridge] ✓ H.264/AVC444 negotiated successfully (version >= 10.0, AVC not disabled)\n");
+    } else if (avc420_enabled && version == RDPGFX_CAPVERSION_81) {
+        fprintf(stderr, "[rdp_bridge] ✓ H.264/AVC420 negotiated successfully (version 8.1 with AVC420)\n");
+    } else {
+        fprintf(stderr, "[rdp_bridge] ✗ H.264 NOT negotiated - falling back to Progressive/Clearcodec\n");
+    }
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_reset_graphics(RdpgfxClientContext* context, const RDPGFX_RESET_GRAPHICS_PDU* reset)
+{
+    /* PURE GFX MODE: Handle reset ourselves, no GDI chaining */
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX Reset: %ux%u\n", reset->width, reset->height);
+    
+    /* NOTE: ClearCodec decoder is session-level and should NOT be reset here.
+     * Its internal caches (VBar, ShortVBar, Glyph) build up over the session
+     * and the server expects the client to retain them. */
+    
+    /* Clear all our surface tracking - but NOT the bitmap cache!
+     * The GFX bitmap cache and ClearCodec internal state are session-level,
+     * they persist across surface resets. Only surfaces are reset. */
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    for (int i = 0; i < RDP_MAX_GFX_SURFACES; i++) {
+        bctx->surfaces[i].active = false;
+        if (bctx->surface_buffers[i]) {
+            free(bctx->surface_buffers[i]);
+            bctx->surface_buffers[i] = NULL;
+        }
+    }
+    bctx->primary_surface_id = 0;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    /* NOTE: Do NOT clear gfx_cache here! The bitmap cache persists across
+     * surface resets. Server will continue to reference cached entries. */
+    
+    /* Update frame dimensions */
+    pthread_mutex_lock(&bctx->rect_mutex);
+    bctx->frame_width = reset->width;
+    bctx->frame_height = reset->height;
+    bctx->needs_full_frame = true;
+    pthread_mutex_unlock(&bctx->rect_mutex);
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_create_surface(RdpgfxClientContext* context, const RDPGFX_CREATE_SURFACE_PDU* create)
+{
+    /* PURE GFX MODE: Track surfaces ourselves, no GDI chaining */
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX CreateSurface: id=%u %ux%u format=0x%X\n",
+            create->surfaceId, create->width, create->height, create->pixelFormat);
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    
+    /* Find slot for this surface */
+    if (create->surfaceId < RDP_MAX_GFX_SURFACES) {
+        bctx->surfaces[create->surfaceId].surface_id = create->surfaceId;
+        bctx->surfaces[create->surfaceId].width = create->width;
+        bctx->surfaces[create->surfaceId].height = create->height;
+        bctx->surfaces[create->surfaceId].pixel_format = create->pixelFormat;
+        bctx->surfaces[create->surfaceId].active = true;
+        bctx->surfaces[create->surfaceId].mapped_to_output = false;
+        bctx->surfaces[create->surfaceId].output_x = 0;
+        bctx->surfaces[create->surfaceId].output_y = 0;
+        
+        /* Allocate per-surface buffer for proper GFX cache workflow.
+         * We need this buffer to support SurfaceToCache operations,
+         * which read pixels from the surface (not primary_buffer). */
+        if (bctx->surface_buffers[create->surfaceId]) {
+            free(bctx->surface_buffers[create->surfaceId]);
+        }
+        size_t buf_size = create->width * create->height * 4;  /* BGRA32 */
+        bctx->surface_buffers[create->surfaceId] = (uint8_t*)calloc(1, buf_size);
+        if (!bctx->surface_buffers[create->surfaceId]) {
+            fprintf(stderr, "[rdp_bridge] Warning: Failed to allocate surface buffer (%zu bytes)\n", buf_size);
+        }
+        
+        /* Create progressive surface context for this surface */
+        if (bctx->progressive_decoder) {
+            progressive_create_surface_context(bctx->progressive_decoder, 
+                create->surfaceId, create->width, create->height);
+        }
+    }
+    
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_delete_surface(RdpgfxClientContext* context, const RDPGFX_DELETE_SURFACE_PDU* del)
+{
+    /* PURE GFX MODE: Track surfaces ourselves, no GDI chaining */
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX DeleteSurface: id=%u\n", del->surfaceId);
+    
+    /* NOTE: ClearCodec decoder is session-level and should NOT be reset on surface delete. */
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    
+    if (del->surfaceId < RDP_MAX_GFX_SURFACES) {
+        bctx->surfaces[del->surfaceId].active = false;
+        if (bctx->primary_surface_id == del->surfaceId) {
+            bctx->primary_surface_id = 0;
+        }
+        if (bctx->surface_buffers[del->surfaceId]) {
+            free(bctx->surface_buffers[del->surfaceId]);
+            bctx->surface_buffers[del->surfaceId] = NULL;
+        }
+        /* Delete progressive surface context */
+        if (bctx->progressive_decoder) {
+            progressive_delete_surface_context(bctx->progressive_decoder, del->surfaceId);
+        }
+    }
+    
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_map_surface(RdpgfxClientContext* context, const RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU* map)
+{
+    /* PURE GFX MODE: Track surface mapping ourselves, no GDI chaining */
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX MapSurface: id=%u -> output (%d, %d)\n",
+            map->surfaceId, map->outputOriginX, map->outputOriginY);
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    
+    if (map->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[map->surfaceId].active) {
+        bctx->surfaces[map->surfaceId].mapped_to_output = true;
+        bctx->surfaces[map->surfaceId].output_x = map->outputOriginX;
+        bctx->surfaces[map->surfaceId].output_y = map->outputOriginY;
+        bctx->primary_surface_id = map->surfaceId;
+        fprintf(stderr, "[rdp_bridge] Surface %u mapped as primary output surface\n", map->surfaceId);
+    }
+    
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    return CHANNEL_RC_OK;
+}
+
+/* Additional GFX callbacks - no-op implementations for protocol compliance */
+
+static UINT gfx_on_map_surface_scaled(RdpgfxClientContext* context, 
+                                       const RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU* map)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX MapSurfaceScaled: id=%u -> output (%d, %d) target=%ux%u\n",
+            map->surfaceId, map->outputOriginX, map->outputOriginY, 
+            map->targetWidth, map->targetHeight);
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    if (map->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[map->surfaceId].active) {
+        bctx->surfaces[map->surfaceId].mapped_to_output = true;
+        bctx->surfaces[map->surfaceId].output_x = map->outputOriginX;
+        bctx->surfaces[map->surfaceId].output_y = map->outputOriginY;
+        bctx->primary_surface_id = map->surfaceId;
+    }
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_map_surface_window(RdpgfxClientContext* context,
+                                       const RDPGFX_MAP_SURFACE_TO_WINDOW_PDU* map)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX MapSurfaceWindow: surface=%u window=%llu\n",
+            map->surfaceId, (unsigned long long)map->windowId);
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_map_surface_scaled_window(RdpgfxClientContext* context,
+                                              const RDPGFX_MAP_SURFACE_TO_SCALED_WINDOW_PDU* map)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX MapSurfaceScaledWindow: surface=%u window=%llu\n",
+            map->surfaceId, (unsigned long long)map->windowId);
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_solid_fill(RdpgfxClientContext* context, const RDPGFX_SOLID_FILL_PDU* fill)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !fill) return ERROR_INVALID_PARAMETER;
+    
+    /* Track commands in this frame */
+    bctx->frame_cmd_count++;
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    rdpGdi* gdi = bctx->gdi;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    if (!gdi || !gdi->primary_buffer) {
+        pthread_mutex_lock(&bctx->rect_mutex);
+        bctx->needs_full_frame = true;
+        pthread_mutex_unlock(&bctx->rect_mutex);
+        return CHANNEL_RC_OK;
+    }
+    
+    /* Get surface output offset */
+    int32_t offsetX = 0, offsetY = 0;
+    if (fill->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[fill->surfaceId].active) {
+        offsetX = bctx->surfaces[fill->surfaceId].output_x;
+        offsetY = bctx->surfaces[fill->surfaceId].output_y;
+    }
+    
+    /* Build BGRA32 color */
+    uint32_t color = fill->fillPixel.B | 
+                     (fill->fillPixel.G << 8) | 
+                     (fill->fillPixel.R << 16) | 
+                     (fill->fillPixel.XA << 24);
+    
+    static int fill_logs = 0;
+    /* Log black fills specifically */
+    if ((color & 0x00FFFFFF) == 0x00000000) {
+        static int black_fill_logs = 0;
+        if (black_fill_logs < 20) {
+            fprintf(stderr, "[rdp_bridge] BLACK_TILE: SolidFill with BLACK surface=%u fillCount=%u\n",
+                    fill->surfaceId, fill->fillRectCount);
+            for (UINT16 j = 0; j < fill->fillRectCount && j < 3; j++) {
+                fprintf(stderr, "   rect[%u]: (%u,%u)-(%u,%u)\n", j,
+                        fill->fillRects[j].left, fill->fillRects[j].top,
+                        fill->fillRects[j].right, fill->fillRects[j].bottom);
+            }
+            black_fill_logs++;
+        }
+    }
+    if (fill_logs < 5) {
+        fprintf(stderr, "[rdp_bridge] GFX SolidFill: surface=%u color=0x%08X fillCount=%u\n",
+                fill->surfaceId, color, fill->fillRectCount);
+        fill_logs++;
+    }
+    
+    /* Fill each rectangle */
+    for (UINT16 i = 0; i < fill->fillRectCount; i++) {
+        UINT32 left = fill->fillRects[i].left + offsetX;
+        UINT32 top = fill->fillRects[i].top + offsetY;
+        UINT32 right = fill->fillRects[i].right + offsetX;
+        UINT32 bottom = fill->fillRects[i].bottom + offsetY;
+        
+        /* Clamp to buffer bounds */
+        if (right > (UINT32)gdi->width) right = gdi->width;
+        if (bottom > (UINT32)gdi->height) bottom = gdi->height;
+        if (left >= right || top >= bottom) continue;
+        
+        UINT32 width = right - left;
+        
+        /* Fill row by row */
+        for (UINT32 y = top; y < bottom; y++) {
+            uint32_t* row = (uint32_t*)(gdi->primary_buffer + y * gdi->stride + left * 4);
+            for (UINT32 x = 0; x < width; x++) {
+                row[x] = color;
+            }
+        }
+        
+        /* Mark dirty rect */
+        pthread_mutex_lock(&bctx->rect_mutex);
+        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+            bctx->dirty_rects[bctx->dirty_rect_count].x = left;
+            bctx->dirty_rects[bctx->dirty_rect_count].y = top;
+            bctx->dirty_rects[bctx->dirty_rect_count].width = right - left;
+            bctx->dirty_rects[bctx->dirty_rect_count].height = bottom - top;
+            bctx->dirty_rect_count++;
+        }
+        pthread_mutex_unlock(&bctx->rect_mutex);
+    }
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context, 
+                                       const RDPGFX_SURFACE_TO_SURFACE_PDU* copy)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !copy) return ERROR_INVALID_PARAMETER;
+    
+    /* Track commands in this frame */
+    bctx->frame_cmd_count++;
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    rdpGdi* gdi = bctx->gdi;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    if (!gdi || !gdi->primary_buffer) {
+        pthread_mutex_lock(&bctx->rect_mutex);
+        bctx->needs_full_frame = true;
+        pthread_mutex_unlock(&bctx->rect_mutex);
+        return CHANNEL_RC_OK;
+    }
+    
+    /* Get source and dest surface offsets */
+    int32_t srcOffsetX = 0, srcOffsetY = 0;
+    int32_t dstOffsetX = 0, dstOffsetY = 0;
+    
+    if (copy->surfaceIdSrc < RDP_MAX_GFX_SURFACES && bctx->surfaces[copy->surfaceIdSrc].active) {
+        srcOffsetX = bctx->surfaces[copy->surfaceIdSrc].output_x;
+        srcOffsetY = bctx->surfaces[copy->surfaceIdSrc].output_y;
+    }
+    if (copy->surfaceIdDest < RDP_MAX_GFX_SURFACES && bctx->surfaces[copy->surfaceIdDest].active) {
+        dstOffsetX = bctx->surfaces[copy->surfaceIdDest].output_x;
+        dstOffsetY = bctx->surfaces[copy->surfaceIdDest].output_y;
+    }
+    
+    static int copy_logs = 0;
+    if (copy_logs < 5) {
+        fprintf(stderr, "[rdp_bridge] GFX SurfaceToSurface: src=%u dst=%u rects=%u\n",
+                copy->surfaceIdSrc, copy->surfaceIdDest, copy->destPtsCount);
+        copy_logs++;
+    }
+    
+    /* Source rectangle */
+    INT32 srcLeft = copy->rectSrc.left + srcOffsetX;
+    INT32 srcTop = copy->rectSrc.top + srcOffsetY;
+    INT32 width = copy->rectSrc.right - copy->rectSrc.left;
+    INT32 height = copy->rectSrc.bottom - copy->rectSrc.top;
+    
+    /* For overlapping copies, we need a temp buffer */
+    uint8_t* tempBuf = NULL;
+    bool needTemp = (copy->surfaceIdSrc == copy->surfaceIdDest);
+    
+    if (needTemp && width > 0 && height > 0) {
+        size_t tempSize = width * height * 4;
+        tempBuf = (uint8_t*)malloc(tempSize);
+        if (tempBuf) {
+            /* Copy source rect to temp buffer */
+            for (INT32 y = 0; y < height; y++) {
+                INT32 srcY = srcTop + y;
+                if (srcY < 0 || srcY >= gdi->height) continue;
+                uint8_t* src = gdi->primary_buffer + srcY * gdi->stride + srcLeft * 4;
+                uint8_t* dst = tempBuf + y * width * 4;
+                INT32 copyWidth = width;
+                if (srcLeft < 0) { src -= srcLeft * 4; dst -= srcLeft * 4; copyWidth += srcLeft; }
+                if (srcLeft + width > gdi->width) copyWidth = gdi->width - srcLeft;
+                if (copyWidth > 0) memcpy(dst, src, copyWidth * 4);
+            }
+        }
+    }
+    
+    /* Copy to each destination point */
+    for (UINT16 i = 0; i < copy->destPtsCount; i++) {
+        INT32 dstLeft = copy->destPts[i].x + dstOffsetX;
+        INT32 dstTop = copy->destPts[i].y + dstOffsetY;
+        
+        /* Clamp to buffer bounds */
+        INT32 copyWidth = width;
+        INT32 copyHeight = height;
+        INT32 srcStartX = 0, srcStartY = 0;
+        
+        if (dstLeft < 0) { srcStartX = -dstLeft; copyWidth += dstLeft; dstLeft = 0; }
+        if (dstTop < 0) { srcStartY = -dstTop; copyHeight += dstTop; dstTop = 0; }
+        if (dstLeft + copyWidth > gdi->width) copyWidth = gdi->width - dstLeft;
+        if (dstTop + copyHeight > gdi->height) copyHeight = gdi->height - dstTop;
+        
+        if (copyWidth <= 0 || copyHeight <= 0) continue;
+        
+        /* Perform the copy */
+        for (INT32 y = 0; y < copyHeight; y++) {
+            uint8_t* src;
+            if (tempBuf) {
+                src = tempBuf + (srcStartY + y) * width * 4 + srcStartX * 4;
+            } else {
+                INT32 srcY = srcTop + srcStartY + y;
+                if (srcY < 0 || srcY >= gdi->height) continue;
+                src = gdi->primary_buffer + srcY * gdi->stride + (srcLeft + srcStartX) * 4;
+            }
+            uint8_t* dst = gdi->primary_buffer + (dstTop + y) * gdi->stride + dstLeft * 4;
+            memcpy(dst, src, copyWidth * 4);
+        }
+        
+        /* Mark dirty rect */
+        pthread_mutex_lock(&bctx->rect_mutex);
+        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+            bctx->dirty_rects[bctx->dirty_rect_count].x = dstLeft;
+            bctx->dirty_rects[bctx->dirty_rect_count].y = dstTop;
+            bctx->dirty_rects[bctx->dirty_rect_count].width = copyWidth;
+            bctx->dirty_rects[bctx->dirty_rect_count].height = copyHeight;
+            bctx->dirty_rect_count++;
+        }
+        pthread_mutex_unlock(&bctx->rect_mutex);
+    }
+    
+    if (tempBuf) free(tempBuf);
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_surface_to_cache(RdpgfxClientContext* context,
+                                     const RDPGFX_SURFACE_TO_CACHE_PDU* cache)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !cache) return ERROR_INVALID_PARAMETER;
+    
+    if (!bctx->gfx_cache) {
+        return CHANNEL_RC_OK;  /* No cache allocated */
+    }
+    
+    /* Get surface info and buffer */
+    if (cache->surfaceId >= RDP_MAX_GFX_SURFACES || !bctx->surfaces[cache->surfaceId].active) {
+        return CHANNEL_RC_OK;
+    }
+    
+    uint8_t* surfBuf = bctx->surface_buffers[cache->surfaceId];
+    UINT32 surfWidth = bctx->surfaces[cache->surfaceId].width;
+    UINT32 surfHeight = bctx->surfaces[cache->surfaceId].height;
+    
+    if (!surfBuf) {
+        static int no_buf_logs = 0;
+        if (no_buf_logs < 10) {
+            fprintf(stderr, "[rdp_bridge] BLACK_TILE: SurfaceToCache no surface buffer for surface=%u slot=%u\n",
+                    cache->surfaceId, cache->cacheSlot);
+            no_buf_logs++;
+        }
+        return CHANNEL_RC_OK;  /* No surface buffer */
+    }
+    
+    /* Calculate source rectangle (no offset - using surface-local coords) */
+    INT32 left = cache->rectSrc.left;
+    INT32 top = cache->rectSrc.top;
+    UINT32 width = cache->rectSrc.right - cache->rectSrc.left;
+    UINT32 height = cache->rectSrc.bottom - cache->rectSrc.top;
+    
+    static int cache_logs = 0;
+    if (cache_logs < 10) {
+        fprintf(stderr, "[rdp_bridge] GFX SurfaceToCache: surface=%u slot=%u (%ux%u) at (%d,%d)\n",
+                cache->surfaceId, cache->cacheSlot, width, height, left, top);
+        cache_logs++;
+    }
+    
+    /* Validate cache slot */
+    if (cache->cacheSlot >= (UINT64)bctx->gfx_cache_size) {
+        fprintf(stderr, "[rdp_bridge] Warning: cache slot %u exceeds max %d\n",
+                cache->cacheSlot, bctx->gfx_cache_size);
+        return CHANNEL_RC_OK;
+    }
+    
+    /* Bounds check against surface dimensions */
+    if (left < 0 || top < 0 || left + (INT32)width > (INT32)surfWidth || 
+        top + (INT32)height > (INT32)surfHeight) {
+        return CHANNEL_RC_OK;
+    }
+    
+    /* Allocate/reallocate cache entry */
+    GfxCacheEntry* entry = &bctx->gfx_cache[cache->cacheSlot];
+    size_t dataSize = width * height * 4;
+    
+    if (entry->data && entry->data_size < dataSize) {
+        free(entry->data);
+        entry->data = NULL;
+    }
+    if (!entry->data) {
+        entry->data = (uint8_t*)malloc(dataSize);
+        if (!entry->data) return ERROR_OUTOFMEMORY;
+        entry->data_size = dataSize;
+    }
+    
+    /* Copy pixels from surface buffer to cache */
+    UINT32 surfStride = surfWidth * 4;
+    for (UINT32 y = 0; y < height; y++) {
+        uint8_t* src = surfBuf + (top + y) * surfStride + left * 4;
+        uint8_t* dst = entry->data + y * width * 4;
+        memcpy(dst, src, width * 4);
+    }
+    
+    entry->width = width;
+    entry->height = height;
+    entry->valid = true;
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context,
+                                     const RDPGFX_CACHE_TO_SURFACE_PDU* cache)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !cache) return ERROR_INVALID_PARAMETER;
+    
+    /* Track commands in this frame */
+    bctx->frame_cmd_count++;
+    
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    rdpGdi* gdi = bctx->gdi;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    if (!gdi || !gdi->primary_buffer || !bctx->gfx_cache) {
+        pthread_mutex_lock(&bctx->rect_mutex);
+        bctx->needs_full_frame = true;
+        pthread_mutex_unlock(&bctx->rect_mutex);
+        return CHANNEL_RC_OK;
+    }
+    
+    /* Validate cache slot */
+    if (cache->cacheSlot >= (UINT64)bctx->gfx_cache_size) {
+        pthread_mutex_lock(&bctx->rect_mutex);
+        bctx->needs_full_frame = true;
+        pthread_mutex_unlock(&bctx->rect_mutex);
+        return CHANNEL_RC_OK;
+    }
+    
+    GfxCacheEntry* entry = &bctx->gfx_cache[cache->cacheSlot];
+    if (!entry->valid || !entry->data) {
+        static int miss_logs = 0;
+        if (miss_logs < 20) {
+            fprintf(stderr, "[rdp_bridge] BLACK_TILE: CacheToSurface cache miss slot=%u (valid=%d, data=%p)\n",
+                    cache->cacheSlot, entry->valid, (void*)entry->data);
+            miss_logs++;
+        }
+        pthread_mutex_lock(&bctx->rect_mutex);
+        bctx->needs_full_frame = true;
+        pthread_mutex_unlock(&bctx->rect_mutex);
+        return CHANNEL_RC_OK;
+    }
+    
+    /* Get surface offset */
+    int32_t offsetX = 0, offsetY = 0;
+    if (cache->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[cache->surfaceId].active) {
+        offsetX = bctx->surfaces[cache->surfaceId].output_x;
+        offsetY = bctx->surfaces[cache->surfaceId].output_y;
+    }
+    
+    static int cache_logs = 0;
+    if (cache_logs < 5) {
+        fprintf(stderr, "[rdp_bridge] GFX CacheToSurface: slot=%u surface=%u destPts=%u\n",
+                cache->cacheSlot, cache->surfaceId, cache->destPtsCount);
+        cache_logs++;
+    }
+    
+    /* Copy cached bitmap to each destination point */
+    for (UINT16 i = 0; i < cache->destPtsCount; i++) {
+        INT32 dstLeft = cache->destPts[i].x + offsetX;
+        INT32 dstTop = cache->destPts[i].y + offsetY;
+        
+        /* Clamp to buffer bounds */
+        UINT32 width = entry->width;
+        UINT32 height = entry->height;
+        UINT32 srcStartX = 0, srcStartY = 0;
+        
+        if (dstLeft < 0) { srcStartX = -dstLeft; width += dstLeft; dstLeft = 0; }
+        if (dstTop < 0) { srcStartY = -dstTop; height += dstTop; dstTop = 0; }
+        if (dstLeft + (INT32)width > gdi->width) width = gdi->width - dstLeft;
+        if (dstTop + (INT32)height > gdi->height) height = gdi->height - dstTop;
+        
+        if (width == 0 || height == 0) continue;
+        
+        /* Copy cached pixels to framebuffer */
+        for (UINT32 y = 0; y < height; y++) {
+            uint8_t* src = entry->data + (srcStartY + y) * entry->width * 4 + srcStartX * 4;
+            uint8_t* dst = gdi->primary_buffer + (dstTop + y) * gdi->stride + dstLeft * 4;
+            memcpy(dst, src, width * 4);
+        }
+        
+        /* Mark dirty rect */
+        pthread_mutex_lock(&bctx->rect_mutex);
+        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+            bctx->dirty_rects[bctx->dirty_rect_count].x = dstLeft;
+            bctx->dirty_rects[bctx->dirty_rect_count].y = dstTop;
+            bctx->dirty_rects[bctx->dirty_rect_count].width = width;
+            bctx->dirty_rects[bctx->dirty_rect_count].height = height;
+            bctx->dirty_rect_count++;
+        }
+        pthread_mutex_unlock(&bctx->rect_mutex);
+    }
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_evict_cache(RdpgfxClientContext* context,
+                                const RDPGFX_EVICT_CACHE_ENTRY_PDU* evict)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !evict) return ERROR_INVALID_PARAMETER;
+    
+    /* Mark cache slot as invalid */
+    if (bctx->gfx_cache && evict->cacheSlot < (UINT64)bctx->gfx_cache_size) {
+        bctx->gfx_cache[evict->cacheSlot].valid = false;
+        /* Keep the buffer allocated for reuse */
+    }
+    
+    static int evict_logs = 0;
+    if (evict_logs < 3) {
+        fprintf(stderr, "[rdp_bridge] GFX EvictCache: slot=%u\n", evict->cacheSlot);
+        evict_logs++;
+    }
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_delete_encoding_context(RdpgfxClientContext* context,
+                                            const RDPGFX_DELETE_ENCODING_CONTEXT_PDU* del)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !del) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX DeleteEncodingContext: surface=%u context=%u\n",
+            del->surfaceId, del->codecContextId);
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_cache_import_reply(RdpgfxClientContext* context,
+                                       const RDPGFX_CACHE_IMPORT_REPLY_PDU* reply)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !reply) return ERROR_INVALID_PARAMETER;
+    
+    fprintf(stderr, "[rdp_bridge] GFX CacheImportReply: importedEntries=%u\n",
+            reply->importedEntriesCount);
+    return CHANNEL_RC_OK;
+}
+
+/* Helper: Detect frame type from H.264 NAL unit */
+static RdpH264FrameType detect_h264_frame_type(const uint8_t* data, size_t len)
+{
+    if (!data || len < 4) return RDP_H264_FRAME_TYPE_P;
+    
+    /* Look for NAL unit type in Annex-B stream */
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
+            uint8_t nal_type = data[i+3] & 0x1F;
+            if (nal_type == 5) return RDP_H264_FRAME_TYPE_IDR;  /* IDR picture */
+            if (nal_type == 1) return RDP_H264_FRAME_TYPE_P;    /* Non-IDR */
+        } else if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
+            if (i + 4 < len) {
+                uint8_t nal_type = data[i+4] & 0x1F;
+                if (nal_type == 5) return RDP_H264_FRAME_TYPE_IDR;
+                if (nal_type == 1) return RDP_H264_FRAME_TYPE_P;
+            }
+        }
+    }
+    return RDP_H264_FRAME_TYPE_P;
+}
+
+/* Queue an H.264 frame for browser consumption
+ * For AVC444: transcode dual streams (4:4:4) to single 4:2:0 stream */
+static bool queue_h264_frame(BridgeContext* bctx, uint32_t frame_id, uint16_t surface_id,
+                             RdpGfxCodecId codec_id, const RdpRect* rect,
+                             const uint8_t* nal_data, uint32_t nal_size,
+                             const uint8_t* chroma_data, uint32_t chroma_size)
+{
+    if (!bctx || !nal_data || nal_size == 0) return false;
+    
+    const uint8_t* output_nal = nal_data;
+    uint32_t output_nal_size = nal_size;
+    uint8_t* transcoded_data = NULL;
+    
+    /* For AVC444: transcode to 4:2:0 for browser compatibility */
+    if ((codec_id == RDP_GFX_CODEC_AVC444 || codec_id == RDP_GFX_CODEC_AVC444v2) 
+        && chroma_data && chroma_size > 0) {
+        
+        /* Initialize transcoder on first frame */
+        if (!bctx->transcoder_initialized) {
+            int width = rect->width > 0 ? rect->width : bctx->frame_width;
+            int height = rect->height > 0 ? rect->height : bctx->frame_height;
+            if (width <= 0 || height <= 0) {
+                width = 1920;
+                height = 1080;
+            }
+            if (!init_transcoder(bctx, width, height)) {
+                fprintf(stderr, "[rdp_bridge] Transcoder init failed, passing through luma only\n");
+            }
+        }
+        
+        /* Transcode AVC444 → AVC420 */
+        if (bctx->transcoder_initialized) {
+            uint32_t new_size = 0;
+            if (transcode_avc444(bctx, nal_data, nal_size, chroma_data, chroma_size,
+                                 &transcoded_data, &new_size)) {
+                output_nal = transcoded_data;
+                output_nal_size = new_size;
+                codec_id = RDP_GFX_CODEC_AVC420;  /* Now it's 4:2:0 */
+            }
+        }
+    }
+    
+    pthread_mutex_lock(&bctx->h264_mutex);
+    
+    /* Check if queue is full */
+    if (bctx->h264_count >= RDP_MAX_H264_FRAMES) {
+        /* Drop oldest frame */
+        H264FrameEntry* oldest = &bctx->h264_frames[bctx->h264_read_idx];
+        if (oldest->nal_data) free(oldest->nal_data);
+        if (oldest->chroma_nal_data) free(oldest->chroma_nal_data);
+        oldest->valid = false;
+        bctx->h264_read_idx = (bctx->h264_read_idx + 1) % RDP_MAX_H264_FRAMES;
+        bctx->h264_count--;
+        fprintf(stderr, "[rdp_bridge] Warning: H.264 queue full, dropped frame\n");
+    }
+    
+    H264FrameEntry* entry = &bctx->h264_frames[bctx->h264_write_idx];
+    
+    /* Free any existing data */
+    if (entry->nal_data) free(entry->nal_data);
+    if (entry->chroma_nal_data) free(entry->chroma_nal_data);
+    
+    /* Copy NAL data (either original or transcoded) */
+    entry->nal_data = (uint8_t*)malloc(output_nal_size);
+    if (!entry->nal_data) {
+        pthread_mutex_unlock(&bctx->h264_mutex);
+        if (transcoded_data) free(transcoded_data);
+        return false;
+    }
+    memcpy(entry->nal_data, output_nal, output_nal_size);
+    entry->nal_size = output_nal_size;
+    
+    /* No chroma data after transcoding (merged into 4:2:0) */
+    entry->chroma_nal_data = NULL;
+    entry->chroma_nal_size = 0;
+    
+    entry->frame_id = frame_id;
+    entry->surface_id = surface_id;
+    entry->codec_id = codec_id;
+    entry->frame_type = detect_h264_frame_type(output_nal, output_nal_size);
+    entry->dest_rect = *rect;
+    entry->timestamp = (uint64_t)(clock() * 1000000.0 / CLOCKS_PER_SEC);
+    entry->needs_ack = true;
+    entry->valid = true;
+    
+    bctx->h264_write_idx = (bctx->h264_write_idx + 1) % RDP_MAX_H264_FRAMES;
+    bctx->h264_count++;
+    
+    /* Track negotiated codec (report original, not transcoded) */
+    if (codec_id == RDP_GFX_CODEC_AVC420 && chroma_data) {
+        /* Was AVC444, transcoded to AVC420 */
+        bctx->gfx_codec = RDP_GFX_CODEC_AVC444;
+    } else {
+        bctx->gfx_codec = codec_id;
+    }
+    
+    pthread_mutex_unlock(&bctx->h264_mutex);
+    
+    if (transcoded_data) free(transcoded_data);
+    return true;
+}
+
+static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SURFACE_COMMAND* cmd)
+{
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    /* Track commands in this frame */
+    bctx->frame_cmd_count++;
+    
+    /* Check if disconnecting - don't process frames during teardown */
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    bool disconnecting = bctx->gfx_disconnecting;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    if (disconnecting) {
+        return CHANNEL_RC_OK;
+    }
+    
+    /* Log codec for debugging */
+    static int logged_codecs = 0;
+    if (logged_codecs < 10) {
+        fprintf(stderr, "[rdp_bridge] GFX SurfaceCommand: codec=0x%04X surface=%u rect=(%d,%d,%d,%d)\n",
+                cmd->codecId, cmd->surfaceId, cmd->left, cmd->top, cmd->right, cmd->bottom);
+        logged_codecs++;
+    }
+    
+    RdpRect rect = {
+        .x = cmd->left,
+        .y = cmd->top,
+        .width = cmd->right - cmd->left,
+        .height = cmd->bottom - cmd->top
+    };
+    
+    switch (cmd->codecId) {
+        case RDPGFX_CODECID_AVC420: {
+            /* AVC420: Single H.264 stream in YUV 4:2:0 */
+            const RDPGFX_AVC420_BITMAP_STREAM* avc420 = cmd->extra;
+            if (avc420 && avc420->data && avc420->length > 0) {
+                queue_h264_frame(bctx, bctx->current_frame_id, cmd->surfaceId,
+                                RDP_GFX_CODEC_AVC420, &rect,
+                                avc420->data, avc420->length, NULL, 0);
+            }
+            break;
+        }
+        
+        case RDPGFX_CODECID_AVC444:
+        case RDPGFX_CODECID_AVC444v2: {
+            /* AVC444: Dual H.264 streams (luma + chroma) for YUV 4:4:4 
+             * Per MS-RDPEGFX, the RFX_AVC444_BITMAP_STREAM contains:
+             * - LC field indicating stream configuration
+             * - First AVC420 stream (typically luma)
+             * - Second AVC420 stream (typically chroma) */
+            const RDPGFX_AVC444_BITMAP_STREAM* avc444 = cmd->extra;
+            if (avc444) {
+                const uint8_t* luma_data = NULL;
+                uint32_t luma_size = 0;
+                const uint8_t* chroma_data = NULL;
+                uint32_t chroma_size = 0;
+                
+                /* First stream (usually luma/main) */
+                if (avc444->bitstream[0].data && avc444->bitstream[0].length > 0) {
+                    luma_data = avc444->bitstream[0].data;
+                    luma_size = avc444->bitstream[0].length;
+                }
+                
+                /* Second stream (usually chroma for 4:4:4) */
+                if (avc444->bitstream[1].data && avc444->bitstream[1].length > 0) {
+                    chroma_data = avc444->bitstream[1].data;
+                    chroma_size = avc444->bitstream[1].length;
+                }
+                
+                if (luma_data) {
+                    RdpGfxCodecId codec = (cmd->codecId == RDPGFX_CODECID_AVC444v2) 
+                                          ? RDP_GFX_CODEC_AVC444v2 : RDP_GFX_CODEC_AVC444;
+                    queue_h264_frame(bctx, bctx->current_frame_id, cmd->surfaceId,
+                                    codec, &rect, luma_data, luma_size,
+                                    chroma_data, chroma_size);
+                }
+            }
+            break;
+        }
+        
+        /* CLEARCODEC: Decode using FreeRDP's standalone clear_decompress API */
+        case RDPGFX_CODECID_CLEARCODEC: {
+            if (!bctx->clear_decoder || !cmd->data || cmd->length == 0) {
+                static int clear_skip = 0;
+                if (clear_skip < 3) {
+                    fprintf(stderr, "[rdp_bridge] ClearCodec: no decoder or data - marking refresh\n");
+                    clear_skip++;
+                }
+                pthread_mutex_lock(&bctx->rect_mutex);
+                bctx->needs_full_frame = true;
+                pthread_mutex_unlock(&bctx->rect_mutex);
+                break;
+            }
+            
+            /* Get surface info */
+            if (cmd->surfaceId >= RDP_MAX_GFX_SURFACES || !bctx->surfaces[cmd->surfaceId].active) {
+                break;
+            }
+            
+            uint8_t* surfBuf = bctx->surface_buffers[cmd->surfaceId];
+            UINT32 surfWidth = bctx->surfaces[cmd->surfaceId].width;
+            UINT32 surfHeight = bctx->surfaces[cmd->surfaceId].height;
+            UINT32 surfStride = surfWidth * 4;
+            
+            /* Command rect is in surface-local coordinates */
+            UINT32 nWidth = cmd->right - cmd->left;
+            UINT32 nHeight = cmd->bottom - cmd->top;
+            UINT32 surfX = cmd->left;
+            UINT32 surfY = cmd->top;
+            
+            /* Bounds check against surface */
+            if (surfX + nWidth > surfWidth || surfY + nHeight > surfHeight) {
+                static int bounds_err = 0;
+                if (bounds_err < 3) {
+                    fprintf(stderr, "[rdp_bridge] ClearCodec: out of surface bounds\n");
+                    bounds_err++;
+                }
+                break;
+            }
+            
+            /* Decode ClearCodec to surface buffer if available */
+            INT32 result = -1;
+            if (surfBuf) {
+                /* Note: nDstWidth/nDstHeight must be the FULL destination buffer size,
+                 * not the update region size, for proper bounds checking */
+                result = clear_decompress(bctx->clear_decoder,
+                                         cmd->data, cmd->length,
+                                         nWidth, nHeight,
+                                         surfBuf, PIXEL_FORMAT_BGRA32,
+                                         surfStride, surfX, surfY,
+                                         surfWidth, surfHeight,
+                                         NULL);
+            } else {
+                static int no_surfbuf = 0;
+                if (no_surfbuf < 10) {
+                    fprintf(stderr, "[rdp_bridge] BLACK_TILE: ClearCodec no surface buffer for surf=%u\n",
+                            cmd->surfaceId);
+                    no_surfbuf++;
+                }
+            }
+            
+            if (result < 0) {
+                static int clear_err = 0;
+                if (clear_err < 5) {
+                    fprintf(stderr, "[rdp_bridge] ClearCodec decode failed: %d - marking refresh\n", result);
+                    clear_err++;
+                }
+                pthread_mutex_lock(&bctx->rect_mutex);
+                bctx->needs_full_frame = true;
+                pthread_mutex_unlock(&bctx->rect_mutex);
+                break;
+            }
+            
+            /* Now copy to primary_buffer if surface is mapped */
+            pthread_mutex_lock(&bctx->gfx_mutex);
+            rdpGdi* gdi = bctx->gdi;
+            bool mapped = bctx->surfaces[cmd->surfaceId].mapped_to_output;
+            INT32 outX = bctx->surfaces[cmd->surfaceId].output_x;
+            INT32 outY = bctx->surfaces[cmd->surfaceId].output_y;
+            pthread_mutex_unlock(&bctx->gfx_mutex);
+            
+            if (mapped && gdi && gdi->primary_buffer && surfBuf) {
+                UINT32 dstX = surfX + outX;
+                UINT32 dstY = surfY + outY;
+                
+                /* Bounds check against primary buffer */
+                if (dstX + nWidth <= (UINT32)gdi->width && dstY + nHeight <= (UINT32)gdi->height) {
+                    /* Copy decoded pixels to primary buffer */
+                    for (UINT32 y = 0; y < nHeight; y++) {
+                        uint8_t* src = surfBuf + (surfY + y) * surfStride + surfX * 4;
+                        uint8_t* dst = gdi->primary_buffer + (dstY + y) * gdi->stride + dstX * 4;
+                        memcpy(dst, src, nWidth * 4);
+                    }
+                    
+                    /* Mark dirty rect */
+                    pthread_mutex_lock(&bctx->rect_mutex);
+                    if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                        bctx->dirty_rects[bctx->dirty_rect_count].x = dstX;
+                        bctx->dirty_rects[bctx->dirty_rect_count].y = dstY;
+                        bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
+                        bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
+                        bctx->dirty_rect_count++;
+                    }
+                    pthread_mutex_unlock(&bctx->rect_mutex);
+                }
+            }
+            
+            static int clear_ok = 0;
+            if (clear_ok < 5) {
+                fprintf(stderr, "[rdp_bridge] ClearCodec decoded: surf[%u] (%u,%u) %ux%u\n",
+                        cmd->surfaceId, surfX, surfY, nWidth, nHeight);
+                clear_ok++;
+            }
+            break;
+        }
+        
+        /* UNCOMPRESSED: Raw BGRA pixels - copy to surface buffer first */
+        case RDPGFX_CODECID_UNCOMPRESSED: {
+            pthread_mutex_lock(&bctx->gfx_mutex);
+            rdpGdi* gdi = bctx->gdi;
+            pthread_mutex_unlock(&bctx->gfx_mutex);
+            
+            if (!cmd->data) {
+                pthread_mutex_lock(&bctx->rect_mutex);
+                bctx->needs_full_frame = true;
+                pthread_mutex_unlock(&bctx->rect_mutex);
+                break;
+            }
+            
+            UINT32 surfId = cmd->surfaceId;
+            UINT32 surfX = cmd->left;
+            UINT32 surfY = cmd->top;
+            UINT32 nWidth = cmd->right - cmd->left;
+            UINT32 nHeight = cmd->bottom - cmd->top;
+            
+            /* Get surface info */
+            bool mapped = false;
+            UINT32 dstX = 0, dstY = 0;
+            uint8_t* surfBuf = NULL;
+            UINT32 surfW = 0, surfH = 0;
+            
+            if (surfId < RDP_MAX_GFX_SURFACES) {
+                mapped = bctx->surfaces[surfId].mapped_to_output;
+                dstX = bctx->surfaces[surfId].output_x + surfX;
+                dstY = bctx->surfaces[surfId].output_y + surfY;
+                surfBuf = bctx->surface_buffers[surfId];
+                surfW = bctx->surfaces[surfId].width;
+                surfH = bctx->surfaces[surfId].height;
+            }
+            
+            /* Copy to surface buffer first */
+            if (surfBuf && surfW > 0 && surfH > 0 &&
+                surfX + nWidth <= surfW && surfY + nHeight <= surfH) {
+                UINT32 srcStride = nWidth * 4;
+                UINT32 surfStride = surfW * 4;
+                for (UINT32 y = 0; y < nHeight; y++) {
+                    BYTE* src = cmd->data + y * srcStride;
+                    BYTE* dst = surfBuf + (surfY + y) * surfStride + surfX * 4;
+                    memcpy(dst, src, nWidth * 4);
+                }
+            } else {
+                static int uncomp_no_buf = 0;
+                if (uncomp_no_buf < 10) {
+                    fprintf(stderr, "[rdp_bridge] BLACK_TILE: UNCOMPRESSED no surface buffer for surf=%u\n", surfId);
+                    uncomp_no_buf++;
+                }
+            }
+            
+            /* Copy to primary_buffer if mapped */
+            if (mapped && gdi && gdi->primary_buffer) {
+                /* Bounds check */
+                if (dstX + nWidth <= (UINT32)gdi->width && dstY + nHeight <= (UINT32)gdi->height) {
+                    UINT32 srcStride = nWidth * 4;
+                    for (UINT32 y = 0; y < nHeight; y++) {
+                        BYTE* src = cmd->data + y * srcStride;
+                        BYTE* dst = gdi->primary_buffer + (dstY + y) * gdi->stride + dstX * 4;
+                        memcpy(dst, src, nWidth * 4);
+                    }
+                    
+                    /* Mark dirty rect */
+                    pthread_mutex_lock(&bctx->rect_mutex);
+                    if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                        bctx->dirty_rects[bctx->dirty_rect_count].x = dstX;
+                        bctx->dirty_rects[bctx->dirty_rect_count].y = dstY;
+                        bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
+                        bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
+                        bctx->dirty_rect_count++;
+                    }
+                    pthread_mutex_unlock(&bctx->rect_mutex);
+                }
+            }
+            
+            static int uncomp_ok = 0;
+            if (uncomp_ok < 5) {
+                fprintf(stderr, "[rdp_bridge] Uncompressed: surf=%u (%u,%u) %ux%u mapped=%d\n",
+                        surfId, surfX, surfY, nWidth, nHeight, mapped);
+                uncomp_ok++;
+            }
+            break;
+        }
+        
+        /* Progressive codec - decode using FreeRDP's progressive decoder */
+        case RDPGFX_CODECID_CAPROGRESSIVE:
+        case RDPGFX_CODECID_CAPROGRESSIVE_V2: {
+            if (!bctx->progressive_decoder) {
+                fprintf(stderr, "[rdp_bridge] Progressive decoder not initialized\n");
+                pthread_mutex_lock(&bctx->rect_mutex);
+                bctx->needs_full_frame = true;
+                pthread_mutex_unlock(&bctx->rect_mutex);
+                break;
+            }
+            
+            pthread_mutex_lock(&bctx->gfx_mutex);
+            rdpGdi* prog_gdi = bctx->gdi;
+            pthread_mutex_unlock(&bctx->gfx_mutex);
+            
+            UINT32 surfId = cmd->surfaceId;
+            
+            /* Get surface info */
+            bool mapped = false;
+            UINT32 outX = 0, outY = 0;
+            uint8_t* surfBuf = NULL;
+            UINT32 surfW = 0, surfH = 0;
+            
+            if (surfId < RDP_MAX_GFX_SURFACES) {
+                mapped = bctx->surfaces[surfId].mapped_to_output;
+                outX = bctx->surfaces[surfId].output_x;
+                outY = bctx->surfaces[surfId].output_y;
+                surfBuf = bctx->surface_buffers[surfId];
+                surfW = bctx->surfaces[surfId].width;
+                surfH = bctx->surfaces[surfId].height;
+            }
+            
+            /* Progressive codec uses Wire-To-Surface-2 PDU format:
+             * - rect coordinates are 0,0,0,0 
+             * - actual update region is determined during decompression */
+            REGION16 invalidRegion;
+            region16_init(&invalidRegion);
+            
+            INT32 rc = -1;
+            
+            /* Decode to surface buffer if available */
+            if (surfBuf && surfW > 0 && surfH > 0) {
+                UINT32 surfStride = surfW * 4;
+                rc = progressive_decompress(bctx->progressive_decoder,
+                    cmd->data, cmd->length,
+                    surfBuf, PIXEL_FORMAT_BGRA32,
+                    surfStride,
+                    0, 0,  /* nXDst, nYDst - decode to full buffer */
+                    &invalidRegion,
+                    cmd->surfaceId, bctx->current_frame_id);
+                
+                /* Copy invalidated regions to primary buffer if mapped */
+                if (rc >= 0 && mapped && prog_gdi && prog_gdi->primary_buffer) {
+                    UINT32 numRects = 0;
+                    const RECTANGLE_16* rects = region16_rects(&invalidRegion, &numRects);
+                    
+                    for (UINT32 i = 0; i < numRects; i++) {
+                        UINT32 rectX = rects[i].left;
+                        UINT32 rectY = rects[i].top;
+                        UINT32 rectW = rects[i].right - rects[i].left;
+                        UINT32 rectH = rects[i].bottom - rects[i].top;
+                        
+                        UINT32 dstX = outX + rectX;
+                        UINT32 dstY = outY + rectY;
+                        
+                        /* Bounds check */
+                        if (rectX + rectW <= surfW && rectY + rectH <= surfH &&
+                            dstX + rectW <= (UINT32)prog_gdi->width && 
+                            dstY + rectH <= (UINT32)prog_gdi->height) {
+                            for (UINT32 y = 0; y < rectH; y++) {
+                                uint8_t* src = surfBuf + (rectY + y) * surfStride + rectX * 4;
+                                uint8_t* dst = prog_gdi->primary_buffer + (dstY + y) * prog_gdi->stride + dstX * 4;
+                                memcpy(dst, src, rectW * 4);
+                            }
+                        }
+                    }
+                }
+            } else if (prog_gdi && prog_gdi->primary_buffer) {
+                /* Fallback: decode directly to primary buffer - log this case */
+                static int prog_fallback = 0;
+                if (prog_fallback < 10) {
+                    fprintf(stderr, "[rdp_bridge] BLACK_TILE: Progressive fallback - no surface buffer for surf=%u\n", surfId);
+                    prog_fallback++;
+                }
+                rc = progressive_decompress(bctx->progressive_decoder,
+                    cmd->data, cmd->length,
+                    prog_gdi->primary_buffer, prog_gdi->dstFormat,
+                    prog_gdi->stride,
+                    0, 0,
+                    &invalidRegion,
+                    cmd->surfaceId, bctx->current_frame_id);
+            }
+            
+            if (rc < 0) {
+                static int prog_err = 0;
+                if (prog_err < 5) {
+                    fprintf(stderr, "[rdp_bridge] Progressive decode failed: %d\n", rc);
+                    prog_err++;
+                }
+                pthread_mutex_lock(&bctx->rect_mutex);
+                bctx->needs_full_frame = true;
+                pthread_mutex_unlock(&bctx->rect_mutex);
+            } else {
+                /* Mark invalidated regions as dirty (adjusted for output offset) */
+                UINT32 numRects = 0;
+                const RECTANGLE_16* rects = region16_rects(&invalidRegion, &numRects);
+                
+                static int prog_ok = 0;
+                if (prog_ok < 10) {
+                    fprintf(stderr, "[rdp_bridge] Progressive decoded: surf=%u %u rects mapped=%d\n", 
+                            surfId, numRects, mapped);
+                    prog_ok++;
+                }
+                
+                if (mapped) {
+                    pthread_mutex_lock(&bctx->rect_mutex);
+                    for (UINT32 i = 0; i < numRects && bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS; i++) {
+                        bctx->dirty_rects[bctx->dirty_rect_count].x = outX + rects[i].left;
+                        bctx->dirty_rects[bctx->dirty_rect_count].y = outY + rects[i].top;
+                        bctx->dirty_rects[bctx->dirty_rect_count].width = rects[i].right - rects[i].left;
+                        bctx->dirty_rects[bctx->dirty_rect_count].height = rects[i].bottom - rects[i].top;
+                        bctx->dirty_rect_count++;
+                    }
+                    if (numRects == 0) {
+                        /* No explicit rects - mark full frame */
+                        bctx->needs_full_frame = true;
+                    }
+                    pthread_mutex_unlock(&bctx->rect_mutex);
+                }
+            }
+            
+            region16_uninit(&invalidRegion);
+            break;
+        }
+        
+        /* Planar codec - decode using FreeRDP's planar decoder */
+        case RDPGFX_CODECID_PLANAR: {
+            if (!bctx->planar_decoder) {
+                pthread_mutex_lock(&bctx->rect_mutex);
+                bctx->needs_full_frame = true;
+                pthread_mutex_unlock(&bctx->rect_mutex);
+                break;
+            }
+            
+            pthread_mutex_lock(&bctx->gfx_mutex);
+            rdpGdi* planar_gdi = bctx->gdi;
+            pthread_mutex_unlock(&bctx->gfx_mutex);
+            
+            UINT32 surfId = cmd->surfaceId;
+            UINT32 surfX = cmd->left;
+            UINT32 surfY = cmd->top;
+            UINT32 nWidth = cmd->right - cmd->left;
+            UINT32 nHeight = cmd->bottom - cmd->top;
+            
+            /* Get surface info */
+            bool mapped = false;
+            UINT32 dstX = 0, dstY = 0;
+            uint8_t* surfBuf = NULL;
+            UINT32 surfW = 0, surfH = 0;
+            
+            if (surfId < RDP_MAX_GFX_SURFACES) {
+                mapped = bctx->surfaces[surfId].mapped_to_output;
+                dstX = bctx->surfaces[surfId].output_x + surfX;
+                dstY = bctx->surfaces[surfId].output_y + surfY;
+                surfBuf = bctx->surface_buffers[surfId];
+                surfW = bctx->surfaces[surfId].width;
+                surfH = bctx->surfaces[surfId].height;
+            }
+            
+            bool decoded = false;
+            
+            /* Decode to surface buffer if available */
+            if (surfBuf && surfW > 0 && surfH > 0 &&
+                surfX + nWidth <= surfW && surfY + nHeight <= surfH) {
+                UINT32 surfStride = surfW * 4;
+                if (freerdp_bitmap_decompress_planar(bctx->planar_decoder,
+                        cmd->data, cmd->length,
+                        nWidth, nHeight,
+                        surfBuf, PIXEL_FORMAT_BGRA32,
+                        surfStride,
+                        surfX, surfY,
+                        nWidth, nHeight, FALSE)) {
+                    decoded = true;
+                    
+                    /* Copy to primary buffer if mapped */
+                    if (mapped && planar_gdi && planar_gdi->primary_buffer &&
+                        dstX + nWidth <= (UINT32)planar_gdi->width &&
+                        dstY + nHeight <= (UINT32)planar_gdi->height) {
+                        for (UINT32 y = 0; y < nHeight; y++) {
+                            uint8_t* src = surfBuf + (surfY + y) * surfStride + surfX * 4;
+                            uint8_t* dst = planar_gdi->primary_buffer + (dstY + y) * planar_gdi->stride + dstX * 4;
+                            memcpy(dst, src, nWidth * 4);
+                        }
+                        
+                        pthread_mutex_lock(&bctx->rect_mutex);
+                        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                            bctx->dirty_rects[bctx->dirty_rect_count].x = dstX;
+                            bctx->dirty_rects[bctx->dirty_rect_count].y = dstY;
+                            bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
+                            bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
+                            bctx->dirty_rect_count++;
+                        }
+                        pthread_mutex_unlock(&bctx->rect_mutex);
+                    }
+                }
+            }
+            
+            if (!decoded) {
+                static int planar_err = 0;
+                if (planar_err < 5) {
+                    fprintf(stderr, "[rdp_bridge] Planar decode failed\n");
+                    planar_err++;
+                }
+                pthread_mutex_lock(&bctx->rect_mutex);
+                bctx->needs_full_frame = true;
+                pthread_mutex_unlock(&bctx->rect_mutex);
+            } else {
+                static int planar_ok = 0;
+                if (planar_ok < 5) {
+                    fprintf(stderr, "[rdp_bridge] Planar decoded: surf=%u (%u,%u) %ux%u mapped=%d\n",
+                            surfId, surfX, surfY, nWidth, nHeight, mapped);
+                    planar_ok++;
+                }
+            }
+            break;
+        }
+        
+        /* Alpha codec and other unknown codecs */
+        case RDPGFX_CODECID_ALPHA:
+        default: {
+            static int other_codec = 0;
+            if (other_codec < 10) {
+                fprintf(stderr, "[rdp_bridge] Unsupported codec 0x%04X at (%d,%d)-(%d,%d) - marking refresh\n",
+                        cmd->codecId, cmd->left, cmd->top, cmd->right, cmd->bottom);
+                other_codec++;
+            }
+            pthread_mutex_lock(&bctx->rect_mutex);
+            bctx->needs_full_frame = true;
+            pthread_mutex_unlock(&bctx->rect_mutex);
+            break;
+        }
+    }
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_start_frame(RdpgfxClientContext* context, const RDPGFX_START_FRAME_PDU* start)
+{
+    /* PURE GFX MODE: Just track frame ID, no GDI chaining needed */
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !start) return ERROR_INVALID_PARAMETER;
+    
+    bctx->current_frame_id = start->frameId;
+    bctx->frame_cmd_count = 0;  /* Reset command count for this frame */
+    
+    static int start_frame_logs = 0;
+    if (start_frame_logs < 20) {
+        fprintf(stderr, "[rdp_bridge] StartFrame: frame_id=%u timestamp=%u\n", 
+                start->frameId, start->timestamp);
+        start_frame_logs++;
+    }
+    
+    return CHANNEL_RC_OK;
+}
+
+static UINT gfx_on_end_frame(RdpgfxClientContext* context, const RDPGFX_END_FRAME_PDU* end)
+{
+    /* PURE GFX MODE: FreeRDP's internal rdpgfx_recv_end_frame_pdu() will send 
+     * FrameAcknowledge after we return. We just need to track decoded frames.
+     * 
+     * Note: FreeRDP increments gfx->TotalDecodedFrames and sends the ack internally
+     * when gfx->sendFrameAcks is TRUE (which it is by default).
+     */
+    BridgeContext* bctx = (BridgeContext*)context->custom;
+    if (!bctx || !end) return ERROR_INVALID_PARAMETER;
+    
+    static int end_frame_logs = 0;
+    
+    if (end_frame_logs < 20) {
+        fprintf(stderr, "[rdp_bridge] EndFrame: frame_id=%u cmds_in_frame=%u (FreeRDP handles ack internally)\n", 
+                end->frameId, bctx->frame_cmd_count);
+        end_frame_logs++;
+        
+        if (bctx->frame_cmd_count == 0) {
+            fprintf(stderr, "[rdp_bridge] WARNING: Empty frame received (no commands between StartFrame/EndFrame)\n");
+        }
+    }
+    
+    /* Mark that we need to refresh the frame for WebSocket clients */
+    pthread_mutex_lock(&bctx->rect_mutex);
+    bctx->needs_full_frame = true;
+    pthread_mutex_unlock(&bctx->rect_mutex);
+    
+    return CHANNEL_RC_OK;
+}
+
+/* ============================================================================
+ * GFX/H.264 API Implementation
+ * ============================================================================ */
+
+bool rdp_gfx_is_active(RdpSession* session)
+{
+    if (!session) return false;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_mutex);
+    bool active = ctx->gfx_active && ctx->gfx != NULL;
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+    
+    return active;
+}
+
+RdpGfxCodecId rdp_gfx_get_codec(RdpSession* session)
+{
+    if (!session) return RDP_GFX_CODEC_UNCOMPRESSED;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_mutex);
+    RdpGfxCodecId codec = ctx->gfx_codec;
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+    
+    return codec;
+}
+
+int rdp_has_h264_frames(RdpSession* session)
+{
+    if (!session) return 0;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->h264_mutex);
+    int count = ctx->h264_count;
+    pthread_mutex_unlock(&ctx->h264_mutex);
+    
+    return count;
+}
+
+int rdp_get_h264_frame(RdpSession* session, RdpH264Frame* frame)
+{
+    if (!session || !frame) return -2;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->h264_mutex);
+    
+    if (ctx->h264_count == 0) {
+        pthread_mutex_unlock(&ctx->h264_mutex);
+        return -1;  /* No frames */
+    }
+    
+    H264FrameEntry* entry = &ctx->h264_frames[ctx->h264_read_idx];
+    if (!entry->valid) {
+        pthread_mutex_unlock(&ctx->h264_mutex);
+        return -1;
+    }
+    
+    /* Copy to output (caller must not free nal_data) */
+    frame->frame_id = entry->frame_id;
+    frame->surface_id = entry->surface_id;
+    frame->codec_id = entry->codec_id;
+    frame->frame_type = entry->frame_type;
+    frame->dest_rect = entry->dest_rect;
+    frame->nal_size = entry->nal_size;
+    frame->nal_data = entry->nal_data;
+    frame->chroma_nal_size = entry->chroma_nal_size;
+    frame->chroma_nal_data = entry->chroma_nal_data;
+    frame->timestamp = entry->timestamp;
+    frame->needs_ack = entry->needs_ack;
+    
+    /* Mark as read but don't free yet - caller needs the data */
+    entry->valid = false;
+    ctx->h264_read_idx = (ctx->h264_read_idx + 1) % RDP_MAX_H264_FRAMES;
+    ctx->h264_count--;
+    
+    pthread_mutex_unlock(&ctx->h264_mutex);
+    return 0;
+}
+
+int rdp_ack_h264_frame(RdpSession* session, uint32_t frame_id)
+{
+    if (!session) return -1;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_mutex);
+    
+    if (!ctx->gfx || !ctx->gfx_active) {
+        pthread_mutex_unlock(&ctx->gfx_mutex);
+        return -1;
+    }
+    
+    RDPGFX_FRAME_ACKNOWLEDGE_PDU ack = {
+        .frameId = frame_id,
+        .queueDepth = 1
+    };
+    
+    UINT status = CHANNEL_RC_OK;
+    if (ctx->gfx->FrameAcknowledge) {
+        status = ctx->gfx->FrameAcknowledge(ctx->gfx, &ack);
+    }
+    
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+    
+    return (status == CHANNEL_RC_OK) ? 0 : -1;
+}
+
+int rdp_gfx_get_surface(RdpSession* session, uint16_t surface_id, RdpGfxSurface* surface)
+{
+    if (!session || !surface) return -1;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_mutex);
+    
+    for (int i = 0; i < RDP_MAX_GFX_SURFACES; i++) {
+        if (ctx->surfaces[i].active && ctx->surfaces[i].surface_id == surface_id) {
+            *surface = ctx->surfaces[i];
+            pthread_mutex_unlock(&ctx->gfx_mutex);
+            return 0;
+        }
+    }
+    
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+    return -1;
+}
+
+uint16_t rdp_gfx_get_primary_surface(RdpSession* session)
+{
+    if (!session) return 0;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_mutex);
+    uint16_t id = ctx->primary_surface_id;
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+    
+    return id;
 }
 
 /* ============================================================================
@@ -1337,3 +3502,19 @@ const char* rdp_version(void)
 {
     return RDP_BRIDGE_VERSION;
 }
+
+/* ============================================================================
+ * Codec Constants - Exported for Python binding to avoid value drift
+ * These values come directly from FreeRDP's rdpgfx.h header
+ * ============================================================================ */
+
+uint16_t rdp_gfx_codec_uncompressed(void) { return RDPGFX_CODECID_UNCOMPRESSED; }
+uint16_t rdp_gfx_codec_cavideo(void) { return RDPGFX_CODECID_CAVIDEO; }
+uint16_t rdp_gfx_codec_clearcodec(void) { return RDPGFX_CODECID_CLEARCODEC; }
+uint16_t rdp_gfx_codec_planar(void) { return RDPGFX_CODECID_PLANAR; }
+uint16_t rdp_gfx_codec_avc420(void) { return RDPGFX_CODECID_AVC420; }
+uint16_t rdp_gfx_codec_alpha(void) { return RDPGFX_CODECID_ALPHA; }
+uint16_t rdp_gfx_codec_avc444(void) { return RDPGFX_CODECID_AVC444; }
+uint16_t rdp_gfx_codec_avc444v2(void) { return RDPGFX_CODECID_AVC444v2; }
+uint16_t rdp_gfx_codec_progressive(void) { return RDPGFX_CODECID_CAPROGRESSIVE; }
+uint16_t rdp_gfx_codec_progressive_v2(void) { return RDPGFX_CODECID_CAPROGRESSIVE_V2; }

@@ -70,6 +70,92 @@ AUDIO_FRAME_MAGIC = b'AUDI'
 # Opus audio frame magic header
 OPUS_AUDIO_MAGIC = b'OPUS'
 
+# H.264 frame magic header (GFX pipeline)
+H264_FRAME_MAGIC = b'H264'
+
+# GFX codec identifiers - These are loaded from the native library at runtime
+# to avoid value drift from FreeRDP's rdpgfx.h header.
+# Default fallback values (will be overwritten when library loads):
+RDP_GFX_CODEC_UNCOMPRESSED = 0x0000
+RDP_GFX_CODEC_CAVIDEO = 0x0003
+RDP_GFX_CODEC_CLEARCODEC = 0x0008
+RDP_GFX_CODEC_PROGRESSIVE = 0x0009
+RDP_GFX_CODEC_PLANAR = 0x000A
+RDP_GFX_CODEC_AVC420 = 0x000B
+RDP_GFX_CODEC_ALPHA = 0x000C
+RDP_GFX_CODEC_PROGRESSIVE_V2 = 0x000D
+RDP_GFX_CODEC_AVC444 = 0x000E
+RDP_GFX_CODEC_AVC444v2 = 0x000F
+
+def _load_codec_constants_from_lib(lib) -> dict:
+    """Load GFX codec constants from native library to avoid drift from C headers."""
+    global RDP_GFX_CODEC_UNCOMPRESSED, RDP_GFX_CODEC_CAVIDEO, RDP_GFX_CODEC_CLEARCODEC
+    global RDP_GFX_CODEC_PROGRESSIVE, RDP_GFX_CODEC_PLANAR, RDP_GFX_CODEC_AVC420
+    global RDP_GFX_CODEC_ALPHA, RDP_GFX_CODEC_PROGRESSIVE_V2, RDP_GFX_CODEC_AVC444
+    global RDP_GFX_CODEC_AVC444v2
+    
+    try:
+        # Set up function bindings for codec getters
+        lib.rdp_gfx_codec_uncompressed.argtypes = []
+        lib.rdp_gfx_codec_uncompressed.restype = c_uint16
+        lib.rdp_gfx_codec_cavideo.argtypes = []
+        lib.rdp_gfx_codec_cavideo.restype = c_uint16
+        lib.rdp_gfx_codec_clearcodec.argtypes = []
+        lib.rdp_gfx_codec_clearcodec.restype = c_uint16
+        lib.rdp_gfx_codec_planar.argtypes = []
+        lib.rdp_gfx_codec_planar.restype = c_uint16
+        lib.rdp_gfx_codec_avc420.argtypes = []
+        lib.rdp_gfx_codec_avc420.restype = c_uint16
+        lib.rdp_gfx_codec_alpha.argtypes = []
+        lib.rdp_gfx_codec_alpha.restype = c_uint16
+        lib.rdp_gfx_codec_avc444.argtypes = []
+        lib.rdp_gfx_codec_avc444.restype = c_uint16
+        lib.rdp_gfx_codec_avc444v2.argtypes = []
+        lib.rdp_gfx_codec_avc444v2.restype = c_uint16
+        lib.rdp_gfx_codec_progressive.argtypes = []
+        lib.rdp_gfx_codec_progressive.restype = c_uint16
+        lib.rdp_gfx_codec_progressive_v2.argtypes = []
+        lib.rdp_gfx_codec_progressive_v2.restype = c_uint16
+        
+        # Load the actual values from FreeRDP headers via the native library
+        RDP_GFX_CODEC_UNCOMPRESSED = lib.rdp_gfx_codec_uncompressed()
+        RDP_GFX_CODEC_CAVIDEO = lib.rdp_gfx_codec_cavideo()
+        RDP_GFX_CODEC_CLEARCODEC = lib.rdp_gfx_codec_clearcodec()
+        RDP_GFX_CODEC_PLANAR = lib.rdp_gfx_codec_planar()
+        RDP_GFX_CODEC_AVC420 = lib.rdp_gfx_codec_avc420()
+        RDP_GFX_CODEC_ALPHA = lib.rdp_gfx_codec_alpha()
+        RDP_GFX_CODEC_AVC444 = lib.rdp_gfx_codec_avc444()
+        RDP_GFX_CODEC_AVC444v2 = lib.rdp_gfx_codec_avc444v2()
+        RDP_GFX_CODEC_PROGRESSIVE = lib.rdp_gfx_codec_progressive()
+        RDP_GFX_CODEC_PROGRESSIVE_V2 = lib.rdp_gfx_codec_progressive_v2()
+        
+        logger.debug(
+            f"Loaded GFX codec constants from native lib: "
+            f"AVC420=0x{RDP_GFX_CODEC_AVC420:04X}, AVC444=0x{RDP_GFX_CODEC_AVC444:04X}, "
+            f"ClearCodec=0x{RDP_GFX_CODEC_CLEARCODEC:04X}"
+        )
+        
+        return {
+            'UNCOMPRESSED': RDP_GFX_CODEC_UNCOMPRESSED,
+            'CAVIDEO': RDP_GFX_CODEC_CAVIDEO,
+            'CLEARCODEC': RDP_GFX_CODEC_CLEARCODEC,
+            'PLANAR': RDP_GFX_CODEC_PLANAR,
+            'AVC420': RDP_GFX_CODEC_AVC420,
+            'ALPHA': RDP_GFX_CODEC_ALPHA,
+            'AVC444': RDP_GFX_CODEC_AVC444,
+            'AVC444v2': RDP_GFX_CODEC_AVC444v2,
+            'PROGRESSIVE': RDP_GFX_CODEC_PROGRESSIVE,
+            'PROGRESSIVE_V2': RDP_GFX_CODEC_PROGRESSIVE_V2,
+        }
+    except Exception as e:
+        logger.warning(f"Failed to load codec constants from native lib: {e}, using fallback values")
+        return {}
+
+# H.264 frame types
+RDP_H264_FRAME_TYPE_IDR = 0  # Keyframe
+RDP_H264_FRAME_TYPE_P = 1    # Predictive
+RDP_H264_FRAME_TYPE_B = 2    # Bi-predictive
+
 
 class RdpRect(Structure):
     """Dirty rectangle structure (matches C struct)"""
@@ -78,6 +164,37 @@ class RdpRect(Structure):
         ('y', c_int32),
         ('width', c_int32),
         ('height', c_int32),
+    ]
+
+
+class RdpH264Frame(Structure):
+    """H.264 frame from GFX pipeline (matches C struct)"""
+    _fields_ = [
+        ('frame_id', c_uint32),
+        ('surface_id', c_uint16),
+        ('codec_id', c_int),           # RdpGfxCodecId enum
+        ('frame_type', c_int),         # RdpH264FrameType enum
+        ('dest_rect', RdpRect),
+        ('nal_size', c_uint32),
+        ('nal_data', POINTER(c_uint8)),
+        ('chroma_nal_size', c_uint32),
+        ('chroma_nal_data', POINTER(c_uint8)),
+        ('timestamp', ctypes.c_uint64),
+        ('needs_ack', c_bool),
+    ]
+
+
+class RdpGfxSurface(Structure):
+    """GFX surface descriptor (matches C struct)"""
+    _fields_ = [
+        ('surface_id', c_uint16),
+        ('width', c_uint32),
+        ('height', c_uint32),
+        ('pixel_format', c_uint32),
+        ('active', c_bool),
+        ('mapped_to_output', c_bool),
+        ('output_x', c_int32),
+        ('output_y', c_int32),
     ]
 
 
@@ -265,6 +382,35 @@ class NativeLibrary:
         lib.rdp_get_opus_frame.argtypes = [c_void_p, POINTER(c_uint8), c_int]
         lib.rdp_get_opus_frame.restype = c_int
         
+        # GFX/H.264 API functions
+        # rdp_gfx_is_active
+        lib.rdp_gfx_is_active.argtypes = [c_void_p]
+        lib.rdp_gfx_is_active.restype = c_bool
+        
+        # rdp_gfx_get_codec
+        lib.rdp_gfx_get_codec.argtypes = [c_void_p]
+        lib.rdp_gfx_get_codec.restype = c_int
+        
+        # rdp_has_h264_frames
+        lib.rdp_has_h264_frames.argtypes = [c_void_p]
+        lib.rdp_has_h264_frames.restype = c_int
+        
+        # rdp_get_h264_frame
+        lib.rdp_get_h264_frame.argtypes = [c_void_p, POINTER(RdpH264Frame)]
+        lib.rdp_get_h264_frame.restype = c_int
+        
+        # rdp_ack_h264_frame
+        lib.rdp_ack_h264_frame.argtypes = [c_void_p, c_uint32]
+        lib.rdp_ack_h264_frame.restype = c_int
+        
+        # rdp_gfx_get_surface
+        lib.rdp_gfx_get_surface.argtypes = [c_void_p, c_uint16, POINTER(RdpGfxSurface)]
+        lib.rdp_gfx_get_surface.restype = c_int
+        
+        # rdp_gfx_get_primary_surface
+        lib.rdp_gfx_get_primary_surface.argtypes = [c_void_p]
+        lib.rdp_gfx_get_primary_surface.restype = c_uint16
+        
         # Session registry functions
         # rdp_set_max_sessions
         lib.rdp_set_max_sessions.argtypes = [c_int]
@@ -273,6 +419,9 @@ class NativeLibrary:
         # rdp_get_max_sessions
         lib.rdp_get_max_sessions.argtypes = []
         lib.rdp_get_max_sessions.restype = c_int
+        
+        # Load GFX codec constants from native library (avoid value drift from C headers)
+        _load_codec_constants_from_lib(lib)
         
         # Initialize session registry with configurable limit
         self._init_session_registry()
@@ -416,6 +565,11 @@ class RDPBridge:
     async def resize(self, width: int, height: int) -> bool:
         """Resize the RDP session"""
         try:
+            # Skip if dimensions haven't changed
+            if self.config.width == width and self.config.height == height:
+                logger.debug(f"Skipping redundant resize to {width}x{height}")
+                return True
+            
             logger.info(f"Resizing session to {width}x{height}")
             
             self.config.width = width
@@ -432,13 +586,15 @@ class RDPBridge:
             return False
     
     async def _stream_frames(self):
-        """Stream frames from native library with delta updates"""
+        """Stream frames from native library - prioritizes H.264/GFX when available"""
         logger.info("Starting frame streaming")
         
-        # Allocate dirty rect buffer
+        # Allocate dirty rect buffer for GDI fallback
         max_rects = 64
         rects = (RdpRect * max_rects)()
         poll_count = 0
+        h264_frame = RdpH264Frame()
+        gfx_mode_logged = False
         
         while self.running:
             try:
@@ -454,6 +610,46 @@ class RDPBridge:
                     logger.error(f"RDP poll error: {error.decode('utf-8') if error else 'Unknown'}")
                     break
                 
+                # Check if GFX/H.264 pipeline is active
+                gfx_active = self._lib.rdp_gfx_is_active(self._session)
+                
+                if gfx_active and not gfx_mode_logged:
+                    codec = self._lib.rdp_gfx_get_codec(self._session)
+                    codec_name = {
+                        RDP_GFX_CODEC_AVC420: "AVC420",
+                        RDP_GFX_CODEC_AVC444: "AVC444", 
+                        RDP_GFX_CODEC_AVC444v2: "AVC444v2",
+                        RDP_GFX_CODEC_PROGRESSIVE: "Progressive",
+                    }.get(codec, f"Unknown({codec})")
+                    logger.info(f"GFX pipeline active with codec: {codec_name}")
+                    gfx_mode_logged = True
+                
+                # Priority 1: Stream H.264 frames from GFX pipeline
+                if gfx_active:
+                    h264_count = self._lib.rdp_has_h264_frames(self._session)
+                    h264_sent = 0
+                    while h264_count > 0:
+                        ret = self._lib.rdp_get_h264_frame(
+                            self._session, ctypes.byref(h264_frame)
+                        )
+                        if ret == 0:
+                            await self._send_h264_frame(h264_frame)
+                            h264_count -= 1
+                            h264_sent += 1
+                        else:
+                            break
+                    
+                    # If we sent H.264 frames, continue polling
+                    if h264_sent > 0:
+                        continue
+                    
+                    # GFX active but no H.264 frames - server may be using non-H.264 codec
+                    # Fall through to GDI/WebP path to render whatever is in the frame buffer
+                    if result == 0:
+                        await asyncio.sleep(0.001)
+                        continue
+                
+                # Fallback: GDI mode (legacy WebP encoding)
                 if result == 0:
                     # No frame update, but still connected
                     await asyncio.sleep(0.001)
@@ -605,6 +801,71 @@ class RDPBridge:
             
         except Exception as e:
             logger.error(f"Delta frame encoding error: {e}")
+    
+    async def _send_h264_frame(self, frame: RdpH264Frame):
+        """Send H.264 frame from GFX pipeline to browser
+        
+        Binary format:
+        [H264 magic (4)] [frame_id (4)] [surface_id (2)] [codec_id (2)]
+        [frame_type (1)] [x (2)] [y (2)] [w (2)] [h (2)]
+        [nal_size (4)] [chroma_nal_size (4)]
+        [nal_data...] [chroma_nal_data...]
+        """
+        try:
+            if not frame.nal_data or frame.nal_size == 0:
+                return
+            
+            # Read NAL data from native buffer
+            nal_data = ctypes.string_at(frame.nal_data, frame.nal_size)
+            
+            # Read chroma NAL data for AVC444
+            chroma_data = b''
+            if frame.chroma_nal_data and frame.chroma_nal_size > 0:
+                chroma_data = ctypes.string_at(frame.chroma_nal_data, frame.chroma_nal_size)
+            
+            # Build binary message
+            message = io.BytesIO()
+            message.write(H264_FRAME_MAGIC)  # 4 bytes
+            message.write(struct.pack('<I', frame.frame_id))  # 4 bytes
+            message.write(struct.pack('<H', frame.surface_id))  # 2 bytes
+            message.write(struct.pack('<H', frame.codec_id))  # 2 bytes
+            message.write(struct.pack('<B', frame.frame_type))  # 1 byte
+            message.write(struct.pack('<h', frame.dest_rect.x))  # 2 bytes
+            message.write(struct.pack('<h', frame.dest_rect.y))  # 2 bytes
+            message.write(struct.pack('<H', frame.dest_rect.width))  # 2 bytes
+            message.write(struct.pack('<H', frame.dest_rect.height))  # 2 bytes
+            message.write(struct.pack('<I', frame.nal_size))  # 4 bytes
+            message.write(struct.pack('<I', len(chroma_data)))  # 4 bytes
+            message.write(nal_data)
+            if chroma_data:
+                message.write(chroma_data)
+            
+            await self.websocket.send(message.getvalue())
+            self._frame_count += 1
+            
+            # Log first few H.264 frames for debugging
+            if self._frame_count <= 5:
+                codec_name = {
+                    RDP_GFX_CODEC_AVC420: "AVC420",
+                    RDP_GFX_CODEC_AVC444: "AVC444",
+                    RDP_GFX_CODEC_AVC444v2: "AVC444v2",
+                }.get(frame.codec_id, f"0x{frame.codec_id:X}")
+                frame_type = {0: "IDR", 1: "P", 2: "B"}.get(frame.frame_type, "?")
+                logger.info(
+                    f"H.264 frame #{self._frame_count}: {codec_name} {frame_type} "
+                    f"{frame.dest_rect.width}x{frame.dest_rect.height} "
+                    f"NAL:{frame.nal_size}b chroma:{len(chroma_data)}b"
+                )
+                
+        except Exception as e:
+            logger.error(f"H.264 frame send error: {e}")
+    
+    async def ack_h264_frame(self, frame_id: int):
+        """Acknowledge an H.264 frame to prevent server back-pressure"""
+        if self._session and self._lib:
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._lib.rdp_ack_h264_frame, self._session, frame_id
+            )
     
     async def _stream_audio(self):
         """Stream Opus audio from native FreeRDP buffer (no PulseAudio required)"""

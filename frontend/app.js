@@ -23,6 +23,8 @@
     let pingStart = 0;
     let resizeTimeout = null;
     let pendingResize = false;
+    let lastRequestedWidth = 0;  // Track last requested dimensions to avoid duplicates
+    let lastRequestedHeight = 0;
     
     // Audio state
     let audioContext = null;
@@ -37,9 +39,30 @@
     let opusSampleRate = 48000;
     let opusChannels = 2;
 
+    // H.264 video decoder state (WebCodecs)
+    let videoDecoder = null;
+    let h264Initialized = false;
+    let h264FrameCount = 0;
+    let lastH264FrameId = 0;
+    let pendingH264Frames = [];  // Queue for out-of-order frames
+    let gfxSurfaces = new Map(); // surface_id -> {width, height, canvas}
+
     // Audio frame magic headers
     const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49];  // "AUDI" (PCM - legacy)
     const OPUS_MAGIC = [0x4F, 0x50, 0x55, 0x53];   // "OPUS" (Opus encoded)
+    
+    // H.264 frame magic header
+    const H264_MAGIC = [0x48, 0x32, 0x36, 0x34];   // "H264"
+    
+    // Frame types received by client:
+    // - WebP/JPEG: Raw image data (full frame or GDI-decoded content)
+    // - DELT: Delta frame with dirty rectangles as WebP tiles  
+    // - H264: H.264 NAL units for hardware decoding
+    // - OPUS: Opus-encoded audio
+    // 
+    // Note: The server handles all RDP GFX codec translation.
+    // ClearCodec, Planar, etc. are decoded server-side and sent as WebP.
+    // H.264 codecs (AVC420/AVC444) are forwarded as H264 frames.
 
     // DOM Elements
     const elements = {
@@ -179,6 +202,12 @@
             // Calculate available space for initial connection
             const { width, height } = getAvailableDimensions();
             console.log('[RDP Client] Initial dimensions:', width, 'x', height);
+            
+            // Track the dimensions we're requesting and pre-set canvas to avoid redundant resize
+            lastRequestedWidth = width;
+            lastRequestedHeight = height;
+            canvas.width = width;
+            canvas.height = height;
 
             // Send connection request with calculated dimensions
             sendMessage({
@@ -222,6 +251,8 @@
     function handleDisconnect() {
         isConnected = false;
         ws = null;
+        lastRequestedWidth = 0;
+        lastRequestedHeight = 0;
         updateStatus('disconnected', 'Disconnected');
         elements.canvas.style.display = 'none';
         elements.loading.style.display = 'block';
@@ -232,6 +263,9 @@
         
         // Cleanup audio
         cleanupAudio();
+        
+        // Cleanup H.264 decoder
+        cleanupH264Decoder();
     }
 
     /**
@@ -319,8 +353,12 @@
         setTimeout(() => {
             if (isConnected) {
                 const { width, height } = getAvailableDimensions();
-                if (width !== canvas.width || height !== canvas.height) {
+                // Only resize if dimensions changed AND differ from what we already requested
+                if ((width !== canvas.width || height !== canvas.height) &&
+                    (width !== lastRequestedWidth || height !== lastRequestedHeight)) {
                     console.log('[RDP Client] Post-connect resize to:', width, 'x', height);
+                    lastRequestedWidth = width;
+                    lastRequestedHeight = height;
                     sendMessage({ type: 'resize', width, height });
                 }
             }
@@ -332,10 +370,18 @@
     }
 
     /**
-     * Handle binary frame update (WebP full frame or delta frame)
+     * Handle binary frame update (WebP full frame, delta frame, or H.264)
      */
     function handleFrameUpdate(data) {
         const bytes = new Uint8Array(data);
+        
+        // Check for H.264 frame magic header: "H264" (0x48, 0x32, 0x36, 0x34)
+        if (bytes.length > 25 &&
+            bytes[0] === H264_MAGIC[0] && bytes[1] === H264_MAGIC[1] &&
+            bytes[2] === H264_MAGIC[2] && bytes[3] === H264_MAGIC[3]) {
+            handleH264Frame(bytes);
+            return;
+        }
         
         // Check for delta frame magic header: "DELT" (0x44, 0x45, 0x4C, 0x54)
         if (bytes.length > 8 &&
@@ -437,6 +483,162 @@
             
         } catch (e) {
             console.error('[RDP Client] Delta frame parsing error:', e);
+        }
+    }
+
+    /**
+     * Handle H.264 frame from GFX pipeline
+     * Format: [H264 (4)] [frame_id (4)] [surface_id (2)] [codec_id (2)]
+     *         [frame_type (1)] [x (2)] [y (2)] [w (2)] [h (2)]
+     *         [nal_size (4)] [chroma_nal_size (4)]
+     *         [nal_data...] [chroma_nal_data...]
+     */
+    async function handleH264Frame(bytes) {
+        try {
+            // Parse header (25 bytes)
+            const view = new DataView(bytes.buffer, bytes.byteOffset);
+            let offset = 4; // Skip magic
+            
+            const frameId = view.getUint32(offset, true); offset += 4;
+            const surfaceId = view.getUint16(offset, true); offset += 2;
+            const codecId = view.getUint16(offset, true); offset += 2;
+            const frameType = bytes[offset]; offset += 1;
+            const destX = view.getInt16(offset, true); offset += 2;
+            const destY = view.getInt16(offset, true); offset += 2;
+            const destW = view.getUint16(offset, true); offset += 2;
+            const destH = view.getUint16(offset, true); offset += 2;
+            const nalSize = view.getUint32(offset, true); offset += 4;
+            const chromaNalSize = view.getUint32(offset, true); offset += 4;
+            
+            // Validate sizes
+            if (offset + nalSize + chromaNalSize > bytes.length) {
+                console.error('[RDP Client] H.264 frame data overflow');
+                return;
+            }
+            
+            // Extract NAL data
+            const nalData = bytes.slice(offset, offset + nalSize);
+            offset += nalSize;
+            
+            // For AVC444, we also have chroma NAL data
+            let chromaData = null;
+            if (chromaNalSize > 0) {
+                chromaData = bytes.slice(offset, offset + chromaNalSize);
+            }
+            
+            // Log first few frames (codec ID is from server's RDP GFX pipeline)
+            h264FrameCount++;
+            if (h264FrameCount <= 5) {
+                const typeName = ['IDR', 'P', 'B'][frameType] || '?';
+                console.log(`[RDP Client] H.264 #${h264FrameCount}: codec=0x${codecId.toString(16).padStart(4,'0')} ${typeName} ` +
+                           `${destW}x${destH} NAL:${nalSize}b chroma:${chromaNalSize}b`);
+            }
+            
+            // Initialize decoder if needed
+            if (!h264Initialized) {
+                const success = await initH264Decoder(destW, destH);
+                if (!success) {
+                    // Fallback: request WebP frames instead
+                    console.warn('[RDP Client] H.264 decoder unavailable, frames will be dropped');
+                    return;
+                }
+            }
+            
+            // Decode the frame
+            await decodeH264Frame(nalData, frameType, destX, destY, destW, destH, surfaceId, chromaData);
+            
+            // Send acknowledgment to prevent server back-pressure
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'ack_frame',
+                    frame_id: frameId
+                }));
+            }
+            
+            lastH264FrameId = frameId;
+            
+        } catch (e) {
+            console.error('[RDP Client] H.264 frame error:', e);
+        }
+    }
+
+    /**
+     * Initialize H.264 decoder using WebCodecs API
+     */
+    async function initH264Decoder(width, height) {
+        // Check WebCodecs support
+        if (typeof VideoDecoder === 'undefined') {
+            console.warn('[RDP Client] WebCodecs VideoDecoder not supported');
+            return false;
+        }
+        
+        try {
+            // Check if H.264 is supported
+            const config = {
+                codec: 'avc1.64001f', // H.264 High Profile Level 3.1
+                codedWidth: width,
+                codedHeight: height,
+                optimizeForLatency: true,
+                hardwareAcceleration: 'prefer-hardware',
+            };
+            
+            const support = await VideoDecoder.isConfigSupported(config);
+            if (!support.supported) {
+                console.warn('[RDP Client] H.264 codec not supported');
+                return false;
+            }
+            
+            // Create decoder
+            videoDecoder = new VideoDecoder({
+                output: (frame) => {
+                    // Draw decoded frame to canvas
+                    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                    frame.close();
+                },
+                error: (e) => {
+                    console.error('[RDP Client] H.264 decode error:', e);
+                }
+            });
+            
+            await videoDecoder.configure(config);
+            h264Initialized = true;
+            console.log('[RDP Client] H.264 decoder initialized:', width, 'x', height);
+            return true;
+            
+        } catch (e) {
+            console.error('[RDP Client] H.264 decoder init failed:', e);
+            return false;
+        }
+    }
+
+    /**
+     * Decode H.264 frame and draw to canvas
+     * Note: AVC444 streams are transcoded to 4:2:0 on the server for browser compatibility
+     */
+    async function decodeH264Frame(nalData, frameType, destX, destY, destW, destH, surfaceId, chromaData) {
+        if (!videoDecoder || videoDecoder.state === 'closed') {
+            return;
+        }
+        
+        try {
+            // Server transcodes AVC444 (4:4:4 dual-stream) to AVC420 (4:2:0)
+            // so we receive a single, browser-compatible H.264 stream
+            
+            // Determine if this is a keyframe
+            const isKeyframe = (frameType === 0); // IDR
+            
+            // Create EncodedVideoChunk
+            const chunk = new EncodedVideoChunk({
+                type: isKeyframe ? 'key' : 'delta',
+                timestamp: performance.now() * 1000, // microseconds
+                data: nalData
+            });
+            
+            // Queue for decoding
+            videoDecoder.decode(chunk);
+            
+        } catch (e) {
+            console.error('[RDP Client] H.264 decode failed:', e);
         }
     }
 
@@ -805,6 +1007,26 @@
     }
 
     /**
+     * Cleanup H.264 decoder resources
+     */
+    function cleanupH264Decoder() {
+        if (videoDecoder) {
+            try {
+                videoDecoder.close();
+            } catch (e) {
+                // Ignore errors during cleanup
+            }
+            videoDecoder = null;
+            h264Initialized = false;
+        }
+        
+        h264FrameCount = 0;
+        lastH264FrameId = 0;
+        pendingH264Frames = [];
+        gfxSurfaces.clear();
+    }
+
+    /**
      * Calculate available dimensions from the container
      */
     function getAvailableDimensions() {
@@ -845,14 +1067,19 @@
 
             const { width: newWidth, height: newHeight } = getAvailableDimensions();
 
-            // Only request resize if dimensions actually changed
-            if (newWidth !== canvas.width || newHeight !== canvas.height) {
+            // Only request resize if dimensions actually changed from both canvas AND last request
+            if ((newWidth !== canvas.width || newHeight !== canvas.height) &&
+                (newWidth !== lastRequestedWidth || newHeight !== lastRequestedHeight)) {
                 console.log('[RDP Client] Requesting resize to:', newWidth, 'x', newHeight);
+                lastRequestedWidth = newWidth;
+                lastRequestedHeight = newHeight;
                 sendMessage({
                     type: 'resize',
                     width: newWidth,
                     height: newHeight
                 });
+            } else {
+                console.log('[RDP Client] Skipping redundant resize request');
             }
 
             pendingResize = false;
@@ -863,6 +1090,10 @@
      * Handle resize confirmation from server
      */
     function handleResize(width, height) {
+        // Skip if dimensions haven't changed
+        if (canvas.width === width && canvas.height === height) {
+            return;
+        }
         canvas.width = width;
         canvas.height = height;
         elements.resolution.textContent = `Resolution: ${width}x${height}`;

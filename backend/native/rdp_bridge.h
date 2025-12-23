@@ -19,6 +19,12 @@ extern "C" {
 /* Maximum dirty rectangles per frame */
 #define RDP_MAX_DIRTY_RECTS 64
 
+/* GFX pipeline constants */
+#define RDP_MAX_GFX_SURFACES 256
+#define RDP_MAX_GFX_CACHE_SLOTS 4096  /* Max bitmap cache slots for GFX */
+#define RDP_MAX_H264_FRAMES 16
+#define RDP_H264_FRAME_BUFFER_SIZE (2 * 1024 * 1024)  /* 2MB per frame max */
+
 /* Session registry limits (compile-time defaults, runtime configurable) */
 #define RDP_MAX_SESSIONS_DEFAULT 100
 #define RDP_MAX_SESSIONS_MIN 2
@@ -55,6 +61,54 @@ typedef struct {
     int32_t width;
     int32_t height;
 } RdpRect;
+
+/* GFX codec identifiers (from MS-RDPEGFX) */
+typedef enum {
+    RDP_GFX_CODEC_UNCOMPRESSED = 0x0000,
+    RDP_GFX_CODEC_CLEARCODEC = 0x0003,
+    RDP_GFX_CODEC_PLANAR = 0x0004,
+    RDP_GFX_CODEC_AVC420 = 0x0009,
+    RDP_GFX_CODEC_ALPHA = 0x000A,
+    RDP_GFX_CODEC_AVC444 = 0x000B,
+    RDP_GFX_CODEC_AVC444v2 = 0x000E,
+    RDP_GFX_CODEC_PROGRESSIVE = 0x000C,
+    RDP_GFX_CODEC_PROGRESSIVE_V2 = 0x000D
+} RdpGfxCodecId;
+
+/* H.264 frame type */
+typedef enum {
+    RDP_H264_FRAME_TYPE_IDR = 0,  /* Keyframe (I-frame) */
+    RDP_H264_FRAME_TYPE_P = 1,    /* Predictive frame */
+    RDP_H264_FRAME_TYPE_B = 2     /* Bi-predictive frame */
+} RdpH264FrameType;
+
+/* H.264 frame from GFX pipeline */
+typedef struct {
+    uint32_t frame_id;            /* RDP frame ID for acknowledgment */
+    uint16_t surface_id;          /* Target surface ID */
+    RdpGfxCodecId codec_id;       /* Actual codec used (AVC420/AVC444/AVC444v2) */
+    RdpH264FrameType frame_type;  /* IDR/P/B frame */
+    RdpRect dest_rect;            /* Destination rectangle on surface */
+    uint32_t nal_size;            /* Size of NAL units */
+    uint8_t* nal_data;            /* H.264 NAL units (Annex-B format) */
+    /* For AVC444: second chroma stream */
+    uint32_t chroma_nal_size;     /* Size of chroma NAL units (0 for AVC420) */
+    uint8_t* chroma_nal_data;     /* Chroma NAL units for AVC444 */
+    uint64_t timestamp;           /* Capture timestamp (microseconds) */
+    bool needs_ack;               /* Whether frame requires acknowledgment */
+} RdpH264Frame;
+
+/* GFX surface descriptor */
+typedef struct {
+    uint16_t surface_id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_format;        /* PIXEL_FORMAT_* constant */
+    bool active;
+    bool mapped_to_output;        /* Whether mapped to main display */
+    int32_t output_x;             /* Output origin X */
+    int32_t output_y;             /* Output origin Y */
+} RdpGfxSurface;
 
 /* Opaque session handle */
 typedef struct RdpSession RdpSession;
@@ -344,6 +398,76 @@ void rdp_destroy(RdpSession* session);
  * Get library version string
  */
 const char* rdp_version(void);
+
+/* ============================================================================
+ * GFX Pipeline / H.264 API (for AVC420/AVC444 streaming)
+ * ============================================================================ */
+
+/**
+ * Check if GFX pipeline is active (H.264/AVC mode negotiated)
+ * 
+ * @param session   Session handle
+ * @return          true if GFX pipeline is active with H.264 codec
+ */
+bool rdp_gfx_is_active(RdpSession* session);
+
+/**
+ * Get negotiated GFX codec ID
+ * 
+ * @param session   Session handle
+ * @return          Active codec ID (RDP_GFX_CODEC_AVC420, AVC444, etc.) or 0
+ */
+RdpGfxCodecId rdp_gfx_get_codec(RdpSession* session);
+
+/**
+ * Check if H.264 frames are available
+ * 
+ * @param session   Session handle
+ * @return          Number of frames available (0 if none)
+ */
+int rdp_has_h264_frames(RdpSession* session);
+
+/**
+ * Get next H.264 frame from the GFX pipeline queue
+ * 
+ * The frame data is valid until the next call to rdp_get_h264_frame()
+ * or rdp_ack_h264_frame(). For AVC444, both nal_data and chroma_nal_data
+ * must be combined per MS-RDPEGFX specification.
+ * 
+ * @param session   Session handle
+ * @param frame     Output: frame descriptor (caller must NOT free nal_data)
+ * @return          0 on success, -1 if no frames, -2 on error
+ */
+int rdp_get_h264_frame(RdpSession* session, RdpH264Frame* frame);
+
+/**
+ * Acknowledge an H.264 frame (send RDPGFX_FRAME_ACKNOWLEDGE_PDU)
+ * 
+ * Must be called after processing each frame to prevent server back-pressure.
+ * 
+ * @param session   Session handle  
+ * @param frame_id  Frame ID from RdpH264Frame.frame_id
+ * @return          0 on success, negative on error
+ */
+int rdp_ack_h264_frame(RdpSession* session, uint32_t frame_id);
+
+/**
+ * Get information about a GFX surface
+ * 
+ * @param session       Session handle
+ * @param surface_id    Surface ID
+ * @param surface       Output: surface descriptor
+ * @return              0 on success, -1 if surface not found
+ */
+int rdp_gfx_get_surface(RdpSession* session, uint16_t surface_id, RdpGfxSurface* surface);
+
+/**
+ * Get the primary output surface ID
+ * 
+ * @param session   Session handle
+ * @return          Primary surface ID or 0 if not mapped
+ */
+uint16_t rdp_gfx_get_primary_surface(RdpSession* session);
 
 #ifdef __cplusplus
 }
