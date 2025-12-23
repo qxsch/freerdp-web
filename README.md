@@ -276,7 +276,6 @@ The native library wasn't built or installed. Use Docker which handles this auto
 - Check if the VM is at a lock screen
 
 ### High latency / choppy video
-- **Enable GFX on Windows**: Set GPO `Computer Configuration > Admin Templates > Windows Components > Remote Desktop Services > Remote Session Environment > Prioritize H.264/AVC 444 graphics mode` to **Enabled**
 - The GFX pipeline uses H.264 for low-latency video (ideal for video streaming)
 - Falls back to WebP if server doesn't support GFX
 - Check network connectivity between backend and VM
