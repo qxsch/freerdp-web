@@ -46,6 +46,12 @@
     let lastH264FrameId = 0;
     let pendingH264Frames = [];  // Queue for out-of-order frames
     let gfxSurfaces = new Map(); // surface_id -> {width, height, canvas}
+    let h264DecodeQueue = [];    // Metadata queue: {destX, destY, destW, destH} per pending decode
+    let h264DecoderError = false; // Set on decode error, cleared on IDR
+    let h264ConfiguredWidth = 0;  // Currently configured decoder width
+    let h264ConfiguredHeight = 0; // Currently configured decoder height
+    let h264ActiveRegion = null;  // Track H.264 active region to prevent WebP overpainting
+    let h264Active = false;       // True once we've received any H.264 frame
 
     // Audio frame magic headers
     const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49];  // "AUDI" (PCM - legacy)
@@ -266,6 +272,10 @@
         
         // Cleanup H.264 decoder
         cleanupH264Decoder();
+        
+        // Reset H.264 region tracking
+        h264Active = false;
+        h264ActiveRegion = null;
     }
 
     /**
@@ -407,7 +417,16 @@
         const img = new Image();
         
         img.onload = () => {
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            // If H.264 is active, clip to draw only outside the H.264 region
+            if (h264ActiveRegion) {
+                ctx.save();
+                clipOutsideRect(ctx, h264ActiveRegion.x, h264ActiveRegion.y, 
+                                h264ActiveRegion.w, h264ActiveRegion.h);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                ctx.restore();
+            } else {
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            }
             URL.revokeObjectURL(url);
         };
         
@@ -466,9 +485,23 @@
                 // Capture rect values in closure
                 const tileX = rect.x;
                 const tileY = rect.y;
+                const tileW = rect.w;
+                const tileH = rect.h;
                 
                 img.onload = () => {
-                    ctx.drawImage(img, tileX, tileY);
+                    // If tile overlaps with H.264 region, clip to draw only outside parts
+                    if (h264ActiveRegion && rectsOverlap(
+                        tileX, tileY, tileW, tileH,
+                        h264ActiveRegion.x, h264ActiveRegion.y, 
+                        h264ActiveRegion.w, h264ActiveRegion.h)) {
+                        ctx.save();
+                        clipOutsideRect(ctx, h264ActiveRegion.x, h264ActiveRegion.y, 
+                                        h264ActiveRegion.w, h264ActiveRegion.h);
+                        ctx.drawImage(img, tileX, tileY);
+                        ctx.restore();
+                    } else {
+                        ctx.drawImage(img, tileX, tileY);
+                    }
                     URL.revokeObjectURL(url);
                     tilesLoaded++;
                 };
@@ -557,9 +590,37 @@
             
             lastH264FrameId = frameId;
             
+            // Mark H.264 as active and track the region
+            h264Active = true;
+            h264ActiveRegion = { x: destX, y: destY, w: destW, h: destH };
+            
         } catch (e) {
             console.error('[RDP Client] H.264 frame error:', e);
         }
+    }
+    
+    /**
+     * Check if two rectangles overlap
+     */
+    function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
+        return !(x1 + w1 <= x2 || x2 + w2 <= x1 || y1 + h1 <= y2 || y2 + h2 <= y1);
+    }
+    
+    /**
+     * Set up a clipping region that excludes a rectangle (draw around it)
+     * Uses the "evenodd" fill rule: outer rect + inner rect = only outer area
+     */
+    function clipOutsideRect(context, rx, ry, rw, rh) {
+        context.beginPath();
+        // Outer rectangle (full canvas)
+        context.rect(0, 0, canvas.width, canvas.height);
+        // Inner rectangle (the hole to exclude) - wound opposite direction
+        context.moveTo(rx, ry);
+        context.lineTo(rx, ry + rh);
+        context.lineTo(rx + rw, ry + rh);
+        context.lineTo(rx + rw, ry);
+        context.closePath();
+        context.clip('evenodd');
     }
 
     /**
@@ -591,17 +652,59 @@
             // Create decoder
             videoDecoder = new VideoDecoder({
                 output: (frame) => {
-                    // Draw decoded frame to canvas
-                    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                    // Get destination rect from queue (FIFO order matches decode order)
+                    const meta = h264DecodeQueue.shift();
+                    
+                    // Canvas backing store dimensions (this is the actual RDP content size)
+                    const canvasW = canvas.width;
+                    const canvasH = canvas.height;
+                    
+                    // H.264 pads to 16x16 macroblock boundaries:
+                    // coded dimensions >= canvas dimensions
+                    // The RDP content occupies the top-left (canvasW x canvasH) of the H.264 frame.
+                    // The rest is macroblock padding (green/black pixels).
+                    
+                    // Log first few frames for debugging
+                    if (h264FrameCount <= 10) {
+                        console.log(`[RDP Client] H.264 decoded:`,
+                            `coded=${frame.codedWidth}x${frame.codedHeight}`,
+                            `canvas=${canvasW}x${canvasH}`,
+                            `padding=(${frame.codedWidth - canvasW},${frame.codedHeight - canvasH})`,
+                            `dest=(${meta?.destX},${meta?.destY},${meta?.destW},${meta?.destH})`);
+                    }
+                    
+                    if (meta) {
+                        // destRect is in canvas coordinate space.
+                        // The H.264 frame content is 1:1 with canvas coordinates - no scaling.
+                        // Just use destRect directly as source coordinates.
+                        const sx = meta.destX;
+                        const sy = meta.destY;
+                        const sWidth = meta.destW;
+                        const sHeight = meta.destH;
+                        
+                        // Destination rect: same coordinates
+                        const dx = meta.destX;
+                        const dy = meta.destY;
+                        const dWidth = meta.destW;
+                        const dHeight = meta.destH;
+                        
+                        ctx.drawImage(frame, sx, sy, sWidth, sHeight, dx, dy, dWidth, dHeight);
+                    }
                     frame.close();
+                    h264DecoderError = false; // Clear error flag on successful decode
                 },
                 error: (e) => {
                     console.error('[RDP Client] H.264 decode error:', e);
+                    h264DecoderError = true;
+                    // Clear the metadata queue on error to stay in sync
+                    h264DecodeQueue = [];
                 }
             });
             
             await videoDecoder.configure(config);
             h264Initialized = true;
+            h264ConfiguredWidth = width;
+            h264ConfiguredHeight = height;
             console.log('[RDP Client] H.264 decoder initialized:', width, 'x', height);
             return true;
             
@@ -616,7 +719,47 @@
      * Note: AVC444 streams are transcoded to 4:2:0 on the server for browser compatibility
      */
     async function decodeH264Frame(nalData, frameType, destX, destY, destW, destH, surfaceId, chromaData) {
+        // Determine if this is a keyframe (IDR)
+        const isKeyframe = (frameType === 0);
+        
+        // For H.264 in RDP GFX, the stream encodes the FULL surface, not tiles.
+        // We should initialize decoder with canvas/screen dimensions, not destRect.
+        // Use canvas dimensions as the surface size (or we could track per-surface)
+        const surfaceW = canvas.width;
+        const surfaceH = canvas.height;
+        
+        // Check if we need to reconfigure decoder for different dimensions
+        const needsReconfigure = h264Initialized && isKeyframe && 
+            (surfaceW !== h264ConfiguredWidth || surfaceH !== h264ConfiguredHeight);
+        
+        // Reset decoder on IDR if there was a previous error, decoder is closed, or dimensions changed
+        if (isKeyframe && (h264DecoderError || !videoDecoder || videoDecoder.state === 'closed' || needsReconfigure)) {
+            if (needsReconfigure) {
+                console.log(`[RDP Client] Reconfiguring H.264 decoder: ${h264ConfiguredWidth}x${h264ConfiguredHeight} -> ${surfaceW}x${surfaceH}`);
+            } else {
+                console.log('[RDP Client] Initializing H.264 decoder on IDR frame');
+            }
+            if (videoDecoder && videoDecoder.state !== 'closed') {
+                try { videoDecoder.close(); } catch (e) { /* ignore */ }
+            }
+            h264Initialized = false;
+            h264DecoderError = false;
+            h264DecodeQueue = [];
+            
+            // Initialize with SURFACE dimensions (not tile dimensions)
+            const success = await initH264Decoder(surfaceW, surfaceH);
+            if (!success) {
+                console.warn('[RDP Client] H.264 decoder init failed');
+                return;
+            }
+        }
+        
         if (!videoDecoder || videoDecoder.state === 'closed') {
+            return;
+        }
+        
+        // Skip P/B frames if decoder had errors (wait for next IDR)
+        if (h264DecoderError && !isKeyframe) {
             return;
         }
         
@@ -624,8 +767,8 @@
             // Server transcodes AVC444 (4:4:4 dual-stream) to AVC420 (4:2:0)
             // so we receive a single, browser-compatible H.264 stream
             
-            // Determine if this is a keyframe
-            const isKeyframe = (frameType === 0); // IDR
+            // Push metadata to queue BEFORE decode (maintains FIFO order)
+            h264DecodeQueue.push({ destX, destY, destW, destH, surfaceId });
             
             // Create EncodedVideoChunk
             const chunk = new EncodedVideoChunk({
@@ -639,6 +782,9 @@
             
         } catch (e) {
             console.error('[RDP Client] H.264 decode failed:', e);
+            // Pop the metadata we just pushed since decode failed
+            h264DecodeQueue.pop();
+            h264DecoderError = true;
         }
     }
 

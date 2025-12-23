@@ -861,11 +861,23 @@ class RDPBridge:
             logger.error(f"H.264 frame send error: {e}")
     
     async def ack_h264_frame(self, frame_id: int):
-        """Acknowledge an H.264 frame to prevent server back-pressure"""
-        if self._session and self._lib:
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._lib.rdp_ack_h264_frame, self._session, frame_id
-            )
+        """Acknowledge an H.264 frame to prevent server back-pressure
+        
+        NOTE: Currently disabled because FreeRDP's GFX channel automatically
+        sends frame acknowledgments in its EndFrame handler. Sending additional
+        acks from the browser causes protocol errors (duplicate acks).
+        
+        To enable browser-controlled acks, we would need to:
+        1. Set OnOpen callback with *do_frame_acks = FALSE
+        2. Manually track which frames need acking
+        3. Send acks only after browser confirms decode
+        """
+        # Disabled: FreeRDP handles acks automatically in EndFrame
+        # if self._session and self._lib:
+        #     await asyncio.get_event_loop().run_in_executor(
+        #         None, self._lib.rdp_ack_h264_frame, self._session, frame_id
+        #     )
+        pass
     
     async def _stream_audio(self):
         """Stream Opus audio from native FreeRDP buffer (no PulseAudio required)"""

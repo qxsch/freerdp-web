@@ -97,12 +97,32 @@ if (surface mapped) {
 
 ## Current Status
 - ✅ GFX negotiation (v10.7 with H.264)
-- ✅ All codecs: H.264, ClearCodec, Planar, Uncompressed, Progressive
+- ✅ All codecs: ClearCodec, Planar, Uncompressed, Progressive
 - ✅ Cache operations: SurfaceToCache, CacheToSurface
 - ✅ Surface operations: SolidFill, SurfaceToSurface
 - ✅ RDPDR disabled
-- ✅ ClearCodec parameter fix applied
-- 🔄 Black tiles issue - investigation ongoing
+- ✅ Per-surface buffer architecture
+- ✅ Full surface buffer consistency (all ops write to both buffers)
+- 🔄 H.264 (AVC420/AVC444) - NALs queued for browser WebCodecs decoding
+
+---
+
+## H.264 Streaming (Next Focus)
+
+The H.264 path works differently:
+1. Server sends AVC420/AVC444 frames via GFX SurfaceCommand
+2. Bridge extracts raw NAL units from RDPGFX_AVC*_BITMAP_STREAM
+3. NALs queued in ring buffer (`h264_frames[]`)
+4. Python backend reads via `rdp_get_h264_frame()`
+5. Sent to browser as binary WebSocket messages
+6. Browser decodes with WebCodecs VideoDecoder
+7. Rendered to canvas
+
+### Potential H.264 Issues to Test:
+- Frame ordering and timestamps
+- IDR frame detection for decoder reset
+- AVC444→AVC420 transcoding (if browser doesn't support 4:4:4)
+- Latency optimization
 
 ---
 
@@ -129,3 +149,83 @@ All GFX operations work in **surface-local coordinates**. The workflow is:
 **Root Cause**: `CacheToSurface` only wrote to `primary_buffer`, not surface buffer  
 **Impact**: When server later calls `SurfaceToCache` on a region where `CacheToSurface` had drawn, it reads stale surface buffer content instead of the cached tile  
 **Fix**: `CacheToSurface` now writes to both surface buffer AND primary buffer
+
+---
+
+## H.264 Streaming Implementation
+
+### Architecture
+```
+Server → AVC420/AVC444 tile at (x,y,w,h)
+    ↓
+C: queue_h264_frame() → sets dest_rect from cmd->left/top/right/bottom
+    ↓
+Python: _send_h264_frame() → packs x,y,w,h into binary header
+    ↓
+JS: handleH264Frame() → parses destX,destY,destW,destH
+    ↓
+JS: decodeH264Frame() → pushes metadata to queue, VideoDecoder.decode()
+    ↓
+JS: output callback → shifts metadata, ctx.drawImage() at (destX,destY)
+```
+
+### Wire Format (Python → Browser)
+```
+[H264 magic (4)] [frame_id (4)] [surface_id (2)] [codec_id (2)]
+[frame_type (1)] [x (2)] [y (2)] [w (2)] [h (2)]
+[nal_size (4)] [chroma_nal_size (4)]
+[nal_data...] [chroma_nal_data...]
+```
+
+### Issue 6: H.264 Tiles Drawn at Wrong Position
+**Symptom**: All H.264 tiles rendered at (0,0) instead of correct screen position  
+**Root Cause**: VideoDecoder `output` callback has no access to per-frame metadata  
+**Fix**: 
+1. Added `h264DecodeQueue[]` — FIFO queue tracking `{destX, destY, destW, destH}` per pending decode
+2. Push metadata BEFORE `videoDecoder.decode()`
+3. Shift metadata in `output` callback, use 9-arg `drawImage()` for tile compositing
+
+### Issue 7: H.264 Decoder Stuck After Errors
+**Symptom**: After network glitch or decode error, all subsequent frames fail  
+**Root Cause**: VideoDecoder enters error state, P/B frames require prior reference frames  
+**Fix**:
+1. Track `h264DecoderError` flag, set in error callback
+2. Skip P/B frames while error flag is set (wait for IDR)
+3. On IDR frame + error flag: close decoder, reinitialize, clear queue
+4. Clear error flag on successful decode
+
+### Key Principle: Metadata Queue Sync
+The WebCodecs `VideoDecoder` is asynchronous — `decode()` returns immediately but `output` callback fires later. The metadata queue MUST stay synchronized:
+- Push to queue BEFORE `decode()`
+- Shift from queue in `output` callback
+- On error: clear the entire queue to prevent desync
+- On decode failure exception: pop the just-pushed metadata
+
+### AVC444 Transcoding
+Browsers only support YUV 4:2:0, not 4:4:4. The C layer uses FFmpeg to transcode:
+```c
+transcode_avc444(luma_stream, chroma_stream) → single 4:2:0 stream
+```
+After transcoding, `codec_id` is changed to `AVC420` and chroma NAL is empty.
+
+### Issue 8: Broken Pipe / Connection Reset with H.264
+**Symptom**: `transport_default_write: BIO_should_retry returned a system error 32: Broken pipe`  
+**Root Cause**: Duplicate frame acknowledgments — FreeRDP's GFX channel automatically sends `RDPGFX_FRAME_ACKNOWLEDGE_PDU` in its `EndFrame` handler. We were also sending acks from the browser via `rdp_ack_h264_frame()`, causing protocol errors.  
+**Fix**: Disabled browser-side acks since FreeRDP handles them automatically.
+
+To enable browser-controlled acks in the future (for better flow control):
+1. Implement `OnOpen` callback: `gfx->OnOpen = gfx_on_open;`
+2. Set `*do_frame_acks = FALSE` in the callback
+3. Track which frames need acking
+4. Send acks only after browser confirms decode
+
+### Issue 9: H.264 Tiles Show Green with Small Video
+**Symptom**: Video plays in tiny portion of rectangle, rest is bright green  
+**Root Cause**: VideoDecoder configured with first tile's dimensions (e.g., 64x64), but subsequent tiles may be larger. Green = uninitialized YUV (Y=0, U=128, V=128).  
+**Fix**:
+1. Track `h264ConfiguredWidth/Height` 
+2. Reconfigure decoder on IDR when dimensions change
+3. Smart rendering based on decoded frame size vs destination rect:
+   - If `displayWidth === destW`: tile mode, draw at position
+   - If `displayWidth >= canvas.width`: full surface mode, draw fullscreen
+   - Otherwise: scale to fit destination rect
