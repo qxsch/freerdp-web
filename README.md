@@ -20,8 +20,10 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ## Features
 
 - 🎬 **RDP GFX pipeline with H.264/AVC444** - Hardware-accelerated video streaming
-- 🔄 **AVC444 → 4:2:0 transcoding** - Server-side conversion for browser compatibility
-- 🖥️ Real-time screen streaming via WebSocket (H.264 or WebP fallback)
+- 🔄 **AVC444 → 4:2:0 transcoding** - Server-side FFmpeg conversion for browser compatibility
+- 🖼️ **Hybrid rendering** - H.264 for video content, WebP delta tiles for UI/scrolling
+- 🎯 **Multiple GFX codecs** - ClearCodec, Planar, Uncompressed decoded server-side
+- 🖥️ Real-time screen streaming via WebSocket (H.264 + WebP delta tiles)
 - 🔊 Native audio streaming with Opus encoding (per-session isolation)
 - ⌨️ Full keyboard support with scan code translation
 - 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
@@ -163,9 +165,10 @@ python -m http.server 8000
 | `disconnected` | Session ended | - |
 | `error` | Error occurred | `message` |
 | `pong` | Ping response | - |
-| Binary (H264) | H.264 frame | 25-byte header + NAL data (GFX pipeline) |
-| Binary (WebP) | Full frame | Raw WebP image data (GDI fallback) |
-| Binary (DELT) | Delta frame | Header + dirty rects + WebP patches |
+| Binary (H264) | H.264 frame | 25-byte header + NAL data (AVC420/AVC444) |
+| Binary (WebP) | Full frame | Raw WebP image data (initial frame only) |
+| Binary (DELT) | Delta frame | Header + dirty rects + WebP tiles (ClearCodec, fills, scrolling) |
+| Binary (OPUS) | Audio frame | 8-byte header + Opus packet |
 
 ## Configuration
 
@@ -199,9 +202,10 @@ const config = {
 │   ├── requirements.txt    # Python dependencies
 │   └── native/
 │       ├── CMakeLists.txt  # CMake build configuration
-│       ├── rdp_bridge.c    # FreeRDP3 C implementation (+ Opus buffer)
+│       ├── rdp_bridge.c    # FreeRDP3 + GFX codecs + FFmpeg transcoding
 │       ├── rdp_bridge.h    # Library header
-│       └── rdpsnd_bridge.c # RDPSND audio plugin (Opus encoding)
+│       ├── rdpsnd_bridge.c # RDPSND audio plugin (Opus encoding)
+│       └── GFX_DEBUGGING_NOTES.md  # GFX pipeline debugging notes
 └── frontend/
     ├── Dockerfile          # nginx:alpine image
     ├── index.html          # SPA entry point
@@ -211,32 +215,57 @@ const config = {
 
 ## Video Architecture (GFX Pipeline)
 
-Video uses the RDPGFX channel (MS-RDPEGFX) for H.264/AVC444 hardware-accelerated streaming:
+The RDPGFX channel (MS-RDPEGFX) provides a hybrid rendering pipeline:
 
+### H.264 Path (Video Content)
 ```
-┌─────────────┐      RDPGFX       ┌─────────────────┐    Transcode     ┌──────────────┐
+┌─────────────┐    AVC444/420     ┌─────────────────┐    Transcode     ┌──────────────┐
 │  Windows VM │ ──────────────►   │  Native Bridge  │ ────────────────►│  H.264 Queue │
-│   (Screen)  │   AVC444 4:4:4    │  (FFmpeg decode │   AVC420 4:2:0   │  (per-user)  │
-└─────────────┘   dual H.264      │   + re-encode)  │   single stream  └──────────────┘
+│   (Video)   │   H.264 NALs      │  (FFmpeg 4:4:4  │   AVC420 4:2:0   │  (per-user)  │
+└─────────────┘                   │   → 4:2:0)      │                  └──────────────┘
                                   └─────────────────┘                         │
                                                                               ▼
 ┌─────────────┐      WebSocket    ┌─────────────────┐     WebCodecs    ┌──────────────┐
 │   Browser   │ ◄───────────────  │  Python Proxy   │ ◄────────────────│ VideoDecoder │
-│  (Canvas)   │   H.264 / WebP    │  (rdp_bridge)   │   H.264→RGB      │  (HW accel)  │
+│  (Canvas)   │   H264 frames     │  (rdp_bridge)   │   H.264→RGB      │  (HW accel)  │
+└─────────────┘                   └─────────────────┘                  └──────────────┘
+```
+
+### Tile Codec Path (UI, Text, Scrolling)
+```
+┌─────────────┐   ClearCodec/     ┌─────────────────┐    Dirty Rects   ┌──────────────┐
+│  Windows VM │   Planar/Fill/    │  Native Bridge  │ ────────────────►│  Framebuffer │
+│    (UI)     │   SurfaceToSurf   │  (Decode/Blit)  │   BGRA32 pixels  │  (per-user)  │
+└─────────────┘                   └─────────────────┘                  └──────────────┘
+                                                                              │
+                                                                              ▼
+┌─────────────┐      WebSocket    ┌─────────────────┐      WebP        ┌──────────────┐
+│   Browser   │ ◄───────────────  │  Python Proxy   │ ◄────────────────│   Encoder    │
+│  (Canvas)   │   DELT frames     │  (rdp_bridge)   │   Delta tiles    │  (Pillow)    │
 └─────────────┘                   └─────────────────┘                  └──────────────┘
 ```
 
 **Key benefits:**
-- **H.264 hardware decode**: Uses browser's hardware VideoDecoder
-- **AVC444 support**: Server-side transcoding converts 4:4:4 to browser-compatible 4:2:0
-- **Low latency**: ultrafast/zerolatency encoding preset, no B-frames
-- **YouTube-ready**: Optimized for video playback scenarios
+- **H.264 hardware decode**: Browser's VideoDecoder with GPU acceleration
+- **AVC444 support**: Server-side FFmpeg transcoding (4:4:4 → 4:2:0)
+- **Low latency**: ultrafast/zerolatency preset, no B-frames
+- **Hybrid rendering**: H.264 for video, WebP delta for UI updates
+- **Efficient scrolling**: SurfaceToSurface/CacheToSurface sent as delta tiles
 
-**Codec negotiation priority:**
-1. AVC444v2 (best quality, transcoded to 4:2:0)
-2. AVC444 (transcoded to 4:2:0)
-3. AVC420 (native browser support)
-4. WebP fallback (GDI mode)
+**GFX Codec Support:**
+| Codec | Description | Output |
+|-------|-------------|--------|
+| AVC420 | H.264 4:2:0 | Pass-through to browser |
+| AVC444/v2 | H.264 4:4:4 | FFmpeg transcode → H.264 |
+| ClearCodec | Lossless tiles | Decode → WebP delta |
+| Planar | RLE compressed | Decode → WebP delta |
+| Uncompressed | Raw BGRA | Copy → WebP delta |
+
+**Surface Operations (→ WebP delta):**
+- `SolidFill` - Fill rectangles with color
+- `SurfaceToSurface` - Copy/scroll regions
+- `CacheToSurface` - Restore cached bitmaps
+- `SurfaceToCache` - Store bitmaps for later
 
 ## Audio Architecture
 
@@ -276,15 +305,15 @@ The native library wasn't built or installed. Use Docker which handles this auto
 - Check if the VM is at a lock screen
 
 ### High latency / choppy video
-- The GFX pipeline uses H.264 for low-latency video (ideal for video streaming)
-- Falls back to WebP if server doesn't support GFX
+- **Enable GFX/H.264 on Windows**: Set GPO `Computer Configuration > Admin Templates > Windows Components > Remote Desktop Services > Remote Session Environment > Prioritize H.264/AVC 444 graphics mode` to **Enabled**
+- The GFX pipeline uses H.264 for video content + WebP delta for UI
 - Check network connectivity between backend and VM
+- Monitor browser console for decode errors
 
 ### No audio in browser
-- **Check browser compatibility**: Audio requires Chrome 94+ or Edge 94+ (WebCodecs API)
+- **Check browser compatibility**: Audio requires Chrome 94+, Edge 94+, Safari 16.4+, or Firefox 130+ (WebCodecs AudioDecoder)
 - **Check RDP server settings**: Ensure audio redirection is enabled on the Windows VM
 - **Check console logs**: Look for `[OPUS]` messages confirming audio frames are received
-- **Firefox/Safari**: Audio not currently supported (WebCodecs unavailable)
 
 ### Container health check failing
 The backend exposes `/health` endpoint. Test with:
