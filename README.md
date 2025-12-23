@@ -5,10 +5,10 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ## Architecture
 
 ```
-┌─────────────┐      WebSocket          ┌─────────────────┐     RDP/GFX    ┌──────────────┐
-│   Browser   │ ◄─────────────────────► │  Python Proxy   │ ◄────────────► │  Windows VM  │
-│  (HTML/JS)  │   H.264 + Opus + input  │ (Native FreeRDP)│  AVC444/AVC420 │              │
-└─────────────┘                         └─────────────────┘                └──────────────┘
+┌─────────────┐      WebSocket                 ┌─────────────────┐     RDP/GFX    ┌──────────────┐
+│   Browser   │ ◄────────────────────────────► │  Python Proxy   │ ◄────────────► │  Windows VM  │
+│  (HTML/JS)  │   H.264 + WebP + Opus + input  │ (Native FreeRDP)│  AVC444/AVC420 │              │
+└─────────────┘                                └─────────────────┘                └──────────────┘
 ```
 
 ### Components
@@ -222,7 +222,7 @@ Video uses the RDPGFX channel (MS-RDPEGFX) for H.264/AVC444 hardware-accelerated
                                                                               ▼
 ┌─────────────┐      WebSocket    ┌─────────────────┐     WebCodecs    ┌──────────────┐
 │   Browser   │ ◄───────────────  │  Python Proxy   │ ◄────────────────│ VideoDecoder │
-│  (Canvas)   │   H.264 NALs      │  (rdp_bridge)   │   H.264→RGB      │  (HW accel)  │
+│  (Canvas)   │   H.264 / WebP    │  (rdp_bridge)   │   H.264→RGB      │  (HW accel)  │
 └─────────────┘                   └─────────────────┘                  └──────────────┘
 ```
 
