@@ -595,6 +595,7 @@ class RDPBridge:
         poll_count = 0
         h264_frame = RdpH264Frame()
         gfx_mode_logged = False
+        h264_ever_received = False  # Once H.264 starts, skip WebP entirely
         
         while self.running:
             try:
@@ -636,16 +637,49 @@ class RDPBridge:
                             await self._send_h264_frame(h264_frame)
                             h264_count -= 1
                             h264_sent += 1
+                            h264_ever_received = True  # Mark that H.264 is now active
                         else:
                             break
                     
-                    # If we sent H.264 frames, continue polling
+                    # If we sent H.264 frames, consume full frame flag but still check dirty rects
+                    # (SolidFill, SurfaceToSurface, CacheToSurface operations add dirty rects
+                    # that need to be sent as WebP delta - these are used for scrolling!)
                     if h264_sent > 0:
-                        continue
+                        # Consume the full frame flag to prevent full WebP
+                        self._lib.rdp_needs_full_frame(self._session)
+                        # But DON'T clear dirty rects - fall through to process them!
                     
-                    # GFX active but no H.264 frames - server may be using non-H.264 codec
-                    # Fall through to GDI/WebP path to render whatever is in the frame buffer
-                    if result == 0:
+                    # GFX is active - check for dirty rects from non-H.264 operations
+                    # (scrolling, fills, cache blits, etc.)
+                    if result != 0 or h264_ever_received:
+                        rect_count = self._lib.rdp_get_dirty_rects(
+                            self._session, rects, max_rects
+                        )
+                        
+                        if rect_count > 0:
+                            # Send delta frame for non-H.264 operations
+                            width = c_int()
+                            height = c_int()
+                            stride = c_int()
+                            buffer_ptr = self._lib.rdp_get_frame_buffer(
+                                self._session,
+                                ctypes.byref(width),
+                                ctypes.byref(height),
+                                ctypes.byref(stride)
+                            )
+                            
+                            if buffer_ptr:
+                                w, h, s = width.value, height.value, stride.value
+                                await self._send_delta_frame(buffer_ptr, w, h, s, rects, rect_count)
+                        
+                        self._lib.rdp_clear_dirty_rects(self._session)
+                        
+                        # If we sent H.264 and/or dirty rects, continue
+                        if h264_sent > 0 or rect_count > 0:
+                            continue
+                    
+                    # GFX active but no updates - wait for more
+                    if result == 0 or h264_ever_received:
                         await asyncio.sleep(0.001)
                         continue
                 

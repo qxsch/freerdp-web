@@ -140,6 +140,7 @@ typedef struct {
     int h264_write_idx;
     int h264_read_idx;
     int h264_count;
+    bool h264_queued_this_frame;  /* H.264 was queued in current GFX frame */
     pthread_mutex_t h264_mutex;
     
     /* Audio playback */
@@ -2646,6 +2647,9 @@ static bool queue_h264_frame(BridgeContext* bctx, uint32_t frame_id, uint16_t su
         bctx->gfx_codec = codec_id;
     }
     
+    /* Mark that H.264 was queued in this frame - frontend will handle rendering */
+    bctx->h264_queued_this_frame = true;
+    
     pthread_mutex_unlock(&bctx->h264_mutex);
     
     if (transcoded_data) free(transcoded_data);
@@ -3188,6 +3192,7 @@ static UINT gfx_on_start_frame(RdpgfxClientContext* context, const RDPGFX_START_
     
     bctx->current_frame_id = start->frameId;
     bctx->frame_cmd_count = 0;  /* Reset command count for this frame */
+    bctx->h264_queued_this_frame = false;  /* Reset H.264 flag for this frame */
     
     static int start_frame_logs = 0;
     if (start_frame_logs < 20) {
@@ -3212,9 +3217,14 @@ static UINT gfx_on_end_frame(RdpgfxClientContext* context, const RDPGFX_END_FRAM
     
     static int end_frame_logs = 0;
     
+    pthread_mutex_lock(&bctx->rect_mutex);
+    int dirty_count = bctx->dirty_rect_count;
+    bool h264_in_frame = bctx->h264_queued_this_frame;
+    pthread_mutex_unlock(&bctx->rect_mutex);
+    
     if (end_frame_logs < 20) {
-        fprintf(stderr, "[rdp_bridge] EndFrame: frame_id=%u cmds_in_frame=%u (FreeRDP handles ack internally)\n", 
-                end->frameId, bctx->frame_cmd_count);
+        fprintf(stderr, "[rdp_bridge] EndFrame: frame_id=%u cmds=%u h264=%d dirty_rects=%d\n", 
+                end->frameId, bctx->frame_cmd_count, h264_in_frame, dirty_count);
         end_frame_logs++;
         
         if (bctx->frame_cmd_count == 0) {
@@ -3222,10 +3232,11 @@ static UINT gfx_on_end_frame(RdpgfxClientContext* context, const RDPGFX_END_FRAM
         }
     }
     
-    /* Mark that we need to refresh the frame for WebSocket clients */
-    pthread_mutex_lock(&bctx->rect_mutex);
-    bctx->needs_full_frame = true;
-    pthread_mutex_unlock(&bctx->rect_mutex);
+    /* DON'T set needs_full_frame here! 
+     * - If H.264 was sent, the frontend handles it via the H.264 pipeline
+     * - If dirty_rects were added (SolidFill, CopyRect, etc), they'll be sent as delta WebP
+     * - Only set needs_full_frame as a fallback in error cases within each codec handler
+     */
     
     return CHANNEL_RC_OK;
 }

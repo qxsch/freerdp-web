@@ -229,3 +229,22 @@ To enable browser-controlled acks in the future (for better flow control):
    - If `displayWidth === destW`: tile mode, draw at position
    - If `displayWidth >= canvas.width`: full surface mode, draw fullscreen
    - Otherwise: scale to fit destination rect
+
+### Issue 10: Full WebP Frames Flooding During GFX
+**Symptom**: Many "Sending full frame" messages, WebP competing with H.264  
+**Root Cause**: `gfx_on_end_frame()` was unconditionally setting `needs_full_frame = true`  
+**Fix**: Removed that line. EndFrame now only logs, doesn't trigger full frames.
+
+### Issue 11: Scrolling Leftovers / Missing Updates
+**Symptom**: Visual artifacts during scrolling, content not updating properly  
+**Root Cause**: Python code was skipping ALL WebP frames (including delta rects) once H.264 started. But `SolidFill`, `SurfaceToSurface`, `CacheToSurface` operations (used for scrolling, copy, fill) add dirty rects that are NOT H.264 encoded — they need to be sent as WebP delta frames!  
+**Fix**: Modified Python streaming loop to:
+1. Send H.264 frames (priority)
+2. **Also send dirty rect delta frames** for non-H.264 operations
+3. Only skip full WebP frames (entire screen)
+
+Key insight: During scrolling:
+- `SurfaceToSurface` copies existing content (registers dirty rect)
+- `SolidFill` or `CacheToSurface` fills new areas (registers dirty rect)
+- These are NOT H.264 — they're direct framebuffer operations
+- Must send as WebP delta to frontend
