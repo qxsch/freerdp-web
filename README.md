@@ -311,9 +311,29 @@ flowchart TB
         subgraph Native["📦 librdp_bridge.so (C)"]
             FreeRDP["FreeRDP3 Client"]
             
-            subgraph GFX["RDPGFX Channel"]
-                AVC444["AVC444/AVC420<br/>Decoder"]
-                FFmpeg["FFmpeg<br/>4:4:4→4:2:0"]
+            subgraph GFX["RDPGFX Channel (MS-RDPEGFX)"]
+                direction TB
+                H264Path["H.264 Path"]
+                TilePath["Tile Codecs Path"]
+                
+                subgraph H264Codecs["H.264 Codecs"]
+                    AVC420["AVC420<br/>(4:2:0)"]
+                    AVC444["AVC444/v2<br/>(4:4:4)"]
+                end
+                
+                subgraph TileCodecs["Tile Codecs"]
+                    ClearCodec["ClearCodec"]
+                    Planar["Planar/RLE"]
+                    Uncompressed["Uncompressed"]
+                end
+                
+                FFmpeg["FFmpeg Transcode<br/>4:4:4 → 4:2:0"]
+                
+                subgraph SurfaceOps["Surface Operations"]
+                    SolidFill["SolidFill"]
+                    S2S["SurfaceToSurface"]
+                    C2S["CacheToSurface"]
+                end
             end
             
             subgraph Audio["RDPSND Channel"]
@@ -321,8 +341,11 @@ flowchart TB
                 Opus["Opus Encoder<br/>64kbps"]
             end
             
-            GDI["GDI Fallback<br/>→ WebP"]
+            H264Queue["H.264 Queue<br/>(per-session)"]
+            Framebuffer["Primary Framebuffer<br/>(BGRA32)"]
         end
+        
+        WebPEncoder["WebP Encoder<br/>(Delta Tiles)"]
     end
 
     subgraph WindowsVM["🖥️ Windows VM"]
@@ -330,31 +353,48 @@ flowchart TB
         Desktop["Desktop / Apps"]
     end
 
-    %% Video flow
+    %% Video encoding on server
     Desktop -->|"Screen Updates"| RDP
-    RDP -->|"H.264 AVC444"| FreeRDP
-    FreeRDP --> AVC444
-    AVC444 -->|"YUV 4:4:4"| FFmpeg
-    FFmpeg -->|"H.264 4:2:0"| WS
-    WS -->|"Binary frames"| VideoDecoder
-    VideoDecoder -->|"Decoded"| Canvas
-
-    %% Fallback video
-    FreeRDP -.->|"Non-H.264"| GDI
-    GDI -.->|"WebP"| WS
+    RDP -->|"RDPGFX"| FreeRDP
+    
+    %% H.264 path (direct to browser)
+    FreeRDP --> H264Codecs
+    AVC420 -->|"Pass-through"| H264Queue
+    AVC444 --> FFmpeg
+    FFmpeg -->|"Re-encoded 4:2:0"| H264Queue
+    H264Queue --> WS
+    WS -->|"H264 frames"| VideoDecoder
+    VideoDecoder -->|"Decoded RGB"| Canvas
+    
+    %% Tile codec path (decode to framebuffer, send as WebP)
+    FreeRDP --> TileCodecs
+    ClearCodec --> Framebuffer
+    Planar --> Framebuffer
+    Uncompressed --> Framebuffer
+    
+    %% Surface operations (direct framebuffer, dirty rects)
+    FreeRDP --> SurfaceOps
+    SolidFill --> Framebuffer
+    S2S --> Framebuffer
+    C2S --> Framebuffer
+    
+    %% WebP delta path
+    Framebuffer -->|"Dirty Rects"| WebPEncoder
+    WebPEncoder -->|"DELT frames"| WS
+    WS -->|"WebP tiles"| Canvas
 
     %% Audio flow
     Desktop -->|"Audio"| RDP
     RDP -->|"PCM/AAC"| FreeRDP
     FreeRDP --> Bridge
-    Bridge -->|"PCM"| Opus
-    Opus -->|"Opus frames"| WS
-    WS -->|"Binary frames"| AudioDecoder
+    Bridge -->|"PCM 44.1kHz"| Opus
+    Opus -->|"Opus 64kbps"| WS
+    WS -->|"OPUS frames"| AudioDecoder
     AudioDecoder -->|"PCM"| AudioCtx
 
     %% Input flow
-    Input -->|"Scancodes"| WS
-    WS -->|"RDP Input"| FreeRDP
+    Input -->|"JSON events"| WS
+    WS -->|"Scancodes"| FreeRDP
     FreeRDP -->|"Input PDUs"| RDP
 
     style Browser fill:#e1f5fe
@@ -363,4 +403,21 @@ flowchart TB
     style Native fill:#ffecb3
     style GFX fill:#c8e6c9
     style Audio fill:#b3e5fc
+    style H264Codecs fill:#a5d6a7
+    style TileCodecs fill:#fff59d
+    style SurfaceOps fill:#ffcc80
 ```
+
+### Data Flow Summary
+
+| Source | Codec/Operation | Processing | Output to Browser |
+|--------|----------------|------------|-------------------|
+| Video content | AVC420 | Pass-through | H.264 NALs |
+| Video content | AVC444/v2 | FFmpeg transcode 4:4:4→4:2:0 | H.264 NALs |
+| Static UI | ClearCodec | Decode to framebuffer | WebP delta tiles |
+| Icons/text | Planar/RLE | Decode to framebuffer | WebP delta tiles |
+| Raw pixels | Uncompressed | Copy to framebuffer | WebP delta tiles |
+| Scrolling | SurfaceToSurface | Blit in framebuffer | WebP delta tiles |
+| Backgrounds | SolidFill | Fill framebuffer | WebP delta tiles |
+| Cached bitmaps | CacheToSurface | Copy from cache | WebP delta tiles |
+| Audio | PCM 44.1kHz | Opus encode | Opus frames |
