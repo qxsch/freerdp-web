@@ -2033,10 +2033,41 @@ static UINT gfx_on_solid_fill(RdpgfxClientContext* context, const RDPGFX_SOLID_F
     
     /* Fill each rectangle */
     for (UINT16 i = 0; i < fill->fillRectCount; i++) {
-        UINT32 left = fill->fillRects[i].left + offsetX;
-        UINT32 top = fill->fillRects[i].top + offsetY;
-        UINT32 right = fill->fillRects[i].right + offsetX;
-        UINT32 bottom = fill->fillRects[i].bottom + offsetY;
+        /* Surface-local coordinates */
+        UINT32 surfLeft = fill->fillRects[i].left;
+        UINT32 surfTop = fill->fillRects[i].top;
+        UINT32 surfRight = fill->fillRects[i].right;
+        UINT32 surfBottom = fill->fillRects[i].bottom;
+        
+        /* Get surface buffer */
+        uint8_t* surfBuf = NULL;
+        UINT32 surfW = 0, surfH = 0;
+        if (fill->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[fill->surfaceId].active) {
+            surfBuf = bctx->surface_buffers[fill->surfaceId];
+            surfW = bctx->surfaces[fill->surfaceId].width;
+            surfH = bctx->surfaces[fill->surfaceId].height;
+        }
+        
+        /* Fill surface buffer first (for SurfaceToCache to work) */
+        if (surfBuf && surfW > 0 && surfH > 0) {
+            UINT32 clampRight = (surfRight > surfW) ? surfW : surfRight;
+            UINT32 clampBottom = (surfBottom > surfH) ? surfH : surfBottom;
+            if (surfLeft < clampRight && surfTop < clampBottom) {
+                UINT32 surfStride = surfW * 4;
+                for (UINT32 y = surfTop; y < clampBottom; y++) {
+                    uint32_t* row = (uint32_t*)(surfBuf + y * surfStride + surfLeft * 4);
+                    for (UINT32 x = 0; x < (clampRight - surfLeft); x++) {
+                        row[x] = color;
+                    }
+                }
+            }
+        }
+        
+        /* Now fill primary buffer with output offset */
+        UINT32 left = surfLeft + offsetX;
+        UINT32 top = surfTop + offsetY;
+        UINT32 right = surfRight + offsetX;
+        UINT32 bottom = surfBottom + offsetY;
         
         /* Clamp to buffer bounds */
         if (right > (UINT32)gdi->width) right = gdi->width;
@@ -2081,24 +2112,34 @@ static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context,
     rdpGdi* gdi = bctx->gdi;
     pthread_mutex_unlock(&bctx->gfx_mutex);
     
-    if (!gdi || !gdi->primary_buffer) {
-        pthread_mutex_lock(&bctx->rect_mutex);
-        bctx->needs_full_frame = true;
-        pthread_mutex_unlock(&bctx->rect_mutex);
-        return CHANNEL_RC_OK;
-    }
-    
-    /* Get source and dest surface offsets */
-    int32_t srcOffsetX = 0, srcOffsetY = 0;
-    int32_t dstOffsetX = 0, dstOffsetY = 0;
+    /* Get source surface info */
+    uint8_t* srcSurfBuf = NULL;
+    UINT32 srcSurfW = 0, srcSurfH = 0;
+    bool srcMapped = false;
+    INT32 srcOutX = 0, srcOutY = 0;
     
     if (copy->surfaceIdSrc < RDP_MAX_GFX_SURFACES && bctx->surfaces[copy->surfaceIdSrc].active) {
-        srcOffsetX = bctx->surfaces[copy->surfaceIdSrc].output_x;
-        srcOffsetY = bctx->surfaces[copy->surfaceIdSrc].output_y;
+        srcSurfBuf = bctx->surface_buffers[copy->surfaceIdSrc];
+        srcSurfW = bctx->surfaces[copy->surfaceIdSrc].width;
+        srcSurfH = bctx->surfaces[copy->surfaceIdSrc].height;
+        srcMapped = bctx->surfaces[copy->surfaceIdSrc].mapped_to_output;
+        srcOutX = bctx->surfaces[copy->surfaceIdSrc].output_x;
+        srcOutY = bctx->surfaces[copy->surfaceIdSrc].output_y;
     }
+    
+    /* Get dest surface info */
+    uint8_t* dstSurfBuf = NULL;
+    UINT32 dstSurfW = 0, dstSurfH = 0;
+    bool dstMapped = false;
+    INT32 dstOutX = 0, dstOutY = 0;
+    
     if (copy->surfaceIdDest < RDP_MAX_GFX_SURFACES && bctx->surfaces[copy->surfaceIdDest].active) {
-        dstOffsetX = bctx->surfaces[copy->surfaceIdDest].output_x;
-        dstOffsetY = bctx->surfaces[copy->surfaceIdDest].output_y;
+        dstSurfBuf = bctx->surface_buffers[copy->surfaceIdDest];
+        dstSurfW = bctx->surfaces[copy->surfaceIdDest].width;
+        dstSurfH = bctx->surfaces[copy->surfaceIdDest].height;
+        dstMapped = bctx->surfaces[copy->surfaceIdDest].mapped_to_output;
+        dstOutX = bctx->surfaces[copy->surfaceIdDest].output_x;
+        dstOutY = bctx->surfaces[copy->surfaceIdDest].output_y;
     }
     
     static int copy_logs = 0;
@@ -2108,75 +2149,120 @@ static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context,
         copy_logs++;
     }
     
-    /* Source rectangle */
-    INT32 srcLeft = copy->rectSrc.left + srcOffsetX;
-    INT32 srcTop = copy->rectSrc.top + srcOffsetY;
+    /* Source rectangle (surface-local coords) */
+    INT32 srcLeft = copy->rectSrc.left;
+    INT32 srcTop = copy->rectSrc.top;
     INT32 width = copy->rectSrc.right - copy->rectSrc.left;
     INT32 height = copy->rectSrc.bottom - copy->rectSrc.top;
     
-    /* For overlapping copies, we need a temp buffer */
+    if (width <= 0 || height <= 0) return CHANNEL_RC_OK;
+    
+    /* For overlapping copies within same surface, need temp buffer */
     uint8_t* tempBuf = NULL;
     bool needTemp = (copy->surfaceIdSrc == copy->surfaceIdDest);
     
-    if (needTemp && width > 0 && height > 0) {
+    if (needTemp && srcSurfBuf && srcSurfW > 0) {
         size_t tempSize = width * height * 4;
         tempBuf = (uint8_t*)malloc(tempSize);
         if (tempBuf) {
-            /* Copy source rect to temp buffer */
+            UINT32 srcStride = srcSurfW * 4;
             for (INT32 y = 0; y < height; y++) {
-                INT32 srcY = srcTop + y;
-                if (srcY < 0 || srcY >= gdi->height) continue;
-                uint8_t* src = gdi->primary_buffer + srcY * gdi->stride + srcLeft * 4;
+                INT32 sy = srcTop + y;
+                if (sy < 0 || sy >= (INT32)srcSurfH) continue;
+                uint8_t* src = srcSurfBuf + sy * srcStride + srcLeft * 4;
                 uint8_t* dst = tempBuf + y * width * 4;
-                INT32 copyWidth = width;
-                if (srcLeft < 0) { src -= srcLeft * 4; dst -= srcLeft * 4; copyWidth += srcLeft; }
-                if (srcLeft + width > gdi->width) copyWidth = gdi->width - srcLeft;
-                if (copyWidth > 0) memcpy(dst, src, copyWidth * 4);
+                INT32 copyW = width;
+                if (srcLeft < 0) { copyW += srcLeft; } 
+                if (srcLeft + width > (INT32)srcSurfW) copyW = srcSurfW - srcLeft;
+                if (copyW > 0 && srcLeft >= 0) memcpy(dst, src, copyW * 4);
             }
         }
     }
     
     /* Copy to each destination point */
     for (UINT16 i = 0; i < copy->destPtsCount; i++) {
-        INT32 dstLeft = copy->destPts[i].x + dstOffsetX;
-        INT32 dstTop = copy->destPts[i].y + dstOffsetY;
+        INT32 dstLeft = copy->destPts[i].x;
+        INT32 dstTop = copy->destPts[i].y;
         
-        /* Clamp to buffer bounds */
-        INT32 copyWidth = width;
-        INT32 copyHeight = height;
-        INT32 srcStartX = 0, srcStartY = 0;
-        
-        if (dstLeft < 0) { srcStartX = -dstLeft; copyWidth += dstLeft; dstLeft = 0; }
-        if (dstTop < 0) { srcStartY = -dstTop; copyHeight += dstTop; dstTop = 0; }
-        if (dstLeft + copyWidth > gdi->width) copyWidth = gdi->width - dstLeft;
-        if (dstTop + copyHeight > gdi->height) copyHeight = gdi->height - dstTop;
-        
-        if (copyWidth <= 0 || copyHeight <= 0) continue;
-        
-        /* Perform the copy */
-        for (INT32 y = 0; y < copyHeight; y++) {
-            uint8_t* src;
-            if (tempBuf) {
-                src = tempBuf + (srcStartY + y) * width * 4 + srcStartX * 4;
-            } else {
-                INT32 srcY = srcTop + srcStartY + y;
-                if (srcY < 0 || srcY >= gdi->height) continue;
-                src = gdi->primary_buffer + srcY * gdi->stride + (srcLeft + srcStartX) * 4;
+        /* Copy within surface buffer first */
+        if (dstSurfBuf && dstSurfW > 0 && dstSurfH > 0) {
+            UINT32 dstStride = dstSurfW * 4;
+            for (INT32 y = 0; y < height; y++) {
+                INT32 sy = srcTop + y;
+                INT32 dy = dstTop + y;
+                if (dy < 0 || dy >= (INT32)dstSurfH) continue;
+                if (!tempBuf && (sy < 0 || sy >= (INT32)srcSurfH)) continue;
+                
+                uint8_t* src;
+                if (tempBuf) {
+                    src = tempBuf + y * width * 4;
+                } else if (srcSurfBuf) {
+                    src = srcSurfBuf + sy * (srcSurfW * 4) + srcLeft * 4;
+                } else {
+                    continue;
+                }
+                
+                INT32 copyW = width;
+                INT32 dstX = dstLeft;
+                if (dstX < 0) { src -= dstX * 4; copyW += dstX; dstX = 0; }
+                if (dstX + copyW > (INT32)dstSurfW) copyW = dstSurfW - dstX;
+                if (copyW > 0) {
+                    uint8_t* dst = dstSurfBuf + dy * dstStride + dstX * 4;
+                    memcpy(dst, src, copyW * 4);
+                }
             }
-            uint8_t* dst = gdi->primary_buffer + (dstTop + y) * gdi->stride + dstLeft * 4;
-            memcpy(dst, src, copyWidth * 4);
         }
         
-        /* Mark dirty rect */
-        pthread_mutex_lock(&bctx->rect_mutex);
-        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
-            bctx->dirty_rects[bctx->dirty_rect_count].x = dstLeft;
-            bctx->dirty_rects[bctx->dirty_rect_count].y = dstTop;
-            bctx->dirty_rects[bctx->dirty_rect_count].width = copyWidth;
-            bctx->dirty_rects[bctx->dirty_rect_count].height = copyHeight;
-            bctx->dirty_rect_count++;
+        /* Also copy to primary_buffer if dest surface is mapped */
+        if (dstMapped && gdi && gdi->primary_buffer) {
+            INT32 primDstLeft = dstLeft + dstOutX;
+            INT32 primDstTop = dstTop + dstOutY;
+            
+            for (INT32 y = 0; y < height; y++) {
+                INT32 sy = srcTop + y;
+                INT32 dy = primDstTop + y;
+                if (dy < 0 || dy >= gdi->height) continue;
+                
+                uint8_t* src;
+                if (tempBuf) {
+                    src = tempBuf + y * width * 4;
+                } else if (srcSurfBuf && srcSurfW > 0 && sy >= 0 && sy < (INT32)srcSurfH) {
+                    src = srcSurfBuf + sy * (srcSurfW * 4) + srcLeft * 4;
+                } else {
+                    continue;
+                }
+                
+                INT32 copyW = width;
+                INT32 dstX = primDstLeft;
+                if (dstX < 0) { src -= dstX * 4; copyW += dstX; dstX = 0; }
+                if (dstX + copyW > gdi->width) copyW = gdi->width - dstX;
+                if (copyW > 0) {
+                    uint8_t* dst = gdi->primary_buffer + dy * gdi->stride + dstX * 4;
+                    memcpy(dst, src, copyW * 4);
+                }
+            }
+            
+            /* Mark dirty rect */
+            pthread_mutex_lock(&bctx->rect_mutex);
+            if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                INT32 dirtyX = (primDstLeft < 0) ? 0 : primDstLeft;
+                INT32 dirtyY = (primDstTop < 0) ? 0 : primDstTop;
+                INT32 dirtyW = width;
+                INT32 dirtyH = height;
+                if (primDstLeft < 0) dirtyW += primDstLeft;
+                if (primDstTop < 0) dirtyH += primDstTop;
+                if (dirtyX + dirtyW > gdi->width) dirtyW = gdi->width - dirtyX;
+                if (dirtyY + dirtyH > gdi->height) dirtyH = gdi->height - dirtyY;
+                if (dirtyW > 0 && dirtyH > 0) {
+                    bctx->dirty_rects[bctx->dirty_rect_count].x = dirtyX;
+                    bctx->dirty_rects[bctx->dirty_rect_count].y = dirtyY;
+                    bctx->dirty_rects[bctx->dirty_rect_count].width = dirtyW;
+                    bctx->dirty_rects[bctx->dirty_rect_count].height = dirtyH;
+                    bctx->dirty_rect_count++;
+                }
+            }
+            pthread_mutex_unlock(&bctx->rect_mutex);
         }
-        pthread_mutex_unlock(&bctx->rect_mutex);
     }
     
     if (tempBuf) free(tempBuf);
@@ -2326,8 +2412,45 @@ static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context,
     
     /* Copy cached bitmap to each destination point */
     for (UINT16 i = 0; i < cache->destPtsCount; i++) {
-        INT32 dstLeft = cache->destPts[i].x + offsetX;
-        INT32 dstTop = cache->destPts[i].y + offsetY;
+        /* Destination in surface-local coordinates */
+        INT32 surfDstX = cache->destPts[i].x;
+        INT32 surfDstY = cache->destPts[i].y;
+        
+        /* Get surface buffer info */
+        uint8_t* surfBuf = NULL;
+        UINT32 surfW = 0, surfH = 0;
+        if (cache->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[cache->surfaceId].active) {
+            surfBuf = bctx->surface_buffers[cache->surfaceId];
+            surfW = bctx->surfaces[cache->surfaceId].width;
+            surfH = bctx->surfaces[cache->surfaceId].height;
+        }
+        
+        /* Write to surface buffer first (for SurfaceToCache consistency) */
+        if (surfBuf && surfW > 0 && surfH > 0) {
+            INT32 clampX = surfDstX;
+            INT32 clampY = surfDstY;
+            UINT32 copyW = entry->width;
+            UINT32 copyH = entry->height;
+            UINT32 srcOffX = 0, srcOffY = 0;
+            
+            if (clampX < 0) { srcOffX = -clampX; copyW += clampX; clampX = 0; }
+            if (clampY < 0) { srcOffY = -clampY; copyH += clampY; clampY = 0; }
+            if (clampX + (INT32)copyW > (INT32)surfW) copyW = surfW - clampX;
+            if (clampY + (INT32)copyH > (INT32)surfH) copyH = surfH - clampY;
+            
+            if (copyW > 0 && copyH > 0) {
+                UINT32 surfStride = surfW * 4;
+                for (UINT32 y = 0; y < copyH; y++) {
+                    uint8_t* src = entry->data + (srcOffY + y) * entry->width * 4 + srcOffX * 4;
+                    uint8_t* dst = surfBuf + (clampY + y) * surfStride + clampX * 4;
+                    memcpy(dst, src, copyW * 4);
+                }
+            }
+        }
+        
+        /* Now write to primary_buffer with output offset */
+        INT32 dstLeft = surfDstX + offsetX;
+        INT32 dstTop = surfDstY + offsetY;
         
         /* Clamp to buffer bounds */
         UINT32 width = entry->width;

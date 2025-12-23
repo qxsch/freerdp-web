@@ -108,8 +108,24 @@ if (surface mapped) {
 
 ## Remaining: Black Tiles
 
-Possible causes to investigate:
-1. **Cache miss**: Cache slot empty when `CacheToSurface` called
-2. **Surface buffer not allocated**: Check `gfx_on_create_surface`
-3. **Zero-initialized regions**: SolidFill with black or uninitialized memory
-4. **Codec failure path**: Decode fails silently, leaves black pixels
+**Root Cause Found**: SolidFill and SurfaceToSurface were writing to `primary_buffer` only, not to surface buffers. This meant:
+1. SolidFill fills primary but surface buffer stays uninitialized (black)
+2. Later SurfaceToCache reads from surface buffer → caches black pixels
+3. CacheToSurface draws cached black pixels
+
+**Fix Applied**: 
+- SolidFill now fills both surface buffer AND primary buffer
+- SurfaceToSurface now copies within surface buffers AND to primary buffer
+
+### Key Principle
+All GFX operations work in **surface-local coordinates**. The workflow is:
+1. Decode/fill/copy to **surface buffer** (no output offset)
+2. If surface is mapped, copy to **primary buffer** (with output offset)
+3. SurfaceToCache reads from **surface buffer**
+4. CacheToSurface writes to **both surface buffer AND primary buffer**
+
+### Issue 5: Stale Cache Tiles (Post-Progressive)
+**Symptom**: Black/corrupted tiles appearing over time, correlated with `DeleteEncodingContext`  
+**Root Cause**: `CacheToSurface` only wrote to `primary_buffer`, not surface buffer  
+**Impact**: When server later calls `SurfaceToCache` on a region where `CacheToSurface` had drawn, it reads stale surface buffer content instead of the cached tile  
+**Fix**: `CacheToSurface` now writes to both surface buffer AND primary buffer
