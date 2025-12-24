@@ -35,6 +35,9 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 👥 Multi-user support (isolated RDP sessions per WebSocket connection)
 
 ## Todo (Best Effort)
+- GFX debugging notes documentation
+  - fix rdp screen resize bug - container silently dies
+  - remove debugging logs
 - Clipboard support (copy/paste)
 - File transfer support
 - Better JS API
