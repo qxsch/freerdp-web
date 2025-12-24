@@ -580,13 +580,8 @@
             // Decode the frame
             await decodeH264Frame(nalData, frameType, destX, destY, destW, destH, surfaceId, chromaData);
             
-            // Send acknowledgment to prevent server back-pressure
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'ack_frame',
-                    frame_id: frameId
-                }));
-            }
+            // Note: Frame acknowledgment is handled automatically by FreeRDP's EndFrame handler
+            // in the C code. No need to send acks from JavaScript.
             
             lastH264FrameId = frameId;
             

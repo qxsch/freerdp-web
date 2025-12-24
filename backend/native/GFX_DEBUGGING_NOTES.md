@@ -680,4 +680,4 @@ Python no longer calls `rdp_clear_dirty_rects()` after delta sends - the get ope
 
 **Additional Discovery**: With atomic read-clear, the Issue 12k `frame_in_progress` guard became HARMFUL. It was causing us to skip reading rects from completed frames just because a new frame had started. This caused 143+ rects to be lost. The guard was removed - atomic operations are sufficient to prevent races.
 
-**STATUS: WORKING** - Atomic read-clear prevents races without blocking frame sends.
+**STATUS: CONFIRMED WORKING** - Atomic read-clear prevents races and ensures all dirty rects are sent. This was the root cause of the leftover artifacts during login and window operations.
