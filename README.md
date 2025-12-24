@@ -38,6 +38,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - GFX debugging notes documentation
   - fix rdp screen resize bug - container silently dies
   - remove debugging logs
+- long term GFX optimizations
 - Clipboard support (copy/paste)
 - File transfer support
 - Better JS API
