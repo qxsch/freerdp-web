@@ -321,9 +321,21 @@ class NativeLibrary:
         lib.rdp_clear_dirty_rects.argtypes = [c_void_p]
         lib.rdp_clear_dirty_rects.restype = None
         
+        # rdp_peek_dirty_rect_count
+        lib.rdp_peek_dirty_rect_count.argtypes = [c_void_p]
+        lib.rdp_peek_dirty_rect_count.restype = c_int
+        
         # rdp_needs_full_frame
         lib.rdp_needs_full_frame.argtypes = [c_void_p]
         lib.rdp_needs_full_frame.restype = c_bool
+        
+        # rdp_gfx_frame_in_progress
+        lib.rdp_gfx_frame_in_progress.argtypes = [c_void_p]
+        lib.rdp_gfx_frame_in_progress.restype = c_bool
+        
+        # rdp_gfx_get_last_completed_frame
+        lib.rdp_gfx_get_last_completed_frame.argtypes = [c_void_p]
+        lib.rdp_gfx_get_last_completed_frame.restype = c_uint32
         
         # rdp_send_mouse
         lib.rdp_send_mouse.argtypes = [c_void_p, c_uint16, c_int, c_int]
@@ -589,8 +601,8 @@ class RDPBridge:
         """Stream frames from native library - prioritizes H.264/GFX when available"""
         logger.info("Starting frame streaming")
         
-        # Allocate dirty rect buffer for GDI fallback
-        max_rects = 64
+        # Allocate dirty rect buffer - must match RDP_MAX_DIRTY_RECTS in C (512)
+        max_rects = 512
         rects = (RdpRect * max_rects)()
         poll_count = 0
         h264_frame = RdpH264Frame()
@@ -649,37 +661,64 @@ class RDPBridge:
                         self._lib.rdp_needs_full_frame(self._session)
                         # But DON'T clear dirty rects - fall through to process them!
                     
-                    # GFX is active - check for dirty rects from non-H.264 operations
-                    # (scrolling, fills, cache blits, etc.)
-                    if result != 0 or h264_ever_received:
-                        rect_count = self._lib.rdp_get_dirty_rects(
-                            self._session, rects, max_rects
+                    # First check if we need a full frame (e.g., dirty rect overflow)
+                    needs_full = self._lib.rdp_needs_full_frame(self._session)
+                    
+                    if needs_full:
+                        # Dirty rect overflow - send full frame instead of deltas
+                        width = c_int()
+                        height = c_int()
+                        stride = c_int()
+                        buffer_ptr = self._lib.rdp_get_frame_buffer(
+                            self._session,
+                            ctypes.byref(width),
+                            ctypes.byref(height),
+                            ctypes.byref(stride)
                         )
                         
-                        if rect_count > 0:
-                            # Send delta frame for non-H.264 operations
-                            width = c_int()
-                            height = c_int()
-                            stride = c_int()
-                            buffer_ptr = self._lib.rdp_get_frame_buffer(
-                                self._session,
-                                ctypes.byref(width),
-                                ctypes.byref(height),
-                                ctypes.byref(stride)
-                            )
-                            
-                            if buffer_ptr:
-                                w, h, s = width.value, height.value, stride.value
-                                await self._send_delta_frame(buffer_ptr, w, h, s, rects, rect_count)
+                        if buffer_ptr:
+                            w, h, s = width.value, height.value, stride.value
+                            logger.info(f"Sending full frame (GFX overflow): {w}x{h}, stride={s}")
+                            await self._send_full_frame(buffer_ptr, w, h, s)
                         
+                        # Clear dirty rects - for full frame this is intentional
+                        # (we're sending the entire buffer, so all rects are covered)
                         self._lib.rdp_clear_dirty_rects(self._session)
+                        continue
+                    
+                    # Issue 12m: With atomic read-clear in rdp_get_dirty_rects, we no longer
+                    # need the frame_in_progress guard. The atomic operation prevents races
+                    # between reading and clearing. Sending rects from completed frames while
+                    # a new frame is building is fine - those rects are valid.
+                    rect_count = self._lib.rdp_get_dirty_rects(
+                        self._session, rects, max_rects
+                    )
+                    
+                    if rect_count > 0:
+                        # Send delta frame for non-H.264 operations
+                        width = c_int()
+                        height = c_int()
+                        stride = c_int()
+                        buffer_ptr = self._lib.rdp_get_frame_buffer(
+                            self._session,
+                            ctypes.byref(width),
+                            ctypes.byref(height),
+                            ctypes.byref(stride)
+                        )
                         
-                        # If we sent H.264 and/or dirty rects, continue
-                        if h264_sent > 0 or rect_count > 0:
-                            continue
+                        if buffer_ptr:
+                            w, h, s = width.value, height.value, stride.value
+                            logger.info(f"Sending delta frame with {rect_count} dirty rects")
+                            await self._send_delta_frame(buffer_ptr, w, h, s, rects, rect_count)
+                        
+                        # Note: rdp_get_dirty_rects now clears atomically, no need to call clear
+                    
+                    # If we sent H.264 or deltas, continue to next poll
+                    if h264_sent > 0 or rect_count > 0:
+                        continue
                     
                     # GFX active but no updates - wait for more
-                    if result == 0 or h264_ever_received:
+                    if result == 0:
                         await asyncio.sleep(0.001)
                         continue
                 

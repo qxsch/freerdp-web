@@ -52,6 +52,11 @@
 #define RDP_BRIDGE_VERSION "1.6.0"
 #define MAX_ERROR_LEN 512
 
+/* Debug flags - set to 1 to enable verbose logging for specific subsystems */
+#define DEBUG_GFX_CACHE 0        /* Log all SurfaceToCache/CacheToSurface operations */
+#define DEBUG_GFX_FILL 0         /* Log all SolidFill operations */
+#define DEBUG_GFX_COPY 0         /* Log all SurfaceToSurface operations */
+
 /* Session registry limits */
 #define RDP_MAX_SESSIONS_DEFAULT 100
 #define RDP_MAX_SESSIONS_MIN 2
@@ -132,7 +137,9 @@ typedef struct {
     RdpGfxSurface surfaces[RDP_MAX_GFX_SURFACES];
     uint16_t primary_surface_id;
     uint32_t current_frame_id;      /* Current frame ID from start_frame */
+    uint32_t last_completed_frame_id; /* Last frame ID that completed (EndFrame called) */
     uint32_t frame_cmd_count;       /* Commands received in current frame */
+    bool gfx_frame_in_progress;     /* True between StartFrame and EndFrame */
     pthread_mutex_t gfx_mutex;
     
     /* H.264 frame queue (ring buffer) */
@@ -575,8 +582,13 @@ RdpSession* rdp_create(
     /* Disable legacy codecs - we want H.264 only */
     if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, FALSE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_NSCodec, FALSE)) goto fail;
-    /* GFX options for optimal streaming */
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, FALSE)) goto fail;
+    /* GFX options for optimal streaming.
+     * GfxSmallCache = TRUE: Tells server to use smaller tile cache, resulting in more
+     * direct WireToSurface updates and fewer SurfaceToCache/CacheToSurface operations.
+     * This avoids leftover artifacts when windows are de-maximized within the RDP session,
+     * as the server won't rely on our client-side cache for desktop background repaints.
+     * GfxThinClient = FALSE: Keep full AVC444/H.264 quality (ThinClient would reduce it). */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxThinClient, FALSE)) goto fail;
     
     /* Audio playback - configure rdpsnd with our bridge device plugin.
@@ -991,6 +1003,11 @@ int rdp_get_dirty_rects(RdpSession* session, RdpRect* rects, int max_rects)
     
     pthread_mutex_lock(&ctx->rect_mutex);
     
+    /* Issue 12m: Atomic read-and-clear to prevent race condition.
+     * Previously, Python would read rects then call clear_dirty_rects() separately.
+     * Between these calls, a new frame could start and add rects, which would
+     * then be incorrectly cleared. Now we read AND clear in one atomic operation. */
+    
     int count = ctx->dirty_rect_count;
     if (count > max_rects) count = max_rects;
     
@@ -998,6 +1015,33 @@ int rdp_get_dirty_rects(RdpSession* session, RdpRect* rects, int max_rects)
         rects[i] = ctx->dirty_rects[i];
     }
     
+    /* Clear only the rects we returned - shift remaining rects down */
+    if (count > 0 && count < ctx->dirty_rect_count) {
+        /* Partial read - shift remaining rects to front */
+        int remaining = ctx->dirty_rect_count - count;
+        for (int i = 0; i < remaining; i++) {
+            ctx->dirty_rects[i] = ctx->dirty_rects[count + i];
+        }
+        ctx->dirty_rect_count = remaining;
+    } else {
+        /* Full read or exact match - clear all */
+        ctx->dirty_rect_count = 0;
+    }
+    
+    pthread_mutex_unlock(&ctx->rect_mutex);
+    
+    return count;
+}
+
+int rdp_peek_dirty_rect_count(RdpSession* session)
+{
+    if (!session) return 0;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    pthread_mutex_lock(&ctx->rect_mutex);
+    int count = ctx->dirty_rect_count;
     pthread_mutex_unlock(&ctx->rect_mutex);
     
     return count;
@@ -1023,11 +1067,44 @@ bool rdp_needs_full_frame(RdpSession* session)
     BridgeContext* ctx = (BridgeContext*)context;
     
     pthread_mutex_lock(&ctx->rect_mutex);
+    
+    /* Note: We allow checking/consuming full_frame flag even while a frame
+     * is in progress. Blocking here caused stalls when frames arrived faster
+     * than Python could process them. The flag is set atomically under mutex. */
+    
     bool needs = ctx->needs_full_frame;
     ctx->needs_full_frame = false;
     pthread_mutex_unlock(&ctx->rect_mutex);
     
     return needs;
+}
+
+bool rdp_gfx_frame_in_progress(RdpSession* session)
+{
+    if (!session) return false;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    pthread_mutex_lock(&ctx->rect_mutex);
+    bool in_progress = ctx->gfx_frame_in_progress;
+    pthread_mutex_unlock(&ctx->rect_mutex);
+    
+    return in_progress;
+}
+
+uint32_t rdp_gfx_get_last_completed_frame(RdpSession* session)
+{
+    if (!session) return 0;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    pthread_mutex_lock(&ctx->rect_mutex);
+    uint32_t frame_id = ctx->last_completed_frame_id;
+    pthread_mutex_unlock(&ctx->rect_mutex);
+    
+    return frame_id;
 }
 
 /* ============================================================================
@@ -1825,11 +1902,27 @@ static UINT gfx_on_reset_graphics(RdpgfxClientContext* context, const RDPGFX_RES
     /* NOTE: Do NOT clear gfx_cache here! The bitmap cache persists across
      * surface resets. Server will continue to reference cached entries. */
     
-    /* Update frame dimensions */
+    /* Clear primary_buffer to black BEFORE setting needs_full_frame.
+     * This prevents sending stale content from the previous surface layout.
+     * The old surface content is no longer valid after reset. */
+    rdpGdi* gdi = bctx->gdi;
+    if (gdi && gdi->primary_buffer) {
+        memset(gdi->primary_buffer, 0, gdi->stride * gdi->height);
+        fprintf(stderr, "[rdp_bridge] GFX Reset: Cleared primary_buffer (%dx%d)\n", 
+                gdi->width, gdi->height);
+    }
+    
+    /* Update frame dimensions.
+     * NOTE: Do NOT set needs_full_frame here! The buffer is now cleared (black),
+     * and the server hasn't sent new content yet. If we set needs_full_frame,
+     * Python will send a black frame before real content arrives.
+     * The dirty rect overflow mechanism will naturally trigger a full frame
+     * when the first big repaint comes in (typically 700+ commands). */
     pthread_mutex_lock(&bctx->rect_mutex);
     bctx->frame_width = reset->width;
     bctx->frame_height = reset->height;
-    bctx->needs_full_frame = true;
+    /* bctx->needs_full_frame = true; -- DON'T do this, causes black frame flash */
+    bctx->dirty_rect_count = 0;  /* Clear any stale dirty rects */
     pthread_mutex_unlock(&bctx->rect_mutex);
     
     return CHANNEL_RC_OK;
@@ -1896,6 +1989,10 @@ static UINT gfx_on_delete_surface(RdpgfxClientContext* context, const RDPGFX_DEL
         bctx->surfaces[del->surfaceId].active = false;
         if (bctx->primary_surface_id == del->surfaceId) {
             bctx->primary_surface_id = 0;
+            /* Issue 12l: Primary surface deleted - clear stale dirty rects */
+            pthread_mutex_lock(&bctx->rect_mutex);
+            bctx->dirty_rect_count = 0;
+            pthread_mutex_unlock(&bctx->rect_mutex);
         }
         if (bctx->surface_buffers[del->surfaceId]) {
             free(bctx->surface_buffers[del->surfaceId]);
@@ -2093,6 +2190,14 @@ static UINT gfx_on_solid_fill(RdpgfxClientContext* context, const RDPGFX_SOLID_F
             bctx->dirty_rects[bctx->dirty_rect_count].width = right - left;
             bctx->dirty_rects[bctx->dirty_rect_count].height = bottom - top;
             bctx->dirty_rect_count++;
+        } else {
+            /* Dirty rect overflow - fall back to full frame */
+            static int overflow_logs = 0;
+            if (overflow_logs < 5) {
+                fprintf(stderr, "[rdp_bridge] WARNING: Dirty rect overflow in SolidFill, requesting full frame\n");
+                overflow_logs++;
+            }
+            bctx->needs_full_frame = true;
         }
         pthread_mutex_unlock(&bctx->rect_mutex);
     }
@@ -2261,6 +2366,8 @@ static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context,
                     bctx->dirty_rects[bctx->dirty_rect_count].height = dirtyH;
                     bctx->dirty_rect_count++;
                 }
+            } else {
+                bctx->needs_full_frame = true;
             }
             pthread_mutex_unlock(&bctx->rect_mutex);
         }
@@ -2306,12 +2413,17 @@ static UINT gfx_on_surface_to_cache(RdpgfxClientContext* context,
     UINT32 width = cache->rectSrc.right - cache->rectSrc.left;
     UINT32 height = cache->rectSrc.bottom - cache->rectSrc.top;
     
+#if DEBUG_GFX_CACHE
+    fprintf(stderr, "[rdp_bridge] GFX SurfaceToCache: surface=%u slot=%u (%ux%u) at (%d,%d) surfDim=%ux%u\n",
+            cache->surfaceId, cache->cacheSlot, width, height, left, top, surfWidth, surfHeight);
+#else
     static int cache_logs = 0;
     if (cache_logs < 10) {
         fprintf(stderr, "[rdp_bridge] GFX SurfaceToCache: surface=%u slot=%u (%ux%u) at (%d,%d)\n",
                 cache->surfaceId, cache->cacheSlot, width, height, left, top);
         cache_logs++;
     }
+#endif
     
     /* Validate cache slot */
     if (cache->cacheSlot >= (UINT64)bctx->gfx_cache_size) {
@@ -2404,12 +2516,23 @@ static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context,
         offsetY = bctx->surfaces[cache->surfaceId].output_y;
     }
     
+#if DEBUG_GFX_CACHE
+    fprintf(stderr, "[rdp_bridge] GFX CacheToSurface: slot=%u surface=%u destPts=%u tileDim=%ux%u offset=(%d,%d)\n",
+            cache->cacheSlot, cache->surfaceId, cache->destPtsCount, 
+            entry->width, entry->height, offsetX, offsetY);
+    for (UINT16 d = 0; d < cache->destPtsCount; d++) {
+        fprintf(stderr, "   destPt[%u]: (%d,%d) -> screen=(%d,%d)\n", d,
+                cache->destPts[d].x, cache->destPts[d].y,
+                cache->destPts[d].x + offsetX, cache->destPts[d].y + offsetY);
+    }
+#else
     static int cache_logs = 0;
     if (cache_logs < 5) {
         fprintf(stderr, "[rdp_bridge] GFX CacheToSurface: slot=%u surface=%u destPts=%u\n",
                 cache->cacheSlot, cache->surfaceId, cache->destPtsCount);
         cache_logs++;
     }
+#endif
     
     /* Copy cached bitmap to each destination point */
     for (UINT16 i = 0; i < cache->destPtsCount; i++) {
@@ -2480,6 +2603,8 @@ static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context,
             bctx->dirty_rects[bctx->dirty_rect_count].width = width;
             bctx->dirty_rects[bctx->dirty_rect_count].height = height;
             bctx->dirty_rect_count++;
+        } else {
+            bctx->needs_full_frame = true;
         }
         pthread_mutex_unlock(&bctx->rect_mutex);
     }
@@ -2839,6 +2964,8 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                         bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
                         bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
                         bctx->dirty_rect_count++;
+                    } else {
+                        bctx->needs_full_frame = true;
                     }
                     pthread_mutex_unlock(&bctx->rect_mutex);
                 }
@@ -2924,6 +3051,8 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                         bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
                         bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
                         bctx->dirty_rect_count++;
+                    } else {
+                        bctx->needs_full_frame = true;
                     }
                     pthread_mutex_unlock(&bctx->rect_mutex);
                 }
@@ -3061,6 +3190,10 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                         bctx->dirty_rects[bctx->dirty_rect_count].height = rects[i].bottom - rects[i].top;
                         bctx->dirty_rect_count++;
                     }
+                    if (numRects > 0 && bctx->dirty_rect_count >= RDP_MAX_DIRTY_RECTS) {
+                        /* Overflow - request full frame */
+                        bctx->needs_full_frame = true;
+                    }
                     if (numRects == 0) {
                         /* No explicit rects - mark full frame */
                         bctx->needs_full_frame = true;
@@ -3139,6 +3272,8 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                             bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
                             bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
                             bctx->dirty_rect_count++;
+                        } else {
+                            bctx->needs_full_frame = true;
                         }
                         pthread_mutex_unlock(&bctx->rect_mutex);
                     }
@@ -3190,6 +3325,11 @@ static UINT gfx_on_start_frame(RdpgfxClientContext* context, const RDPGFX_START_
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx || !start) return ERROR_INVALID_PARAMETER;
     
+    /* Mark frame as in progress - Python should not send frames while this is true */
+    pthread_mutex_lock(&bctx->rect_mutex);
+    bctx->gfx_frame_in_progress = true;
+    pthread_mutex_unlock(&bctx->rect_mutex);
+    
     bctx->current_frame_id = start->frameId;
     bctx->frame_cmd_count = 0;  /* Reset command count for this frame */
     bctx->h264_queued_this_frame = false;  /* Reset H.264 flag for this frame */
@@ -3220,6 +3360,10 @@ static UINT gfx_on_end_frame(RdpgfxClientContext* context, const RDPGFX_END_FRAM
     pthread_mutex_lock(&bctx->rect_mutex);
     int dirty_count = bctx->dirty_rect_count;
     bool h264_in_frame = bctx->h264_queued_this_frame;
+    /* Frame is now complete - Python can safely read buffer and send frames */
+    bctx->gfx_frame_in_progress = false;
+    /* Update last_completed_frame_id so Python knows a frame finished */
+    bctx->last_completed_frame_id = end->frameId;
     pthread_mutex_unlock(&bctx->rect_mutex);
     
     if (end_frame_logs < 20) {

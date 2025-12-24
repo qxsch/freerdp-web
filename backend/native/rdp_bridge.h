@@ -16,8 +16,11 @@
 extern "C" {
 #endif
 
-/* Maximum dirty rectangles per frame */
-#define RDP_MAX_DIRTY_RECTS 64
+/* Maximum dirty rectangles per frame.
+ * Increased from 64 to 512 to handle complex repaint scenarios like
+ * window de-maximize, where many small tiles need updating.
+ * When limit is exceeded, we fall back to full frame update. */
+#define RDP_MAX_DIRTY_RECTS 512
 
 /* GFX pipeline constants */
 #define RDP_MAX_GFX_SURFACES 256
@@ -230,12 +233,42 @@ int rdp_get_dirty_rects(
 void rdp_clear_dirty_rects(RdpSession* session);
 
 /**
+ * Peek at the current dirty rectangle count without clearing or copying
+ * 
+ * @return Number of dirty rectangles currently accumulated
+ */
+int rdp_peek_dirty_rect_count(RdpSession* session);
+
+/**
  * Check if a full frame refresh is needed
  * 
  * Returns true after connect, resize, or when too many dirty rects accumulated.
  * After calling this, the flag is cleared.
+ * Returns false while a GFX frame is in progress.
  */
 bool rdp_needs_full_frame(RdpSession* session);
+
+/**
+ * Check if a GFX frame is currently being processed
+ * 
+ * When true, Python should wait before sending frames to avoid sending
+ * incomplete buffer state. This is set between StartFrame and EndFrame
+ * callbacks in the GFX pipeline.
+ * 
+ * @return true if a frame is being processed, false if safe to send
+ */
+bool rdp_gfx_frame_in_progress(RdpSession* session);
+
+/**
+ * Get the last completed GFX frame ID
+ * 
+ * Returns the frame ID of the most recently completed GFX frame (after EndFrame).
+ * Python can track this to know when new dirty rects are ready to be sent.
+ * Only read dirty rects when this value changes from the last check.
+ * 
+ * @return Last completed frame ID, or 0 if no frames completed yet
+ */
+uint32_t rdp_gfx_get_last_completed_frame(RdpSession* session);
 
 /**
  * Send mouse input event
