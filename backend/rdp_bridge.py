@@ -307,6 +307,12 @@ class NativeLibrary:
         lib.rdp_poll.argtypes = [c_void_p, c_int]
         lib.rdp_poll.restype = c_int
         
+        # rdp_lock_frame_buffer / rdp_unlock_frame_buffer
+        lib.rdp_lock_frame_buffer.argtypes = [c_void_p]
+        lib.rdp_lock_frame_buffer.restype = None
+        lib.rdp_unlock_frame_buffer.argtypes = [c_void_p]
+        lib.rdp_unlock_frame_buffer.restype = None
+        
         # rdp_get_frame_buffer
         lib.rdp_get_frame_buffer.argtypes = [
             c_void_p, POINTER(c_int), POINTER(c_int), POINTER(c_int)
@@ -597,6 +603,44 @@ class RDPBridge:
             logger.error(f"Resize error: {e}")
             return False
     
+    def _read_frame_buffer_safe(self) -> tuple:
+        """Read frame buffer with lock protection against resize races.
+        
+        Returns (pixel_data, width, height, stride) or (None, 0, 0, 0) on error.
+        The pixel_data is a copy, safe to use after this function returns.
+        """
+        if not self._session or not self._lib:
+            return (None, 0, 0, 0)
+        
+        # Lock to prevent buffer reallocation during read
+        self._lib.rdp_lock_frame_buffer(self._session)
+        try:
+            width = c_int()
+            height = c_int()
+            stride = c_int()
+            buffer_ptr = self._lib.rdp_get_frame_buffer(
+                self._session,
+                ctypes.byref(width),
+                ctypes.byref(height),
+                ctypes.byref(stride)
+            )
+            
+            if not buffer_ptr:
+                return (None, 0, 0, 0)
+            
+            w, h, s = width.value, height.value, stride.value
+            if w <= 0 or h <= 0 or s <= 0:
+                return (None, 0, 0, 0)
+            
+            # Copy buffer while holding lock - this is the critical section
+            buffer_size = h * s
+            pixel_data = ctypes.string_at(buffer_ptr, buffer_size)
+            
+            return (pixel_data, w, h, s)
+        finally:
+            # Always unlock
+            self._lib.rdp_unlock_frame_buffer(self._session)
+    
     async def _stream_frames(self):
         """Stream frames from native library - prioritizes H.264/GFX when available"""
         logger.info("Starting frame streaming")
@@ -607,7 +651,6 @@ class RDPBridge:
         poll_count = 0
         h264_frame = RdpH264Frame()
         gfx_mode_logged = False
-        h264_ever_received = False  # Once H.264 starts, skip WebP entirely
         
         while self.running:
             try:
@@ -649,7 +692,6 @@ class RDPBridge:
                             await self._send_h264_frame(h264_frame)
                             h264_count -= 1
                             h264_sent += 1
-                            h264_ever_received = True  # Mark that H.264 is now active
                         else:
                             break
                     
@@ -666,20 +708,11 @@ class RDPBridge:
                     
                     if needs_full:
                         # Dirty rect overflow - send full frame instead of deltas
-                        width = c_int()
-                        height = c_int()
-                        stride = c_int()
-                        buffer_ptr = self._lib.rdp_get_frame_buffer(
-                            self._session,
-                            ctypes.byref(width),
-                            ctypes.byref(height),
-                            ctypes.byref(stride)
-                        )
+                        # Use safe buffer read with lock protection
+                        pixel_data, w, h, s = self._read_frame_buffer_safe()
                         
-                        if buffer_ptr:
-                            w, h, s = width.value, height.value, stride.value
-                            logger.info(f"Sending full frame (GFX overflow): {w}x{h}, stride={s}")
-                            await self._send_full_frame(buffer_ptr, w, h, s)
+                        if pixel_data:
+                            await self._send_full_frame(pixel_data, w, h, s)
                         
                         # Clear dirty rects - for full frame this is intentional
                         # (we're sending the entire buffer, so all rects are covered)
@@ -696,20 +729,11 @@ class RDPBridge:
                     
                     if rect_count > 0:
                         # Send delta frame for non-H.264 operations
-                        width = c_int()
-                        height = c_int()
-                        stride = c_int()
-                        buffer_ptr = self._lib.rdp_get_frame_buffer(
-                            self._session,
-                            ctypes.byref(width),
-                            ctypes.byref(height),
-                            ctypes.byref(stride)
-                        )
+                        # Use safe buffer read with lock protection
+                        pixel_data, w, h, s = self._read_frame_buffer_safe()
                         
-                        if buffer_ptr:
-                            w, h, s = width.value, height.value, stride.value
-                            logger.info(f"Sending delta frame with {rect_count} dirty rects")
-                            await self._send_delta_frame(buffer_ptr, w, h, s, rects, rect_count)
+                        if pixel_data:
+                            await self._send_delta_frame(pixel_data, w, h, s, rects, rect_count)
                         
                         # Note: rdp_get_dirty_rects now clears atomically, no need to call clear
                     
@@ -733,27 +757,16 @@ class RDPBridge:
                 if poll_count <= 10:
                     logger.debug(f"Frame update available: needs_full={needs_full}")
                 
-                # Get frame buffer
-                width = c_int()
-                height = c_int()
-                stride = c_int()
-                buffer_ptr = self._lib.rdp_get_frame_buffer(
-                    self._session,
-                    ctypes.byref(width),
-                    ctypes.byref(height),
-                    ctypes.byref(stride)
-                )
+                # Get frame buffer with lock protection
+                pixel_data, w, h, s = self._read_frame_buffer_safe()
                 
-                if not buffer_ptr:
+                if not pixel_data:
                     logger.warning("Frame buffer not available")
                     continue
                 
-                w, h, s = width.value, height.value, stride.value
-                
                 if needs_full:
                     # Send full frame
-                    logger.info(f"Sending full frame: {w}x{h}, stride={s}")
-                    await self._send_full_frame(buffer_ptr, w, h, s)
+                    await self._send_full_frame(pixel_data, w, h, s)
                 else:
                     # Get dirty rects and send delta
                     rect_count = self._lib.rdp_get_dirty_rects(
@@ -761,7 +774,7 @@ class RDPBridge:
                     )
                     
                     if rect_count > 0:
-                        await self._send_delta_frame(buffer_ptr, w, h, s, rects, rect_count)
+                        await self._send_delta_frame(pixel_data, w, h, s, rects, rect_count)
                 
                 # Clear dirty rects after processing
                 self._lib.rdp_clear_dirty_rects(self._session)
@@ -775,12 +788,19 @@ class RDPBridge:
         
         logger.info(f"Frame streaming ended after {self._frame_count} frames")
     
-    async def _send_full_frame(self, buffer_ptr, width: int, height: int, stride: int):
-        """Encode and send a full frame as WebP"""
+    async def _send_full_frame(self, pixel_data: bytes, width: int, height: int, stride: int):
+        """Encode and send a full frame as WebP.
+        
+        Args:
+            pixel_data: Copied pixel data (safe to use, not a pointer)
+            width: Frame width
+            height: Frame height
+            stride: Bytes per row
+        """
         try:
-            # Read pixel data from native buffer
-            buffer_size = height * stride
-            pixel_data = ctypes.string_at(buffer_ptr, buffer_size)
+            # Validate dimensions
+            if width <= 0 or height <= 0 or stride <= 0 or not pixel_data:
+                return
             
             # Create PIL image from BGRA data
             img = Image.frombytes('RGBA', (width, height), pixel_data, 'raw', 'BGRA', stride)
@@ -802,14 +822,25 @@ class RDPBridge:
             logger.error(f"Full frame encoding error: {e}")
     
     async def _send_delta_frame(
-        self, buffer_ptr, width: int, height: int, stride: int,
+        self, pixel_data: bytes, width: int, height: int, stride: int,
         rects: 'ctypes.Array[RdpRect]', rect_count: int
     ):
-        """Encode and send delta frame with dirty rectangles"""
+        """Encode and send delta frame with dirty rectangles.
+        
+        Args:
+            pixel_data: Copied pixel data (safe to use, not a pointer)
+            width: Frame width
+            height: Frame height
+            stride: Bytes per row
+            rects: Array of dirty rectangles
+            rect_count: Number of dirty rectangles
+        """
         try:
-            # Read full pixel buffer
-            buffer_size = height * stride
-            pixel_data = ctypes.string_at(buffer_ptr, buffer_size)
+            # Validate dimensions
+            if width <= 0 or height <= 0 or stride <= 0 or not pixel_data:
+                return
+            
+            buffer_size = len(pixel_data)
             
             # Build delta message
             rect_list = []
@@ -825,6 +856,12 @@ class RDPBridge:
                 if rx + rw > width: rw = width - rx
                 if ry + rh > height: rh = height - ry
                 if rw <= 0 or rh <= 0:
+                    continue
+                
+                # Validate buffer access bounds
+                max_offset = (ry + rh - 1) * stride + (rx + rw) * 4
+                if max_offset > buffer_size:
+                    logger.warning(f"Skipping out-of-bounds rect ({rx},{ry} {rw}x{rh}) for buffer {width}x{height}")
                     continue
                 
                 rect_list.append({

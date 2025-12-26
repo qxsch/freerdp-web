@@ -193,10 +193,27 @@ const char* rdp_get_error(RdpSession* session);
 int rdp_poll(RdpSession* session, int timeout_ms);
 
 /**
+ * Lock the frame buffer to prevent reallocation during read
+ * 
+ * MUST call rdp_unlock_frame_buffer() after reading the buffer!
+ * Use this with rdp_get_frame_buffer() for high-performance direct access.
+ * 
+ * @param session   Session handle
+ */
+void rdp_lock_frame_buffer(RdpSession* session);
+
+/**
+ * Unlock the frame buffer after reading
+ * 
+ * @param session   Session handle
+ */
+void rdp_unlock_frame_buffer(RdpSession* session);
+
+/**
  * Get pointer to the frame buffer
  * 
- * The buffer contains BGRA pixel data (32-bit per pixel).
- * Valid until session is destroyed or resized.
+ * IMPORTANT: Caller MUST hold lock via rdp_lock_frame_buffer() before calling
+ * and call rdp_unlock_frame_buffer() after reading the buffer!
  * 
  * @param session   Session handle
  * @param width     Output: frame width in pixels

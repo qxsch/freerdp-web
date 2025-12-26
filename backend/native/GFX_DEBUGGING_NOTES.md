@@ -103,7 +103,72 @@ if (surface mapped) {
 - ✅ RDPDR disabled
 - ✅ Per-surface buffer architecture
 - ✅ Full surface buffer consistency (all ops write to both buffers)
+- ✅ Thread-safe frame buffer access with locking
 - 🔄 H.264 (AVC420/AVC444) - NALs queued for browser WebCodecs decoding
+
+---
+
+## Frame Buffer Locking (Thread Safety)
+
+### The Problem
+In GFX mode, surface buffers can be freed and reallocated during resize:
+
+```
+1. Python calls rdp_get_frame_buffer() → gets pointer to surface_buffers[0]
+2. Python starts reading with ctypes.string_at(ptr, size)
+3. MEANWHILE: Server sends GFX DeleteSurface → free(surface_buffers[0])
+4. Python reads from freed memory → CRASH
+```
+
+The resize sequence that triggers this:
+```
+GFX DeleteSurface: id=0     ← free old buffer
+GFX Reset: new dimensions
+GFX CreateSurface: id=0     ← allocate new buffer
+GFX MapSurfaceScaled: id=0
+```
+
+### The Solution: Lock/Unlock API
+
+```c
+void rdp_lock_frame_buffer(RdpSession* session);
+void rdp_unlock_frame_buffer(RdpSession* session);
+uint8_t* rdp_get_frame_buffer(RdpSession* session, int* w, int* h, int* stride);
+```
+
+Python usage pattern:
+```python
+self._lib.rdp_lock_frame_buffer(self._session)
+try:
+    buffer_ptr = self._lib.rdp_get_frame_buffer(...)
+    if buffer_ptr:
+        # Copy while holding lock
+        pixel_data = ctypes.string_at(buffer_ptr, h * stride)
+finally:
+    self._lib.rdp_unlock_frame_buffer(self._session)
+```
+
+### Why Lock/Unlock vs Atomic Copy?
+
+We considered two approaches:
+
+1. **Atomic copy API** (`rdp_read_frame_buffer` - copies buffer internally):
+   - Pro: Simpler API, no deadlock risk
+   - Con: **Huge performance impact** - copying 8MB+ per frame at 60fps = 480MB/s memcpy
+
+2. **Lock/Unlock API** (current approach):
+   - Pro: Zero-copy - Python reads directly from buffer
+   - Pro: Lock held only during `ctypes.string_at()` which is fast
+   - Con: Must ensure unlock always called (use try/finally)
+
+### Lock Scope
+
+The lock (`gfx_mutex`) protects:
+- `surface_buffers[]` - the actual pixel data
+- `surfaces[]` - surface metadata (dimensions, mapped status)
+- `primary_surface_id` - which surface is the primary output
+
+GFX callbacks (DeleteSurface, CreateSurface, Reset) acquire this lock before modifying buffers, ensuring Python's read is atomic with respect to resize.
 
 ---
 
@@ -681,3 +746,180 @@ Python no longer calls `rdp_clear_dirty_rects()` after delta sends - the get ope
 **Additional Discovery**: With atomic read-clear, the Issue 12k `frame_in_progress` guard became HARMFUL. It was causing us to skip reading rects from completed frames just because a new frame had started. This caused 143+ rects to be lost. The guard was removed - atomic operations are sufficient to prevent races.
 
 **STATUS: CONFIRMED WORKING** - Atomic read-clear prevents races and ensures all dirty rects are sent. This was the root cause of the leftover artifacts during login and window operations.
+
+---
+
+## Issue 13: Container Crash on Resize (GDI/GFX Architecture Split)
+
+### Symptom
+Container crashes silently (no error logs, just exits) when browser window is resized during active RDP session. The crash happens specifically during the GFX resize sequence:
+```
+GFX DeleteSurface: id=0
+GFX Reset: new dimensions
+GFX CreateSurface: id=0
+GFX MapSurfaceScaled: id=0
+```
+
+### Investigation Timeline
+
+**Stage 1: Lock/Unlock API**
+Initial theory was a race condition between Python reading frame buffer and C freeing/reallocating during resize. Added `rdp_lock_frame_buffer()`/`rdp_unlock_frame_buffer()` API. See "Frame Buffer Locking" section above.
+
+**Stage 2: Transcoder Buffer Overflow**
+Found that `transcode_avc444()` could write to a buffer allocated for old dimensions if called after resize but before transcoder reallocation. Added:
+1. Transcoder cleanup in `gfx_on_reset_graphics()` - free old transcoder buffers immediately
+2. Dimension safety checks in `transcode_avc444()` - skip if dimensions don't match
+
+**Stage 3: Root Cause - GDI/GFX Mixing**
+User identified the real architectural flaw: GFX callbacks were writing to BOTH `surface_buffers[]` AND `gdi->primary_buffer`. In pure GFX mode, we should ONLY use `surface_buffers[]`.
+
+The problem: `gdi->primary_buffer` is managed by FreeRDP's GDI layer and can be in an inconsistent state during resize. By writing to it from GFX callbacks, we were accessing potentially freed or reallocated memory.
+
+### The Fix: Pure GFX Mode
+
+Removed all `gdi->primary_buffer` access from GFX callbacks. The principle:
+
+```
+PURE GFX MODE:
+- All graphics data goes to surface_buffers[surfaceId]
+- rdp_get_frame_buffer() returns surface_buffers[primary_surface_id]
+- Dirty rects use output_offset for screen coordinates
+- gdi->primary_buffer is ONLY for non-GFX fallback mode
+```
+
+### Functions Modified
+
+| Function | What Changed |
+|----------|--------------|
+| `gfx_on_reset_graphics` | Removed `memset(gdi->primary_buffer, ...)` |
+| `gfx_on_solid_fill` | Removed read of `gdi` pointer, removed write to `gdi->primary_buffer` |
+| `gfx_on_surface_to_surface` | Removed copy to `gdi->primary_buffer` |
+| `gfx_on_cache_to_surface` | Removed copy to `gdi->primary_buffer` |
+| ClearCodec decoder | Removed copy to `gdi->primary_buffer` |
+| Uncompressed decoder | Removed copy to `gdi->primary_buffer` |
+| Progressive decoder | Removed copy to `gdi->primary_buffer`, removed GDI fallback path |
+| Planar decoder | Removed copy to `gdi->primary_buffer` |
+
+### Code Pattern Before (Wrong)
+
+```c
+static UINT gfx_on_solid_fill(...) {
+    rdpGdi* gdi = bctx->gdi;  // ← Accessing GDI in GFX callback
+    
+    // Write to surface buffer
+    fill_surface_buffer(surface_buffers[surfaceId], ...);
+    
+    // ALSO write to GDI buffer ← WRONG! Can crash during resize!
+    fill_gdi_buffer(gdi->primary_buffer, ...);
+}
+```
+
+### Code Pattern After (Correct)
+
+```c
+static UINT gfx_on_solid_fill(...) {
+    /* PURE GFX MODE: Only write to surface_buffers[], never gdi->primary_buffer */
+    
+    // Write to surface buffer only
+    fill_surface_buffer(surface_buffers[surfaceId], ...);
+    
+    // Mark dirty rect with output offset
+    mark_dirty_rect(surfX + outputX, surfY + outputY, width, height);
+}
+```
+
+### Key Architectural Insight
+
+FreeRDP supports two rendering paths:
+1. **GDI Mode**: Legacy, uses `gdi->primary_buffer`, GDI callbacks
+2. **GFX Mode**: Modern, uses per-surface buffers, RDPEGFX callbacks
+
+When GFX is active (which it is for H.264/AVC support), we should NOT touch GDI structures. The GDI layer may still be initialized (FreeRDP requires it), but we don't use it for rendering.
+
+The `rdp_get_frame_buffer()` function correctly handles this:
+```c
+if (ctx->primary_surface_id > 0 && ctx->surface_buffers[ctx->primary_surface_id]) {
+    return ctx->surface_buffers[ctx->primary_surface_id];  // GFX mode
+}
+return gdi->primary_buffer;  // Non-GFX fallback
+```
+
+### Status
+✅ **FIXED** - Container no longer crashes on resize. The GDI/GFX separation is now clean.
+
+---
+
+## Current Status (Updated)
+
+- ✅ GFX negotiation (v10.7 with H.264)
+- ✅ All codecs: ClearCodec, Planar, Uncompressed, Progressive
+- ✅ Cache operations: SurfaceToCache, CacheToSurface
+- ✅ Surface operations: SolidFill, SurfaceToSurface
+- ✅ RDPDR disabled
+- ✅ Per-surface buffer architecture
+- ✅ Thread-safe frame buffer access with locking
+- ✅ Atomic dirty rect read-clear (no race conditions)
+- ✅ GFX/GDI separation (pure GFX mode, no GDI buffer access in GFX callbacks)
+- ✅ Resize stability (no crash on resize)
+- ✅ H.264 (AVC420/AVC444) streaming to browser WebCodecs
+- ✅ AVC444→AVC420 transcoding via FFmpeg
+
+---
+
+## Architecture Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        RDP Server                               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ RDPEGFX Channel
+┌─────────────────────────────────────────────────────────────────┐
+│                    rdp_bridge.c (C Layer)                       │
+│                                                                 │
+│  GFX Callbacks:                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
+│  │ SolidFill    │  │ CacheToSurf  │  │ Progressive  │  ...      │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘           │
+│         │                 │                 │                   │
+│         ▼                 ▼                 ▼                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │              surface_buffers[surfaceId]                  │   │
+│  │              (per-surface BGRA32 buffers)                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │              dirty_rects[] + needs_full_frame            │   │
+│  │              (protected by rect_mutex)                   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ ctypes API (with gfx_mutex locking)
+┌─────────────────────────────────────────────────────────────────┐
+│                   rdp_bridge.py (Python Layer)                  │
+│                                                                 │
+│  rdp_lock_frame_buffer()                                        │
+│  rdp_get_frame_buffer() → surface_buffers[primary_surface_id]   │
+│  rdp_get_dirty_rects() → atomic read + clear                    │
+│  rdp_unlock_frame_buffer()                                      │
+│                                                                 │
+│  Encode to WebP/H.264 → WebSocket                               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ WebSocket
+┌─────────────────────────────────────────────────────────────────┐
+│                     Browser (JavaScript)                        │
+│                                                                 │
+│  WebP → Canvas 2D                                               │
+│  H.264 → WebCodecs VideoDecoder → Canvas 2D                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Design Principles
+
+1. **GFX callbacks ONLY write to `surface_buffers[]`**
+2. **`gdi->primary_buffer` is NEVER accessed in GFX mode**
+3. **Dirty rects are read-and-cleared atomically**
+4. **Frame buffer access is protected by `gfx_mutex`**
+5. **Transcoder is reset on resize before new frames arrive**

@@ -836,12 +836,8 @@ static void maybe_init_gfx_pipeline(BridgeContext* bctx)
         return;
     }
     
-    fprintf(stderr, "[rdp_bridge] Initializing PURE GFX pipeline (no GDI chaining)\n");
-    
     /* Check if FreeRDP set up the FrameAcknowledge callback */
-    if (gfx->FrameAcknowledge) {
-        fprintf(stderr, "[rdp_bridge] FrameAcknowledge callback is set by FreeRDP\n");
-    } else {
+    if (!gfx->FrameAcknowledge) {
         fprintf(stderr, "[rdp_bridge] WARNING: FrameAcknowledge callback is NULL - acks won't be sent!\n");
     }
     
@@ -866,7 +862,6 @@ static void maybe_init_gfx_pipeline(BridgeContext* bctx)
     pthread_mutex_unlock(&bctx->gfx_mutex);
     
     /* GFX callbacks are already set in bridge_on_channel_connected */
-    fprintf(stderr, "[rdp_bridge] Pure GFX pipeline ready (surfaces managed internally)\n");
 }
 
 /* ============================================================================
@@ -976,10 +971,53 @@ int rdp_poll(RdpSession* session, int timeout_ms)
     return has_update;
 }
 
+/* Lock the frame buffer to prevent reallocation during read.
+ * MUST call rdp_unlock_frame_buffer() after reading!
+ * For high-performance direct buffer access. */
+void rdp_lock_frame_buffer(RdpSession* session)
+{
+    if (!session) return;
+    BridgeContext* ctx = (BridgeContext*)session;
+    pthread_mutex_lock(&ctx->gfx_mutex);
+}
+
+/* Unlock the frame buffer after reading */
+void rdp_unlock_frame_buffer(RdpSession* session)
+{
+    if (!session) return;
+    BridgeContext* ctx = (BridgeContext*)session;
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+}
+
+/* Get frame buffer pointer - CALLER MUST hold lock via rdp_lock_frame_buffer()! */
 uint8_t* rdp_get_frame_buffer(RdpSession* session, int* width, int* height, int* stride)
 {
     if (!session) return NULL;
     
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    /* In pure GFX mode, use the GFX surface buffer directly */
+    if (ctx->gfx_active) {
+        uint16_t primary_id = ctx->primary_surface_id;
+        
+        if (primary_id < RDP_MAX_GFX_SURFACES && 
+            ctx->surfaces[primary_id].active &&
+            ctx->surface_buffers[primary_id]) {
+            
+            uint32_t w = ctx->surfaces[primary_id].width;
+            uint32_t h = ctx->surfaces[primary_id].height;
+            uint8_t* buf = ctx->surface_buffers[primary_id];
+            
+            if (width) *width = w;
+            if (height) *height = h;
+            if (stride) *stride = w * 4;  /* BGRA32, no padding */
+            
+            return buf;
+        }
+        return NULL;
+    }
+    
+    /* Fallback to GDI for non-GFX mode */
     rdpContext* context = (rdpContext*)session;
     rdpGdi* gdi = context->gdi;
     
@@ -1387,8 +1425,6 @@ static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventAr
             gfx->EvictCacheEntry = gfx_on_evict_cache;
             gfx->DeleteEncodingContext = gfx_on_delete_encoding_context;
             gfx->CacheImportReply = gfx_on_cache_import_reply;
-            
-            fprintf(stderr, "[rdp_bridge] GFX channel connected, all callbacks registered\n");
         }
     }
 }
@@ -1645,7 +1681,6 @@ static bool init_transcoder(BridgeContext* ctx, int width, int height)
     }
     
     ctx->transcoder_initialized = true;
-    fprintf(stderr, "[rdp_bridge] AVC444 transcoder initialized (%dx%d)\n", width, height);
     return true;
     
 fail:
@@ -1741,6 +1776,22 @@ static bool transcode_avc444(BridgeContext* ctx,
     AVFrame* luma = ctx->decoded_frame_luma;
     AVFrame* combined = ctx->combined_frame;
     
+    /* Safety check: ensure decoded frame fits in our pre-allocated buffers.
+     * If the frame dimensions changed (e.g., after resize), we need to bail out
+     * rather than cause a buffer overflow. The transcoder should be reset on resize. */
+    if (luma->width > combined->width || luma->height > combined->height) {
+        fprintf(stderr, "[rdp_bridge] Transcoder dimension mismatch: decoded=%dx%d, buffer=%dx%d\n",
+                luma->width, luma->height, combined->width, combined->height);
+        /* Pass through luma data as-is rather than crash */
+        *out_data = malloc(luma_size);
+        if (*out_data) {
+            memcpy(*out_data, luma_data, luma_size);
+            *out_size = luma_size;
+            return true;
+        }
+        return false;
+    }
+    
     /* Copy Y plane from luma frame */
     for (int y = 0; y < luma->height; y++) {
         memcpy(combined->data[0] + y * combined->linesize[0],
@@ -1752,18 +1803,30 @@ static bool transcode_avc444(BridgeContext* ctx,
         /* AVC444: Use decoded chroma for U/V at full resolution */
         AVFrame* chroma = ctx->decoded_frame_chroma;
         
-        /* The chroma stream contains U and V at full resolution */
-        for (int y = 0; y < chroma->height; y++) {
-            /* Copy U plane */
-            memcpy(combined->data[1] + y * combined->linesize[1],
-                   chroma->data[1] + y * chroma->linesize[1],
-                   chroma->width);
-            /* Copy V plane */
-            memcpy(combined->data[2] + y * combined->linesize[2],
-                   chroma->data[2] + y * chroma->linesize[2],
-                   chroma->width);
+        /* Safety check for chroma dimensions */
+        if (chroma->width > combined->width || chroma->height > combined->height) {
+            fprintf(stderr, "[rdp_bridge] Chroma dimension mismatch: %dx%d vs %dx%d\n",
+                    chroma->width, chroma->height, combined->width, combined->height);
+            /* Skip chroma copy, use luma-only fallback below */
+            got_chroma = false;
         }
-    } else {
+        
+        if (got_chroma) {
+            /* The chroma stream contains U and V at full resolution */
+            for (int y = 0; y < chroma->height; y++) {
+                /* Copy U plane */
+                memcpy(combined->data[1] + y * combined->linesize[1],
+                       chroma->data[1] + y * chroma->linesize[1],
+                       chroma->width);
+                /* Copy V plane */
+                memcpy(combined->data[2] + y * combined->linesize[2],
+                       chroma->data[2] + y * chroma->linesize[2],
+                       chroma->width);
+            }
+        }
+    }
+    
+    if (!got_chroma) {
         /* No chroma: upscale 4:2:0 chroma from luma frame to 4:4:4 */
         for (int y = 0; y < luma->height; y++) {
             for (int x = 0; x < luma->width; x++) {
@@ -1850,26 +1913,6 @@ static UINT gfx_on_caps_confirm(RdpgfxClientContext* context, const RDPGFX_CAPS_
         case RDPGFX_CAPVERSION_107:  version_str = "10.7"; break;
     }
     
-    fprintf(stderr, "[rdp_bridge] GFX Caps confirmed: version=%s (0x%08X) flags=0x%08X\n",
-            version_str, version, flags);
-    
-    /* Decode flags for debugging */
-    bool avc_disabled = (flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) != 0;
-    bool avc420_enabled = (flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) != 0;
-    bool small_cache = (flags & RDPGFX_CAPS_FLAG_SMALL_CACHE) != 0;
-    bool thin_client = (flags & RDPGFX_CAPS_FLAG_THINCLIENT) != 0;
-    
-    fprintf(stderr, "[rdp_bridge] GFX Capabilities: AVC_DISABLED=%d, AVC420_ENABLED=%d, SMALL_CACHE=%d, THINCLIENT=%d\n",
-            avc_disabled, avc420_enabled, small_cache, thin_client);
-    
-    if (!avc_disabled && version >= RDPGFX_CAPVERSION_10) {
-        fprintf(stderr, "[rdp_bridge] ✓ H.264/AVC444 negotiated successfully (version >= 10.0, AVC not disabled)\n");
-    } else if (avc420_enabled && version == RDPGFX_CAPVERSION_81) {
-        fprintf(stderr, "[rdp_bridge] ✓ H.264/AVC420 negotiated successfully (version 8.1 with AVC420)\n");
-    } else {
-        fprintf(stderr, "[rdp_bridge] ✗ H.264 NOT negotiated - falling back to Progressive/Clearcodec\n");
-    }
-    
     return CHANNEL_RC_OK;
 }
 
@@ -1879,7 +1922,14 @@ static UINT gfx_on_reset_graphics(RdpgfxClientContext* context, const RDPGFX_RES
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
     
-    fprintf(stderr, "[rdp_bridge] GFX Reset: %ux%u\n", reset->width, reset->height);
+    /* Reset the AVC444 transcoder on resize.
+     * The transcoder's encoder/frames are sized for the original resolution.
+     * If we resize to a larger resolution, the new decoded frames will overflow
+     * the transcoder's internal buffers, causing a crash.
+     * Cleaning up here allows re-initialization with new dimensions. */
+    if (bctx->transcoder_initialized) {
+        cleanup_transcoder(bctx);
+    }
     
     /* NOTE: ClearCodec decoder is session-level and should NOT be reset here.
      * Its internal caches (VBar, ShortVBar, Glyph) build up over the session
@@ -1902,15 +1952,9 @@ static UINT gfx_on_reset_graphics(RdpgfxClientContext* context, const RDPGFX_RES
     /* NOTE: Do NOT clear gfx_cache here! The bitmap cache persists across
      * surface resets. Server will continue to reference cached entries. */
     
-    /* Clear primary_buffer to black BEFORE setting needs_full_frame.
-     * This prevents sending stale content from the previous surface layout.
-     * The old surface content is no longer valid after reset. */
-    rdpGdi* gdi = bctx->gdi;
-    if (gdi && gdi->primary_buffer) {
-        memset(gdi->primary_buffer, 0, gdi->stride * gdi->height);
-        fprintf(stderr, "[rdp_bridge] GFX Reset: Cleared primary_buffer (%dx%d)\n", 
-                gdi->width, gdi->height);
-    }
+    /* PURE GFX MODE: Do NOT touch gdi->primary_buffer.
+     * We only use surface_buffers[] which are managed via CreateSurface/DeleteSurface.
+     * The server will send fresh content to the new surface. */
     
     /* Update frame dimensions.
      * NOTE: Do NOT set needs_full_frame here! The buffer is now cleared (black),
@@ -1933,9 +1977,6 @@ static UINT gfx_on_create_surface(RdpgfxClientContext* context, const RDPGFX_CRE
     /* PURE GFX MODE: Track surfaces ourselves, no GDI chaining */
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
-    
-    fprintf(stderr, "[rdp_bridge] GFX CreateSurface: id=%u %ux%u format=0x%X\n",
-            create->surfaceId, create->width, create->height, create->pixelFormat);
     
     pthread_mutex_lock(&bctx->gfx_mutex);
     
@@ -1979,8 +2020,6 @@ static UINT gfx_on_delete_surface(RdpgfxClientContext* context, const RDPGFX_DEL
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
     
-    fprintf(stderr, "[rdp_bridge] GFX DeleteSurface: id=%u\n", del->surfaceId);
-    
     /* NOTE: ClearCodec decoder is session-level and should NOT be reset on surface delete. */
     
     pthread_mutex_lock(&bctx->gfx_mutex);
@@ -2014,9 +2053,6 @@ static UINT gfx_on_map_surface(RdpgfxClientContext* context, const RDPGFX_MAP_SU
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
     
-    fprintf(stderr, "[rdp_bridge] GFX MapSurface: id=%u -> output (%d, %d)\n",
-            map->surfaceId, map->outputOriginX, map->outputOriginY);
-    
     pthread_mutex_lock(&bctx->gfx_mutex);
     
     if (map->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[map->surfaceId].active) {
@@ -2024,7 +2060,6 @@ static UINT gfx_on_map_surface(RdpgfxClientContext* context, const RDPGFX_MAP_SU
         bctx->surfaces[map->surfaceId].output_x = map->outputOriginX;
         bctx->surfaces[map->surfaceId].output_y = map->outputOriginY;
         bctx->primary_surface_id = map->surfaceId;
-        fprintf(stderr, "[rdp_bridge] Surface %u mapped as primary output surface\n", map->surfaceId);
     }
     
     pthread_mutex_unlock(&bctx->gfx_mutex);
@@ -2038,10 +2073,6 @@ static UINT gfx_on_map_surface_scaled(RdpgfxClientContext* context,
 {
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
-    
-    fprintf(stderr, "[rdp_bridge] GFX MapSurfaceScaled: id=%u -> output (%d, %d) target=%ux%u\n",
-            map->surfaceId, map->outputOriginX, map->outputOriginY, 
-            map->targetWidth, map->targetHeight);
     
     pthread_mutex_lock(&bctx->gfx_mutex);
     if (map->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[map->surfaceId].active) {
@@ -2060,8 +2091,6 @@ static UINT gfx_on_map_surface_window(RdpgfxClientContext* context,
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
     
-    fprintf(stderr, "[rdp_bridge] GFX MapSurfaceWindow: surface=%u window=%llu\n",
-            map->surfaceId, (unsigned long long)map->windowId);
     return CHANNEL_RC_OK;
 }
 
@@ -2071,8 +2100,6 @@ static UINT gfx_on_map_surface_scaled_window(RdpgfxClientContext* context,
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
     
-    fprintf(stderr, "[rdp_bridge] GFX MapSurfaceScaledWindow: surface=%u window=%llu\n",
-            map->surfaceId, (unsigned long long)map->windowId);
     return CHANNEL_RC_OK;
 }
 
@@ -2084,22 +2111,23 @@ static UINT gfx_on_solid_fill(RdpgfxClientContext* context, const RDPGFX_SOLID_F
     /* Track commands in this frame */
     bctx->frame_cmd_count++;
     
-    pthread_mutex_lock(&bctx->gfx_mutex);
-    rdpGdi* gdi = bctx->gdi;
-    pthread_mutex_unlock(&bctx->gfx_mutex);
+    /* PURE GFX MODE: Only write to surface_buffers[], never gdi->primary_buffer */
     
-    if (!gdi || !gdi->primary_buffer) {
-        pthread_mutex_lock(&bctx->rect_mutex);
-        bctx->needs_full_frame = true;
-        pthread_mutex_unlock(&bctx->rect_mutex);
+    /* Validate surface */
+    if (fill->surfaceId >= RDP_MAX_GFX_SURFACES || !bctx->surfaces[fill->surfaceId].active) {
         return CHANNEL_RC_OK;
     }
     
-    /* Get surface output offset */
-    int32_t offsetX = 0, offsetY = 0;
-    if (fill->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[fill->surfaceId].active) {
-        offsetX = bctx->surfaces[fill->surfaceId].output_x;
-        offsetY = bctx->surfaces[fill->surfaceId].output_y;
+    pthread_mutex_lock(&bctx->gfx_mutex);
+    uint8_t* surfBuf = bctx->surface_buffers[fill->surfaceId];
+    UINT32 surfW = bctx->surfaces[fill->surfaceId].width;
+    UINT32 surfH = bctx->surfaces[fill->surfaceId].height;
+    int32_t offsetX = bctx->surfaces[fill->surfaceId].output_x;
+    int32_t offsetY = bctx->surfaces[fill->surfaceId].output_y;
+    pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    if (!surfBuf || surfW == 0 || surfH == 0) {
+        return CHANNEL_RC_OK;
     }
     
     /* Build BGRA32 color */
@@ -2108,95 +2136,37 @@ static UINT gfx_on_solid_fill(RdpgfxClientContext* context, const RDPGFX_SOLID_F
                      (fill->fillPixel.R << 16) | 
                      (fill->fillPixel.XA << 24);
     
-    static int fill_logs = 0;
-    /* Log black fills specifically */
-    if ((color & 0x00FFFFFF) == 0x00000000) {
-        static int black_fill_logs = 0;
-        if (black_fill_logs < 20) {
-            fprintf(stderr, "[rdp_bridge] BLACK_TILE: SolidFill with BLACK surface=%u fillCount=%u\n",
-                    fill->surfaceId, fill->fillRectCount);
-            for (UINT16 j = 0; j < fill->fillRectCount && j < 3; j++) {
-                fprintf(stderr, "   rect[%u]: (%u,%u)-(%u,%u)\n", j,
-                        fill->fillRects[j].left, fill->fillRects[j].top,
-                        fill->fillRects[j].right, fill->fillRects[j].bottom);
-            }
-            black_fill_logs++;
-        }
-    }
-    if (fill_logs < 5) {
-        fprintf(stderr, "[rdp_bridge] GFX SolidFill: surface=%u color=0x%08X fillCount=%u\n",
-                fill->surfaceId, color, fill->fillRectCount);
-        fill_logs++;
-    }
+    UINT32 surfStride = surfW * 4;
     
-    /* Fill each rectangle */
+    /* Fill each rectangle in surface buffer */
     for (UINT16 i = 0; i < fill->fillRectCount; i++) {
-        /* Surface-local coordinates */
         UINT32 surfLeft = fill->fillRects[i].left;
         UINT32 surfTop = fill->fillRects[i].top;
         UINT32 surfRight = fill->fillRects[i].right;
         UINT32 surfBottom = fill->fillRects[i].bottom;
         
-        /* Get surface buffer */
-        uint8_t* surfBuf = NULL;
-        UINT32 surfW = 0, surfH = 0;
-        if (fill->surfaceId < RDP_MAX_GFX_SURFACES && bctx->surfaces[fill->surfaceId].active) {
-            surfBuf = bctx->surface_buffers[fill->surfaceId];
-            surfW = bctx->surfaces[fill->surfaceId].width;
-            surfH = bctx->surfaces[fill->surfaceId].height;
-        }
+        /* Clamp to surface bounds */
+        if (surfRight > surfW) surfRight = surfW;
+        if (surfBottom > surfH) surfBottom = surfH;
+        if (surfLeft >= surfRight || surfTop >= surfBottom) continue;
         
-        /* Fill surface buffer first (for SurfaceToCache to work) */
-        if (surfBuf && surfW > 0 && surfH > 0) {
-            UINT32 clampRight = (surfRight > surfW) ? surfW : surfRight;
-            UINT32 clampBottom = (surfBottom > surfH) ? surfH : surfBottom;
-            if (surfLeft < clampRight && surfTop < clampBottom) {
-                UINT32 surfStride = surfW * 4;
-                for (UINT32 y = surfTop; y < clampBottom; y++) {
-                    uint32_t* row = (uint32_t*)(surfBuf + y * surfStride + surfLeft * 4);
-                    for (UINT32 x = 0; x < (clampRight - surfLeft); x++) {
-                        row[x] = color;
-                    }
-                }
-            }
-        }
-        
-        /* Now fill primary buffer with output offset */
-        UINT32 left = surfLeft + offsetX;
-        UINT32 top = surfTop + offsetY;
-        UINT32 right = surfRight + offsetX;
-        UINT32 bottom = surfBottom + offsetY;
-        
-        /* Clamp to buffer bounds */
-        if (right > (UINT32)gdi->width) right = gdi->width;
-        if (bottom > (UINT32)gdi->height) bottom = gdi->height;
-        if (left >= right || top >= bottom) continue;
-        
-        UINT32 width = right - left;
-        
-        /* Fill row by row */
-        for (UINT32 y = top; y < bottom; y++) {
-            uint32_t* row = (uint32_t*)(gdi->primary_buffer + y * gdi->stride + left * 4);
-            for (UINT32 x = 0; x < width; x++) {
+        /* Fill surface buffer */
+        for (UINT32 y = surfTop; y < surfBottom; y++) {
+            uint32_t* row = (uint32_t*)(surfBuf + y * surfStride + surfLeft * 4);
+            for (UINT32 x = 0; x < (surfRight - surfLeft); x++) {
                 row[x] = color;
             }
         }
         
-        /* Mark dirty rect */
+        /* Mark dirty rect (with output offset for screen coords) */
         pthread_mutex_lock(&bctx->rect_mutex);
         if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
-            bctx->dirty_rects[bctx->dirty_rect_count].x = left;
-            bctx->dirty_rects[bctx->dirty_rect_count].y = top;
-            bctx->dirty_rects[bctx->dirty_rect_count].width = right - left;
-            bctx->dirty_rects[bctx->dirty_rect_count].height = bottom - top;
+            bctx->dirty_rects[bctx->dirty_rect_count].x = surfLeft + offsetX;
+            bctx->dirty_rects[bctx->dirty_rect_count].y = surfTop + offsetY;
+            bctx->dirty_rects[bctx->dirty_rect_count].width = surfRight - surfLeft;
+            bctx->dirty_rects[bctx->dirty_rect_count].height = surfBottom - surfTop;
             bctx->dirty_rect_count++;
         } else {
-            /* Dirty rect overflow - fall back to full frame */
-            static int overflow_logs = 0;
-            if (overflow_logs < 5) {
-                fprintf(stderr, "[rdp_bridge] WARNING: Dirty rect overflow in SolidFill, requesting full frame\n");
-                overflow_logs++;
-            }
             bctx->needs_full_frame = true;
         }
         pthread_mutex_unlock(&bctx->rect_mutex);
@@ -2214,46 +2184,34 @@ static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context,
     /* Track commands in this frame */
     bctx->frame_cmd_count++;
     
+    /* PURE GFX MODE: Only work with surface_buffers[], never gdi->primary_buffer */
+    
     pthread_mutex_lock(&bctx->gfx_mutex);
-    rdpGdi* gdi = bctx->gdi;
-    pthread_mutex_unlock(&bctx->gfx_mutex);
     
     /* Get source surface info */
     uint8_t* srcSurfBuf = NULL;
     UINT32 srcSurfW = 0, srcSurfH = 0;
-    bool srcMapped = false;
-    INT32 srcOutX = 0, srcOutY = 0;
     
     if (copy->surfaceIdSrc < RDP_MAX_GFX_SURFACES && bctx->surfaces[copy->surfaceIdSrc].active) {
         srcSurfBuf = bctx->surface_buffers[copy->surfaceIdSrc];
         srcSurfW = bctx->surfaces[copy->surfaceIdSrc].width;
         srcSurfH = bctx->surfaces[copy->surfaceIdSrc].height;
-        srcMapped = bctx->surfaces[copy->surfaceIdSrc].mapped_to_output;
-        srcOutX = bctx->surfaces[copy->surfaceIdSrc].output_x;
-        srcOutY = bctx->surfaces[copy->surfaceIdSrc].output_y;
     }
     
     /* Get dest surface info */
     uint8_t* dstSurfBuf = NULL;
     UINT32 dstSurfW = 0, dstSurfH = 0;
-    bool dstMapped = false;
     INT32 dstOutX = 0, dstOutY = 0;
     
     if (copy->surfaceIdDest < RDP_MAX_GFX_SURFACES && bctx->surfaces[copy->surfaceIdDest].active) {
         dstSurfBuf = bctx->surface_buffers[copy->surfaceIdDest];
         dstSurfW = bctx->surfaces[copy->surfaceIdDest].width;
         dstSurfH = bctx->surfaces[copy->surfaceIdDest].height;
-        dstMapped = bctx->surfaces[copy->surfaceIdDest].mapped_to_output;
         dstOutX = bctx->surfaces[copy->surfaceIdDest].output_x;
         dstOutY = bctx->surfaces[copy->surfaceIdDest].output_y;
     }
     
-    static int copy_logs = 0;
-    if (copy_logs < 5) {
-        fprintf(stderr, "[rdp_bridge] GFX SurfaceToSurface: src=%u dst=%u rects=%u\n",
-                copy->surfaceIdSrc, copy->surfaceIdDest, copy->destPtsCount);
-        copy_logs++;
-    }
+    pthread_mutex_unlock(&bctx->gfx_mutex);
     
     /* Source rectangle (surface-local coords) */
     INT32 srcLeft = copy->rectSrc.left;
@@ -2261,13 +2219,13 @@ static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context,
     INT32 width = copy->rectSrc.right - copy->rectSrc.left;
     INT32 height = copy->rectSrc.bottom - copy->rectSrc.top;
     
-    if (width <= 0 || height <= 0) return CHANNEL_RC_OK;
+    if (width <= 0 || height <= 0 || !srcSurfBuf || !dstSurfBuf) return CHANNEL_RC_OK;
     
     /* For overlapping copies within same surface, need temp buffer */
     uint8_t* tempBuf = NULL;
     bool needTemp = (copy->surfaceIdSrc == copy->surfaceIdDest);
     
-    if (needTemp && srcSurfBuf && srcSurfW > 0) {
+    if (needTemp && srcSurfW > 0) {
         size_t tempSize = width * height * 4;
         tempBuf = (uint8_t*)malloc(tempSize);
         if (tempBuf) {
@@ -2285,92 +2243,52 @@ static UINT gfx_on_surface_to_surface(RdpgfxClientContext* context,
         }
     }
     
-    /* Copy to each destination point */
+    UINT32 dstStride = dstSurfW * 4;
+    
+    /* Copy to each destination point in dest surface buffer */
     for (UINT16 i = 0; i < copy->destPtsCount; i++) {
         INT32 dstLeft = copy->destPts[i].x;
         INT32 dstTop = copy->destPts[i].y;
         
-        /* Copy within surface buffer first */
-        if (dstSurfBuf && dstSurfW > 0 && dstSurfH > 0) {
-            UINT32 dstStride = dstSurfW * 4;
-            for (INT32 y = 0; y < height; y++) {
-                INT32 sy = srcTop + y;
-                INT32 dy = dstTop + y;
-                if (dy < 0 || dy >= (INT32)dstSurfH) continue;
-                if (!tempBuf && (sy < 0 || sy >= (INT32)srcSurfH)) continue;
-                
-                uint8_t* src;
-                if (tempBuf) {
-                    src = tempBuf + y * width * 4;
-                } else if (srcSurfBuf) {
-                    src = srcSurfBuf + sy * (srcSurfW * 4) + srcLeft * 4;
-                } else {
-                    continue;
-                }
-                
-                INT32 copyW = width;
-                INT32 dstX = dstLeft;
-                if (dstX < 0) { src -= dstX * 4; copyW += dstX; dstX = 0; }
-                if (dstX + copyW > (INT32)dstSurfW) copyW = dstSurfW - dstX;
-                if (copyW > 0) {
-                    uint8_t* dst = dstSurfBuf + dy * dstStride + dstX * 4;
-                    memcpy(dst, src, copyW * 4);
-                }
+        for (INT32 y = 0; y < height; y++) {
+            INT32 sy = srcTop + y;
+            INT32 dy = dstTop + y;
+            if (dy < 0 || dy >= (INT32)dstSurfH) continue;
+            if (!tempBuf && (sy < 0 || sy >= (INT32)srcSurfH)) continue;
+            
+            uint8_t* src;
+            if (tempBuf) {
+                src = tempBuf + y * width * 4;
+            } else {
+                src = srcSurfBuf + sy * (srcSurfW * 4) + srcLeft * 4;
+            }
+            
+            INT32 copyW = width;
+            INT32 dstX = dstLeft;
+            if (dstX < 0) { src -= dstX * 4; copyW += dstX; dstX = 0; }
+            if (dstX + copyW > (INT32)dstSurfW) copyW = dstSurfW - dstX;
+            if (copyW > 0) {
+                uint8_t* dst = dstSurfBuf + dy * dstStride + dstX * 4;
+                memcpy(dst, src, copyW * 4);
             }
         }
         
-        /* Also copy to primary_buffer if dest surface is mapped */
-        if (dstMapped && gdi && gdi->primary_buffer) {
-            INT32 primDstLeft = dstLeft + dstOutX;
-            INT32 primDstTop = dstTop + dstOutY;
-            
-            for (INT32 y = 0; y < height; y++) {
-                INT32 sy = srcTop + y;
-                INT32 dy = primDstTop + y;
-                if (dy < 0 || dy >= gdi->height) continue;
-                
-                uint8_t* src;
-                if (tempBuf) {
-                    src = tempBuf + y * width * 4;
-                } else if (srcSurfBuf && srcSurfW > 0 && sy >= 0 && sy < (INT32)srcSurfH) {
-                    src = srcSurfBuf + sy * (srcSurfW * 4) + srcLeft * 4;
-                } else {
-                    continue;
-                }
-                
-                INT32 copyW = width;
-                INT32 dstX = primDstLeft;
-                if (dstX < 0) { src -= dstX * 4; copyW += dstX; dstX = 0; }
-                if (dstX + copyW > gdi->width) copyW = gdi->width - dstX;
-                if (copyW > 0) {
-                    uint8_t* dst = gdi->primary_buffer + dy * gdi->stride + dstX * 4;
-                    memcpy(dst, src, copyW * 4);
-                }
-            }
-            
-            /* Mark dirty rect */
-            pthread_mutex_lock(&bctx->rect_mutex);
-            if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
-                INT32 dirtyX = (primDstLeft < 0) ? 0 : primDstLeft;
-                INT32 dirtyY = (primDstTop < 0) ? 0 : primDstTop;
-                INT32 dirtyW = width;
-                INT32 dirtyH = height;
-                if (primDstLeft < 0) dirtyW += primDstLeft;
-                if (primDstTop < 0) dirtyH += primDstTop;
-                if (dirtyX + dirtyW > gdi->width) dirtyW = gdi->width - dirtyX;
-                if (dirtyY + dirtyH > gdi->height) dirtyH = gdi->height - dirtyY;
-                if (dirtyW > 0 && dirtyH > 0) {
-                    bctx->dirty_rects[bctx->dirty_rect_count].x = dirtyX;
-                    bctx->dirty_rects[bctx->dirty_rect_count].y = dirtyY;
-                    bctx->dirty_rects[bctx->dirty_rect_count].width = dirtyW;
-                    bctx->dirty_rects[bctx->dirty_rect_count].height = dirtyH;
-                    bctx->dirty_rect_count++;
-                }
-            } else {
-                bctx->needs_full_frame = true;
-            }
-            pthread_mutex_unlock(&bctx->rect_mutex);
+        /* Mark dirty rect (with output offset for screen coords) */
+        pthread_mutex_lock(&bctx->rect_mutex);
+        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+            INT32 dirtyX = dstLeft + dstOutX;
+            INT32 dirtyY = dstTop + dstOutY;
+            if (dirtyX < 0) dirtyX = 0;
+            if (dirtyY < 0) dirtyY = 0;
+            bctx->dirty_rects[bctx->dirty_rect_count].x = dirtyX;
+            bctx->dirty_rects[bctx->dirty_rect_count].y = dirtyY;
+            bctx->dirty_rects[bctx->dirty_rect_count].width = width;
+            bctx->dirty_rects[bctx->dirty_rect_count].height = height;
+            bctx->dirty_rect_count++;
+        } else {
+            bctx->needs_full_frame = true;
         }
+        pthread_mutex_unlock(&bctx->rect_mutex);
     }
     
     if (tempBuf) free(tempBuf);
@@ -2412,18 +2330,6 @@ static UINT gfx_on_surface_to_cache(RdpgfxClientContext* context,
     INT32 top = cache->rectSrc.top;
     UINT32 width = cache->rectSrc.right - cache->rectSrc.left;
     UINT32 height = cache->rectSrc.bottom - cache->rectSrc.top;
-    
-#if DEBUG_GFX_CACHE
-    fprintf(stderr, "[rdp_bridge] GFX SurfaceToCache: surface=%u slot=%u (%ux%u) at (%d,%d) surfDim=%ux%u\n",
-            cache->surfaceId, cache->cacheSlot, width, height, left, top, surfWidth, surfHeight);
-#else
-    static int cache_logs = 0;
-    if (cache_logs < 10) {
-        fprintf(stderr, "[rdp_bridge] GFX SurfaceToCache: surface=%u slot=%u (%ux%u) at (%d,%d)\n",
-                cache->surfaceId, cache->cacheSlot, width, height, left, top);
-        cache_logs++;
-    }
-#endif
     
     /* Validate cache slot */
     if (cache->cacheSlot >= (UINT64)bctx->gfx_cache_size) {
@@ -2476,22 +2382,14 @@ static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context,
     /* Track commands in this frame */
     bctx->frame_cmd_count++;
     
-    pthread_mutex_lock(&bctx->gfx_mutex);
-    rdpGdi* gdi = bctx->gdi;
-    pthread_mutex_unlock(&bctx->gfx_mutex);
+    /* PURE GFX MODE: Only write to surface_buffers[], never gdi->primary_buffer */
     
-    if (!gdi || !gdi->primary_buffer || !bctx->gfx_cache) {
-        pthread_mutex_lock(&bctx->rect_mutex);
-        bctx->needs_full_frame = true;
-        pthread_mutex_unlock(&bctx->rect_mutex);
+    if (!bctx->gfx_cache) {
         return CHANNEL_RC_OK;
     }
     
     /* Validate cache slot */
     if (cache->cacheSlot >= (UINT64)bctx->gfx_cache_size) {
-        pthread_mutex_lock(&bctx->rect_mutex);
-        bctx->needs_full_frame = true;
-        pthread_mutex_unlock(&bctx->rect_mutex);
         return CHANNEL_RC_OK;
     }
     
@@ -2516,25 +2414,7 @@ static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context,
         offsetY = bctx->surfaces[cache->surfaceId].output_y;
     }
     
-#if DEBUG_GFX_CACHE
-    fprintf(stderr, "[rdp_bridge] GFX CacheToSurface: slot=%u surface=%u destPts=%u tileDim=%ux%u offset=(%d,%d)\n",
-            cache->cacheSlot, cache->surfaceId, cache->destPtsCount, 
-            entry->width, entry->height, offsetX, offsetY);
-    for (UINT16 d = 0; d < cache->destPtsCount; d++) {
-        fprintf(stderr, "   destPt[%u]: (%d,%d) -> screen=(%d,%d)\n", d,
-                cache->destPts[d].x, cache->destPts[d].y,
-                cache->destPts[d].x + offsetX, cache->destPts[d].y + offsetY);
-    }
-#else
-    static int cache_logs = 0;
-    if (cache_logs < 5) {
-        fprintf(stderr, "[rdp_bridge] GFX CacheToSurface: slot=%u surface=%u destPts=%u\n",
-                cache->cacheSlot, cache->surfaceId, cache->destPtsCount);
-        cache_logs++;
-    }
-#endif
-    
-    /* Copy cached bitmap to each destination point */
+    /* Copy cached bitmap to each destination point in surface buffer */
     for (UINT16 i = 0; i < cache->destPtsCount; i++) {
         /* Destination in surface-local coordinates */
         INT32 surfDstX = cache->destPts[i].x;
@@ -2549,64 +2429,41 @@ static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context,
             surfH = bctx->surfaces[cache->surfaceId].height;
         }
         
-        /* Write to surface buffer first (for SurfaceToCache consistency) */
-        if (surfBuf && surfW > 0 && surfH > 0) {
-            INT32 clampX = surfDstX;
-            INT32 clampY = surfDstY;
-            UINT32 copyW = entry->width;
-            UINT32 copyH = entry->height;
-            UINT32 srcOffX = 0, srcOffY = 0;
-            
-            if (clampX < 0) { srcOffX = -clampX; copyW += clampX; clampX = 0; }
-            if (clampY < 0) { srcOffY = -clampY; copyH += clampY; clampY = 0; }
-            if (clampX + (INT32)copyW > (INT32)surfW) copyW = surfW - clampX;
-            if (clampY + (INT32)copyH > (INT32)surfH) copyH = surfH - clampY;
-            
-            if (copyW > 0 && copyH > 0) {
-                UINT32 surfStride = surfW * 4;
-                for (UINT32 y = 0; y < copyH; y++) {
-                    uint8_t* src = entry->data + (srcOffY + y) * entry->width * 4 + srcOffX * 4;
-                    uint8_t* dst = surfBuf + (clampY + y) * surfStride + clampX * 4;
-                    memcpy(dst, src, copyW * 4);
-                }
+        if (!surfBuf || surfW == 0 || surfH == 0) continue;
+        
+        /* PURE GFX MODE: Only write to surface buffer */
+        INT32 clampX = surfDstX;
+        INT32 clampY = surfDstY;
+        UINT32 copyW = entry->width;
+        UINT32 copyH = entry->height;
+        UINT32 srcOffX = 0, srcOffY = 0;
+        
+        if (clampX < 0) { srcOffX = -clampX; copyW += clampX; clampX = 0; }
+        if (clampY < 0) { srcOffY = -clampY; copyH += clampY; clampY = 0; }
+        if (clampX + (INT32)copyW > (INT32)surfW) copyW = surfW - clampX;
+        if (clampY + (INT32)copyH > (INT32)surfH) copyH = surfH - clampY;
+        
+        if (copyW > 0 && copyH > 0) {
+            UINT32 surfStride = surfW * 4;
+            for (UINT32 y = 0; y < copyH; y++) {
+                uint8_t* src = entry->data + (srcOffY + y) * entry->width * 4 + srcOffX * 4;
+                uint8_t* dst = surfBuf + (clampY + y) * surfStride + clampX * 4;
+                memcpy(dst, src, copyW * 4);
             }
+            
+            /* Mark dirty rect (with output offset for screen coords) */
+            pthread_mutex_lock(&bctx->rect_mutex);
+            if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                bctx->dirty_rects[bctx->dirty_rect_count].x = clampX + offsetX;
+                bctx->dirty_rects[bctx->dirty_rect_count].y = clampY + offsetY;
+                bctx->dirty_rects[bctx->dirty_rect_count].width = copyW;
+                bctx->dirty_rects[bctx->dirty_rect_count].height = copyH;
+                bctx->dirty_rect_count++;
+            } else {
+                bctx->needs_full_frame = true;
+            }
+            pthread_mutex_unlock(&bctx->rect_mutex);
         }
-        
-        /* Now write to primary_buffer with output offset */
-        INT32 dstLeft = surfDstX + offsetX;
-        INT32 dstTop = surfDstY + offsetY;
-        
-        /* Clamp to buffer bounds */
-        UINT32 width = entry->width;
-        UINT32 height = entry->height;
-        UINT32 srcStartX = 0, srcStartY = 0;
-        
-        if (dstLeft < 0) { srcStartX = -dstLeft; width += dstLeft; dstLeft = 0; }
-        if (dstTop < 0) { srcStartY = -dstTop; height += dstTop; dstTop = 0; }
-        if (dstLeft + (INT32)width > gdi->width) width = gdi->width - dstLeft;
-        if (dstTop + (INT32)height > gdi->height) height = gdi->height - dstTop;
-        
-        if (width == 0 || height == 0) continue;
-        
-        /* Copy cached pixels to framebuffer */
-        for (UINT32 y = 0; y < height; y++) {
-            uint8_t* src = entry->data + (srcStartY + y) * entry->width * 4 + srcStartX * 4;
-            uint8_t* dst = gdi->primary_buffer + (dstTop + y) * gdi->stride + dstLeft * 4;
-            memcpy(dst, src, width * 4);
-        }
-        
-        /* Mark dirty rect */
-        pthread_mutex_lock(&bctx->rect_mutex);
-        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
-            bctx->dirty_rects[bctx->dirty_rect_count].x = dstLeft;
-            bctx->dirty_rects[bctx->dirty_rect_count].y = dstTop;
-            bctx->dirty_rects[bctx->dirty_rect_count].width = width;
-            bctx->dirty_rects[bctx->dirty_rect_count].height = height;
-            bctx->dirty_rect_count++;
-        } else {
-            bctx->needs_full_frame = true;
-        }
-        pthread_mutex_unlock(&bctx->rect_mutex);
     }
     
     return CHANNEL_RC_OK;
@@ -2624,11 +2481,6 @@ static UINT gfx_on_evict_cache(RdpgfxClientContext* context,
         /* Keep the buffer allocated for reuse */
     }
     
-    static int evict_logs = 0;
-    if (evict_logs < 3) {
-        fprintf(stderr, "[rdp_bridge] GFX EvictCache: slot=%u\n", evict->cacheSlot);
-        evict_logs++;
-    }
     return CHANNEL_RC_OK;
 }
 
@@ -2638,8 +2490,6 @@ static UINT gfx_on_delete_encoding_context(RdpgfxClientContext* context,
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx || !del) return ERROR_INVALID_PARAMETER;
     
-    fprintf(stderr, "[rdp_bridge] GFX DeleteEncodingContext: surface=%u context=%u\n",
-            del->surfaceId, del->codecContextId);
     return CHANNEL_RC_OK;
 }
 
@@ -2649,8 +2499,6 @@ static UINT gfx_on_cache_import_reply(RdpgfxClientContext* context,
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx || !reply) return ERROR_INVALID_PARAMETER;
     
-    fprintf(stderr, "[rdp_bridge] GFX CacheImportReply: importedEntries=%u\n",
-            reply->importedEntriesCount);
     return CHANNEL_RC_OK;
 }
 
@@ -2798,14 +2646,6 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
         return CHANNEL_RC_OK;
     }
     
-    /* Log codec for debugging */
-    static int logged_codecs = 0;
-    if (logged_codecs < 10) {
-        fprintf(stderr, "[rdp_bridge] GFX SurfaceCommand: codec=0x%04X surface=%u rect=(%d,%d,%d,%d)\n",
-                cmd->codecId, cmd->surfaceId, cmd->left, cmd->top, cmd->right, cmd->bottom);
-        logged_codecs++;
-    }
-    
     RdpRect rect = {
         .x = cmd->left,
         .y = cmd->top,
@@ -2935,56 +2775,27 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 break;
             }
             
-            /* Now copy to primary_buffer if surface is mapped */
-            pthread_mutex_lock(&bctx->gfx_mutex);
-            rdpGdi* gdi = bctx->gdi;
-            bool mapped = bctx->surfaces[cmd->surfaceId].mapped_to_output;
+            /* PURE GFX MODE: Mark dirty rect (data is already in surface buffer) */
             INT32 outX = bctx->surfaces[cmd->surfaceId].output_x;
             INT32 outY = bctx->surfaces[cmd->surfaceId].output_y;
-            pthread_mutex_unlock(&bctx->gfx_mutex);
             
-            if (mapped && gdi && gdi->primary_buffer && surfBuf) {
-                UINT32 dstX = surfX + outX;
-                UINT32 dstY = surfY + outY;
-                
-                /* Bounds check against primary buffer */
-                if (dstX + nWidth <= (UINT32)gdi->width && dstY + nHeight <= (UINT32)gdi->height) {
-                    /* Copy decoded pixels to primary buffer */
-                    for (UINT32 y = 0; y < nHeight; y++) {
-                        uint8_t* src = surfBuf + (surfY + y) * surfStride + surfX * 4;
-                        uint8_t* dst = gdi->primary_buffer + (dstY + y) * gdi->stride + dstX * 4;
-                        memcpy(dst, src, nWidth * 4);
-                    }
-                    
-                    /* Mark dirty rect */
-                    pthread_mutex_lock(&bctx->rect_mutex);
-                    if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
-                        bctx->dirty_rects[bctx->dirty_rect_count].x = dstX;
-                        bctx->dirty_rects[bctx->dirty_rect_count].y = dstY;
-                        bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
-                        bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
-                        bctx->dirty_rect_count++;
-                    } else {
-                        bctx->needs_full_frame = true;
-                    }
-                    pthread_mutex_unlock(&bctx->rect_mutex);
-                }
+            pthread_mutex_lock(&bctx->rect_mutex);
+            if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                bctx->dirty_rects[bctx->dirty_rect_count].x = surfX + outX;
+                bctx->dirty_rects[bctx->dirty_rect_count].y = surfY + outY;
+                bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
+                bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
+                bctx->dirty_rect_count++;
+            } else {
+                bctx->needs_full_frame = true;
             }
-            
-            static int clear_ok = 0;
-            if (clear_ok < 5) {
-                fprintf(stderr, "[rdp_bridge] ClearCodec decoded: surf[%u] (%u,%u) %ux%u\n",
-                        cmd->surfaceId, surfX, surfY, nWidth, nHeight);
-                clear_ok++;
-            }
+            pthread_mutex_unlock(&bctx->rect_mutex);
             break;
         }
         
-        /* UNCOMPRESSED: Raw BGRA pixels - copy to surface buffer first */
+        /* UNCOMPRESSED: Raw BGRA pixels - copy to surface buffer */
         case RDPGFX_CODECID_UNCOMPRESSED: {
-            pthread_mutex_lock(&bctx->gfx_mutex);
-            rdpGdi* gdi = bctx->gdi;
-            pthread_mutex_unlock(&bctx->gfx_mutex);
+            /* PURE GFX MODE: Only write to surface_buffers[] */
             
             if (!cmd->data) {
                 pthread_mutex_lock(&bctx->rect_mutex);
@@ -3000,21 +2811,17 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
             UINT32 nHeight = cmd->bottom - cmd->top;
             
             /* Get surface info */
-            bool mapped = false;
-            UINT32 dstX = 0, dstY = 0;
-            uint8_t* surfBuf = NULL;
-            UINT32 surfW = 0, surfH = 0;
-            
-            if (surfId < RDP_MAX_GFX_SURFACES) {
-                mapped = bctx->surfaces[surfId].mapped_to_output;
-                dstX = bctx->surfaces[surfId].output_x + surfX;
-                dstY = bctx->surfaces[surfId].output_y + surfY;
-                surfBuf = bctx->surface_buffers[surfId];
-                surfW = bctx->surfaces[surfId].width;
-                surfH = bctx->surfaces[surfId].height;
+            if (surfId >= RDP_MAX_GFX_SURFACES || !bctx->surfaces[surfId].active) {
+                break;
             }
             
-            /* Copy to surface buffer first */
+            uint8_t* surfBuf = bctx->surface_buffers[surfId];
+            UINT32 surfW = bctx->surfaces[surfId].width;
+            UINT32 surfH = bctx->surfaces[surfId].height;
+            INT32 outX = bctx->surfaces[surfId].output_x;
+            INT32 outY = bctx->surfaces[surfId].output_y;
+            
+            /* Copy to surface buffer */
             if (surfBuf && surfW > 0 && surfH > 0 &&
                 surfX + nWidth <= surfW && surfY + nHeight <= surfH) {
                 UINT32 srcStride = nWidth * 4;
@@ -3024,46 +2831,21 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                     BYTE* dst = surfBuf + (surfY + y) * surfStride + surfX * 4;
                     memcpy(dst, src, nWidth * 4);
                 }
-            } else {
-                static int uncomp_no_buf = 0;
-                if (uncomp_no_buf < 10) {
-                    fprintf(stderr, "[rdp_bridge] BLACK_TILE: UNCOMPRESSED no surface buffer for surf=%u\n", surfId);
-                    uncomp_no_buf++;
+                
+                /* Mark dirty rect */
+                pthread_mutex_lock(&bctx->rect_mutex);
+                if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                    bctx->dirty_rects[bctx->dirty_rect_count].x = surfX + outX;
+                    bctx->dirty_rects[bctx->dirty_rect_count].y = surfY + outY;
+                    bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
+                    bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
+                    bctx->dirty_rect_count++;
+                } else {
+                    bctx->needs_full_frame = true;
                 }
+                pthread_mutex_unlock(&bctx->rect_mutex);
             }
             
-            /* Copy to primary_buffer if mapped */
-            if (mapped && gdi && gdi->primary_buffer) {
-                /* Bounds check */
-                if (dstX + nWidth <= (UINT32)gdi->width && dstY + nHeight <= (UINT32)gdi->height) {
-                    UINT32 srcStride = nWidth * 4;
-                    for (UINT32 y = 0; y < nHeight; y++) {
-                        BYTE* src = cmd->data + y * srcStride;
-                        BYTE* dst = gdi->primary_buffer + (dstY + y) * gdi->stride + dstX * 4;
-                        memcpy(dst, src, nWidth * 4);
-                    }
-                    
-                    /* Mark dirty rect */
-                    pthread_mutex_lock(&bctx->rect_mutex);
-                    if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
-                        bctx->dirty_rects[bctx->dirty_rect_count].x = dstX;
-                        bctx->dirty_rects[bctx->dirty_rect_count].y = dstY;
-                        bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
-                        bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
-                        bctx->dirty_rect_count++;
-                    } else {
-                        bctx->needs_full_frame = true;
-                    }
-                    pthread_mutex_unlock(&bctx->rect_mutex);
-                }
-            }
-            
-            static int uncomp_ok = 0;
-            if (uncomp_ok < 5) {
-                fprintf(stderr, "[rdp_bridge] Uncompressed: surf=%u (%u,%u) %ux%u mapped=%d\n",
-                        surfId, surfX, surfY, nWidth, nHeight, mapped);
-                uncomp_ok++;
-            }
             break;
         }
         
@@ -3078,25 +2860,23 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 break;
             }
             
-            pthread_mutex_lock(&bctx->gfx_mutex);
-            rdpGdi* prog_gdi = bctx->gdi;
-            pthread_mutex_unlock(&bctx->gfx_mutex);
+            /* PURE GFX MODE: Only write to surface_buffers[] */
             
             UINT32 surfId = cmd->surfaceId;
             
             /* Get surface info */
-            bool mapped = false;
-            UINT32 outX = 0, outY = 0;
-            uint8_t* surfBuf = NULL;
-            UINT32 surfW = 0, surfH = 0;
+            if (surfId >= RDP_MAX_GFX_SURFACES || !bctx->surfaces[surfId].active) {
+                break;
+            }
             
-            if (surfId < RDP_MAX_GFX_SURFACES) {
-                mapped = bctx->surfaces[surfId].mapped_to_output;
-                outX = bctx->surfaces[surfId].output_x;
-                outY = bctx->surfaces[surfId].output_y;
-                surfBuf = bctx->surface_buffers[surfId];
-                surfW = bctx->surfaces[surfId].width;
-                surfH = bctx->surfaces[surfId].height;
+            uint8_t* surfBuf = bctx->surface_buffers[surfId];
+            UINT32 surfW = bctx->surfaces[surfId].width;
+            UINT32 surfH = bctx->surfaces[surfId].height;
+            INT32 outX = bctx->surfaces[surfId].output_x;
+            INT32 outY = bctx->surfaces[surfId].output_y;
+            
+            if (!surfBuf || surfW == 0 || surfH == 0) {
+                break;
             }
             
             /* Progressive codec uses Wire-To-Surface-2 PDU format:
@@ -3105,60 +2885,14 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
             REGION16 invalidRegion;
             region16_init(&invalidRegion);
             
-            INT32 rc = -1;
-            
-            /* Decode to surface buffer if available */
-            if (surfBuf && surfW > 0 && surfH > 0) {
-                UINT32 surfStride = surfW * 4;
-                rc = progressive_decompress(bctx->progressive_decoder,
-                    cmd->data, cmd->length,
-                    surfBuf, PIXEL_FORMAT_BGRA32,
-                    surfStride,
-                    0, 0,  /* nXDst, nYDst - decode to full buffer */
-                    &invalidRegion,
-                    cmd->surfaceId, bctx->current_frame_id);
-                
-                /* Copy invalidated regions to primary buffer if mapped */
-                if (rc >= 0 && mapped && prog_gdi && prog_gdi->primary_buffer) {
-                    UINT32 numRects = 0;
-                    const RECTANGLE_16* rects = region16_rects(&invalidRegion, &numRects);
-                    
-                    for (UINT32 i = 0; i < numRects; i++) {
-                        UINT32 rectX = rects[i].left;
-                        UINT32 rectY = rects[i].top;
-                        UINT32 rectW = rects[i].right - rects[i].left;
-                        UINT32 rectH = rects[i].bottom - rects[i].top;
-                        
-                        UINT32 dstX = outX + rectX;
-                        UINT32 dstY = outY + rectY;
-                        
-                        /* Bounds check */
-                        if (rectX + rectW <= surfW && rectY + rectH <= surfH &&
-                            dstX + rectW <= (UINT32)prog_gdi->width && 
-                            dstY + rectH <= (UINT32)prog_gdi->height) {
-                            for (UINT32 y = 0; y < rectH; y++) {
-                                uint8_t* src = surfBuf + (rectY + y) * surfStride + rectX * 4;
-                                uint8_t* dst = prog_gdi->primary_buffer + (dstY + y) * prog_gdi->stride + dstX * 4;
-                                memcpy(dst, src, rectW * 4);
-                            }
-                        }
-                    }
-                }
-            } else if (prog_gdi && prog_gdi->primary_buffer) {
-                /* Fallback: decode directly to primary buffer - log this case */
-                static int prog_fallback = 0;
-                if (prog_fallback < 10) {
-                    fprintf(stderr, "[rdp_bridge] BLACK_TILE: Progressive fallback - no surface buffer for surf=%u\n", surfId);
-                    prog_fallback++;
-                }
-                rc = progressive_decompress(bctx->progressive_decoder,
-                    cmd->data, cmd->length,
-                    prog_gdi->primary_buffer, prog_gdi->dstFormat,
-                    prog_gdi->stride,
-                    0, 0,
-                    &invalidRegion,
-                    cmd->surfaceId, bctx->current_frame_id);
-            }
+            UINT32 surfStride = surfW * 4;
+            INT32 rc = progressive_decompress(bctx->progressive_decoder,
+                cmd->data, cmd->length,
+                surfBuf, PIXEL_FORMAT_BGRA32,
+                surfStride,
+                0, 0,  /* nXDst, nYDst - decode to full buffer */
+                &invalidRegion,
+                cmd->surfaceId, bctx->current_frame_id);
             
             if (rc < 0) {
                 static int prog_err = 0;
@@ -3174,32 +2908,21 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 UINT32 numRects = 0;
                 const RECTANGLE_16* rects = region16_rects(&invalidRegion, &numRects);
                 
-                static int prog_ok = 0;
-                if (prog_ok < 10) {
-                    fprintf(stderr, "[rdp_bridge] Progressive decoded: surf=%u %u rects mapped=%d\n", 
-                            surfId, numRects, mapped);
-                    prog_ok++;
+                pthread_mutex_lock(&bctx->rect_mutex);
+                for (UINT32 i = 0; i < numRects && bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS; i++) {
+                    bctx->dirty_rects[bctx->dirty_rect_count].x = outX + rects[i].left;
+                    bctx->dirty_rects[bctx->dirty_rect_count].y = outY + rects[i].top;
+                    bctx->dirty_rects[bctx->dirty_rect_count].width = rects[i].right - rects[i].left;
+                    bctx->dirty_rects[bctx->dirty_rect_count].height = rects[i].bottom - rects[i].top;
+                    bctx->dirty_rect_count++;
                 }
-                
-                if (mapped) {
-                    pthread_mutex_lock(&bctx->rect_mutex);
-                    for (UINT32 i = 0; i < numRects && bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS; i++) {
-                        bctx->dirty_rects[bctx->dirty_rect_count].x = outX + rects[i].left;
-                        bctx->dirty_rects[bctx->dirty_rect_count].y = outY + rects[i].top;
-                        bctx->dirty_rects[bctx->dirty_rect_count].width = rects[i].right - rects[i].left;
-                        bctx->dirty_rects[bctx->dirty_rect_count].height = rects[i].bottom - rects[i].top;
-                        bctx->dirty_rect_count++;
-                    }
-                    if (numRects > 0 && bctx->dirty_rect_count >= RDP_MAX_DIRTY_RECTS) {
-                        /* Overflow - request full frame */
-                        bctx->needs_full_frame = true;
-                    }
-                    if (numRects == 0) {
-                        /* No explicit rects - mark full frame */
-                        bctx->needs_full_frame = true;
-                    }
-                    pthread_mutex_unlock(&bctx->rect_mutex);
+                if (numRects > 0 && bctx->dirty_rect_count >= RDP_MAX_DIRTY_RECTS) {
+                    bctx->needs_full_frame = true;
                 }
+                if (numRects == 0) {
+                    bctx->needs_full_frame = true;
+                }
+                pthread_mutex_unlock(&bctx->rect_mutex);
             }
             
             region16_uninit(&invalidRegion);
@@ -3215,9 +2938,7 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 break;
             }
             
-            pthread_mutex_lock(&bctx->gfx_mutex);
-            rdpGdi* planar_gdi = bctx->gdi;
-            pthread_mutex_unlock(&bctx->gfx_mutex);
+            /* PURE GFX MODE: Only write to surface_buffers[] */
             
             UINT32 surfId = cmd->surfaceId;
             UINT32 surfX = cmd->left;
@@ -3226,23 +2947,19 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
             UINT32 nHeight = cmd->bottom - cmd->top;
             
             /* Get surface info */
-            bool mapped = false;
-            UINT32 dstX = 0, dstY = 0;
-            uint8_t* surfBuf = NULL;
-            UINT32 surfW = 0, surfH = 0;
-            
-            if (surfId < RDP_MAX_GFX_SURFACES) {
-                mapped = bctx->surfaces[surfId].mapped_to_output;
-                dstX = bctx->surfaces[surfId].output_x + surfX;
-                dstY = bctx->surfaces[surfId].output_y + surfY;
-                surfBuf = bctx->surface_buffers[surfId];
-                surfW = bctx->surfaces[surfId].width;
-                surfH = bctx->surfaces[surfId].height;
+            if (surfId >= RDP_MAX_GFX_SURFACES || !bctx->surfaces[surfId].active) {
+                break;
             }
+            
+            uint8_t* surfBuf = bctx->surface_buffers[surfId];
+            UINT32 surfW = bctx->surfaces[surfId].width;
+            UINT32 surfH = bctx->surfaces[surfId].height;
+            INT32 outX = bctx->surfaces[surfId].output_x;
+            INT32 outY = bctx->surfaces[surfId].output_y;
             
             bool decoded = false;
             
-            /* Decode to surface buffer if available */
+            /* Decode to surface buffer */
             if (surfBuf && surfW > 0 && surfH > 0 &&
                 surfX + nWidth <= surfW && surfY + nHeight <= surfH) {
                 UINT32 surfStride = surfW * 4;
@@ -3255,28 +2972,18 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                         nWidth, nHeight, FALSE)) {
                     decoded = true;
                     
-                    /* Copy to primary buffer if mapped */
-                    if (mapped && planar_gdi && planar_gdi->primary_buffer &&
-                        dstX + nWidth <= (UINT32)planar_gdi->width &&
-                        dstY + nHeight <= (UINT32)planar_gdi->height) {
-                        for (UINT32 y = 0; y < nHeight; y++) {
-                            uint8_t* src = surfBuf + (surfY + y) * surfStride + surfX * 4;
-                            uint8_t* dst = planar_gdi->primary_buffer + (dstY + y) * planar_gdi->stride + dstX * 4;
-                            memcpy(dst, src, nWidth * 4);
-                        }
-                        
-                        pthread_mutex_lock(&bctx->rect_mutex);
-                        if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
-                            bctx->dirty_rects[bctx->dirty_rect_count].x = dstX;
-                            bctx->dirty_rects[bctx->dirty_rect_count].y = dstY;
-                            bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
-                            bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
-                            bctx->dirty_rect_count++;
-                        } else {
-                            bctx->needs_full_frame = true;
-                        }
-                        pthread_mutex_unlock(&bctx->rect_mutex);
+                    /* Mark dirty rect */
+                    pthread_mutex_lock(&bctx->rect_mutex);
+                    if (bctx->dirty_rect_count < RDP_MAX_DIRTY_RECTS) {
+                        bctx->dirty_rects[bctx->dirty_rect_count].x = surfX + outX;
+                        bctx->dirty_rects[bctx->dirty_rect_count].y = surfY + outY;
+                        bctx->dirty_rects[bctx->dirty_rect_count].width = nWidth;
+                        bctx->dirty_rects[bctx->dirty_rect_count].height = nHeight;
+                        bctx->dirty_rect_count++;
+                    } else {
+                        bctx->needs_full_frame = true;
                     }
+                    pthread_mutex_unlock(&bctx->rect_mutex);
                 }
             }
             
@@ -3289,13 +2996,6 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 pthread_mutex_lock(&bctx->rect_mutex);
                 bctx->needs_full_frame = true;
                 pthread_mutex_unlock(&bctx->rect_mutex);
-            } else {
-                static int planar_ok = 0;
-                if (planar_ok < 5) {
-                    fprintf(stderr, "[rdp_bridge] Planar decoded: surf=%u (%u,%u) %ux%u mapped=%d\n",
-                            surfId, surfX, surfY, nWidth, nHeight, mapped);
-                    planar_ok++;
-                }
             }
             break;
         }
@@ -3334,13 +3034,6 @@ static UINT gfx_on_start_frame(RdpgfxClientContext* context, const RDPGFX_START_
     bctx->frame_cmd_count = 0;  /* Reset command count for this frame */
     bctx->h264_queued_this_frame = false;  /* Reset H.264 flag for this frame */
     
-    static int start_frame_logs = 0;
-    if (start_frame_logs < 20) {
-        fprintf(stderr, "[rdp_bridge] StartFrame: frame_id=%u timestamp=%u\n", 
-                start->frameId, start->timestamp);
-        start_frame_logs++;
-    }
-    
     return CHANNEL_RC_OK;
 }
 
@@ -3355,26 +3048,12 @@ static UINT gfx_on_end_frame(RdpgfxClientContext* context, const RDPGFX_END_FRAM
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx || !end) return ERROR_INVALID_PARAMETER;
     
-    static int end_frame_logs = 0;
-    
     pthread_mutex_lock(&bctx->rect_mutex);
-    int dirty_count = bctx->dirty_rect_count;
-    bool h264_in_frame = bctx->h264_queued_this_frame;
     /* Frame is now complete - Python can safely read buffer and send frames */
     bctx->gfx_frame_in_progress = false;
     /* Update last_completed_frame_id so Python knows a frame finished */
     bctx->last_completed_frame_id = end->frameId;
     pthread_mutex_unlock(&bctx->rect_mutex);
-    
-    if (end_frame_logs < 20) {
-        fprintf(stderr, "[rdp_bridge] EndFrame: frame_id=%u cmds=%u h264=%d dirty_rects=%d\n", 
-                end->frameId, bctx->frame_cmd_count, h264_in_frame, dirty_count);
-        end_frame_logs++;
-        
-        if (bctx->frame_cmd_count == 0) {
-            fprintf(stderr, "[rdp_bridge] WARNING: Empty frame received (no commands between StartFrame/EndFrame)\n");
-        }
-    }
     
     /* DON'T set needs_full_frame here! 
      * - If H.264 was sent, the frontend handles it via the H.264 pipeline
