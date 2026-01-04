@@ -743,13 +743,13 @@ class RDPBridge:
                     
                     # GFX active but no updates - wait for more
                     if result == 0:
-                        await asyncio.sleep(0.001)
+                        await asyncio.sleep(0.0001)
                         continue
                 
                 # Fallback: GDI mode (legacy WebP encoding)
                 if result == 0:
                     # No frame update, but still connected
-                    await asyncio.sleep(0.001)
+                    await asyncio.sleep(0.0001)
                     continue
                 
                 # Check if we need a full frame
@@ -784,7 +784,7 @@ class RDPBridge:
                 break
             except Exception as e:
                 logger.error(f"Frame streaming error: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.0001)
         
         logger.info(f"Frame streaming ended after {self._frame_count} frames")
     
@@ -1013,7 +1013,7 @@ class RDPBridge:
             try:
                 # Check if Opus data is available
                 if not self._lib.rdp_has_opus_data(self._session):
-                    await asyncio.sleep(0.002)  # 2ms polling when idle
+                    await asyncio.sleep(0.0001)  # 0.1ms polling when idle
                     continue
                 
                 # Get audio format
@@ -1027,7 +1027,7 @@ class RDPBridge:
                 
                 # Send multiple frames if they've accumulated
                 frames_this_batch = 0
-                max_frames_per_batch = 5  # Limit to avoid large bursts
+                max_frames_per_batch = 10  # Limit to avoid large bursts
                 
                 while self._lib.rdp_has_opus_data(self._session) and frames_this_batch < max_frames_per_batch:
                     # Read Opus frame from native buffer
@@ -1061,13 +1061,13 @@ class RDPBridge:
                         break
                 
                 # Small delay to prevent tight loop and allow batching
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.0001)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Native audio streaming error: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.0001)
         
         logger.info(f"Native audio streaming ended after {frames_sent} frames")
     
