@@ -1061,13 +1061,13 @@ class RDPBridge:
                         break
                 
                 # Small delay to prevent tight loop and allow batching
-                await asyncio.sleep(0.0001)
+                await asyncio.sleep(0)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Native audio streaming error: {e}")
-                await asyncio.sleep(0.0001)
+                await asyncio.sleep(0)
         
         logger.info(f"Native audio streaming ended after {frames_sent} frames")
     
