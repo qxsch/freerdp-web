@@ -38,7 +38,6 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - long term GFX optimizations (client side rendering and caching)
 - Clipboard support (copy/paste)
 - File transfer support
-- Better JS API
 - NVENC/VAAPI hardware transcoding (currently software FFmpeg)
 
 ## Tech Stack
