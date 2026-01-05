@@ -118,16 +118,48 @@ static void write_opus_frame(AudioContext* ctx, const unsigned char* data, int s
     
     /* Check if we have space (with wrap-around handling) 
      * Note: opus_write_pos and opus_read_pos are POINTERS to the actual values */
-    size_t available;
+    size_t used;
     if (*ctx->opus_write_pos >= *ctx->opus_read_pos) {
-        available = ctx->opus_buffer_size - (*ctx->opus_write_pos - *ctx->opus_read_pos);
+        used = *ctx->opus_write_pos - *ctx->opus_read_pos;
     } else {
-        available = *ctx->opus_read_pos - *ctx->opus_write_pos;
+        /* This shouldn't happen with monotonic positions, but handle it */
+        used = 0;
     }
     
+    size_t available = ctx->opus_buffer_size - used;
+    
     if (available < total_size + 64) {
-        /* Buffer full - drop oldest frames by advancing read position */
-        *ctx->opus_read_pos = *ctx->opus_write_pos;
+        /* Buffer full - drop old frames one at a time until we have space.
+         * This preserves as much audio as possible instead of dropping everything. */
+        int frames_dropped = 0;
+        while (available < total_size + 64 && *ctx->opus_read_pos < *ctx->opus_write_pos) {
+            /* Read frame size at current read position */
+            size_t read_pos = *ctx->opus_read_pos % ctx->opus_buffer_size;
+            uint16_t old_frame_size = ctx->opus_buffer[read_pos];
+            read_pos = (read_pos + 1) % ctx->opus_buffer_size;
+            old_frame_size |= (uint16_t)ctx->opus_buffer[read_pos] << 8;
+            
+            /* Sanity check - if frame size is invalid, reset buffer */
+            if (old_frame_size == 0 || old_frame_size > 4000) {
+                *ctx->opus_read_pos = *ctx->opus_write_pos;
+                available = ctx->opus_buffer_size;
+                break;
+            }
+            
+            /* Skip this old frame */
+            *ctx->opus_read_pos += OPUS_FRAME_HEADER_SIZE + old_frame_size;
+            frames_dropped++;
+            
+            /* Recalculate available space */
+            used = *ctx->opus_write_pos - *ctx->opus_read_pos;
+            available = ctx->opus_buffer_size - used;
+        }
+        
+        /* Log overflow warning (will be per-occurrence, not rate-limited) */
+        if (frames_dropped > 0) {
+            fprintf(stderr, "[rdpsnd_bridge] WARNING: Buffer overflow, dropped %d frames\n",
+                    frames_dropped);
+        }
     }
     
     /* Write frame header (2-byte little-endian size) */
@@ -195,9 +227,6 @@ static BOOL rdpsnd_bridge_open(rdpsndDevicePlugin* device,
     rdpsndBridgePlugin* bridge = (rdpsndBridgePlugin*)device;
     int error;
     
-    fprintf(stderr, "[rdpsnd_bridge] Open called: %u Hz, %u ch, %u-bit\n",
-            format->nSamplesPerSec, format->nChannels, format->wBitsPerSample);
-    
     if (!bridge || !format)
         return FALSE;
     
@@ -215,8 +244,6 @@ static BOOL rdpsnd_bridge_open(rdpsndDevicePlugin* device,
         get_ctx_fn get_ctx = (get_ctx_fn)dlsym(RTLD_DEFAULT, "rdp_get_current_audio_context");
         if (get_ctx) {
             src_ctx = (AudioContext*)get_ctx();
-            fprintf(stderr, "[rdpsnd_bridge] Got audio context from rdp_bridge.so: %p\n", 
-                    (void*)src_ctx);
         }
     }
     
@@ -247,9 +274,6 @@ static BOOL rdpsnd_bridge_open(rdpsndDevicePlugin* device,
     bridge->audio_ctx->channels = src_ctx->channels;
     bridge->audio_ctx->initialized = src_ctx->initialized;
     
-    fprintf(stderr, "[rdpsnd_bridge] Created session-specific audio context: buffer=%p\n",
-            (void*)bridge->audio_ctx->opus_buffer);
-    
     /* Store input sample rate and check if resampling is needed */
     bridge->input_sample_rate = format->nSamplesPerSec;
     bridge->needs_resample = (format->nSamplesPerSec != OPUS_SAMPLE_RATE);
@@ -267,8 +291,6 @@ static BOOL rdpsnd_bridge_open(rdpsndDevicePlugin* device,
             fprintf(stderr, "[rdpsnd_bridge] Failed to allocate resample buffer\n");
             return FALSE;
         }
-        fprintf(stderr, "[rdpsnd_bridge] Resampling enabled: %u Hz -> %d Hz\n", 
-                format->nSamplesPerSec, OPUS_SAMPLE_RATE);
     } else {
         bridge->resample_buffer = NULL;
     }
@@ -325,9 +347,8 @@ static BOOL rdpsnd_bridge_open(rdpsndDevicePlugin* device,
     
     bridge->opened = TRUE;
     
-    fprintf(stderr, "[rdpsnd_bridge] Opened: input=%u Hz, opus=%d Hz, %u ch, frame=%zu samples\n",
-            format->nSamplesPerSec, OPUS_SAMPLE_RATE, format->nChannels,
-            bridge->pcm_frame_samples);
+    fprintf(stderr, "[rdpsnd_bridge] Initialized: %uHz -> 48kHz, %uch\n",
+            format->nSamplesPerSec, format->nChannels);
     
     return TRUE;
 }
@@ -509,8 +530,6 @@ static void rdpsnd_bridge_free(rdpsndDevicePlugin* device)
     }
     
     free(bridge);
-    
-    fprintf(stderr, "[rdpsnd_bridge] Freed\n");
 }
 
 /* ============================================================================
@@ -527,8 +546,6 @@ FREERDP_ENTRY_POINT(UINT VCAPITYPE freerdp_rdpsnd_client_subsystem_entry(
     PFREERDP_RDPSND_DEVICE_ENTRY_POINTS pEntryPoints))
 {
     rdpsndBridgePlugin* bridge;
-    
-    fprintf(stderr, "[rdpsnd_bridge] Plugin entry point called\n");
     
     bridge = (rdpsndBridgePlugin*)calloc(1, sizeof(rdpsndBridgePlugin));
     if (!bridge) {
@@ -547,8 +564,6 @@ FREERDP_ENTRY_POINT(UINT VCAPITYPE freerdp_rdpsnd_client_subsystem_entry(
     
     /* Register with rdpsnd */
     pEntryPoints->pRegisterRdpsndDevice(pEntryPoints->rdpsnd, &bridge->device);
-    
-    fprintf(stderr, "[rdpsnd_bridge] Plugin registered successfully\n");
     
     return CHANNEL_RC_OK;
 }

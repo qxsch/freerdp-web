@@ -435,6 +435,19 @@ int rdp_get_opus_format(RdpSession* session, int* sample_rate, int* channels);
 int rdp_get_opus_frame(RdpSession* session, uint8_t* buffer, int max_size);
 
 /**
+ * Get audio buffer debug statistics for diagnostics
+ *
+ * @param session       Session handle
+ * @param initialized   Output: 1 if audio is initialized, 0 otherwise
+ * @param write_pos     Output: current write position in buffer
+ * @param read_pos      Output: current read position in buffer
+ * @param buffer_size   Output: total buffer size
+ * @return              0 on success, negative on error
+ */
+int rdp_get_audio_stats(RdpSession* session, int* initialized, size_t* write_pos, 
+                        size_t* read_pos, size_t* buffer_size);
+
+/**
  * Disconnect from the RDP server
  */
 void rdp_disconnect(RdpSession* session);

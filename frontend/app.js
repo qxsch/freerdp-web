@@ -32,12 +32,19 @@
     let isAudioPlaying = false;
     let isMuted = false;
     let audioGainNode = null;
+    let audioNextPlayTime = 0;  // Track when next buffer should start (prevents gaps)
     
     // Opus decoder state
     let opusDecoder = null;
     let opusInitialized = false;
     let opusSampleRate = 48000;
     let opusChannels = 2;
+    let opusDecodeErrors = 0;        // Track consecutive decode errors
+    let opusLastSuccessTime = 0;     // Timestamp of last successful decode
+    let opusRecoveryPending = false; // Prevent multiple simultaneous recovery attempts
+    let opusFramesReceived = 0;      // Total frames received from server
+    let opusFramesDecoded = 0;       // Total frames successfully decoded (output callback fired)
+    let opusFramesQueued = 0;        // Total frames queued for playback
 
     // H.264 video decoder state (WebCodecs)
     let videoDecoder = null;
@@ -376,6 +383,7 @@
 
         // Start ping for latency measurement
         setInterval(sendPing, 5000);
+        
         console.log('[RDP Client] RDP session established');
     }
 
@@ -814,33 +822,58 @@
     /**
      * Initialize Opus decoder using WebCodecs API
      */
-    async function initOpusDecoder(sampleRate, channels) {
+    async function initOpusDecoder(sampleRate, channels, forceReinit = false) {
         // Check WebCodecs support
         if (typeof AudioDecoder === 'undefined') {
             console.warn('[RDP Client] WebCodecs AudioDecoder not supported, Opus audio disabled');
             return false;
         }
         
-        // Close existing decoder if format changed
-        if (opusDecoder && (opusSampleRate !== sampleRate || opusChannels !== channels)) {
-            opusDecoder.close();
+        // Close existing decoder if format changed or force reinit requested
+        if (opusDecoder && (forceReinit || opusSampleRate !== sampleRate || opusChannels !== channels)) {
+            try {
+                opusDecoder.close();
+            } catch (e) {
+                // Ignore close errors
+            }
             opusDecoder = null;
             opusInitialized = false;
         }
         
-        if (opusDecoder) return true;
+        if (opusDecoder && !forceReinit) return true;
         
         try {
             opusSampleRate = sampleRate;
             opusChannels = channels;
+            opusDecodeErrors = 0;  // Reset error count on new decoder
+            opusFramesDecoded = 0; // Reset decoded count on new decoder
+            opusFramesQueued = 0;  // Reset queued count on new decoder
             
             opusDecoder = new AudioDecoder({
                 output: (audioData) => {
+                    // Reset error tracking on successful decode
+                    opusDecodeErrors = 0;
+                    opusLastSuccessTime = performance.now();
+                    opusFramesDecoded++;
+                    
+                    // Log first decoded frame and occasional milestones
+                    if (opusFramesDecoded === 1) {
+                        console.log('[RDP Client] Opus audio active: ' + 
+                                    audioData.sampleRate + 'Hz, format=' + audioData.format);
+                    }
+                    
                     // Convert AudioData to AudioBuffer and queue for playback
                     handleDecodedOpusAudio(audioData);
                 },
                 error: (e) => {
-                    console.error('[RDP Client] Opus decode error:', e);
+                    opusDecodeErrors++;
+                    console.error('[RDP Client] Opus decode error (#' + opusDecodeErrors + '):', e.message || e);
+                    
+                    // Trigger recovery after multiple consecutive errors
+                    if (opusDecodeErrors >= 5 && !opusRecoveryPending) {
+                        console.warn('[RDP Client] Too many Opus decode errors, scheduling recovery...');
+                        scheduleOpusRecovery();
+                    }
                 }
             });
             
@@ -851,6 +884,7 @@
             });
             
             opusInitialized = true;
+            opusRecoveryPending = false;
             console.log('[RDP Client] Opus decoder initialized:', sampleRate, 'Hz,', channels, 'ch');
             return true;
             
@@ -862,10 +896,46 @@
     }
 
     /**
+     * Schedule Opus decoder recovery after errors
+     */
+    function scheduleOpusRecovery() {
+        if (opusRecoveryPending) return;
+        opusRecoveryPending = true;
+        
+        // Small delay to prevent rapid recovery loops
+        setTimeout(async () => {
+            console.log('[RDP Client] Attempting Opus decoder recovery...');
+            
+            // Close existing decoder
+            if (opusDecoder) {
+                try {
+                    opusDecoder.close();
+                } catch (e) {
+                    // Ignore
+                }
+                opusDecoder = null;
+            }
+            opusInitialized = false;
+            
+            // Clear audio queue to prevent stale audio
+            audioQueue = [];
+            
+            // Reinitialize will happen on next frame
+            opusRecoveryPending = false;
+            console.log('[RDP Client] Opus decoder recovery complete, will reinit on next frame');
+        }, 100);
+    }
+
+    /**
      * Handle decoded Opus audio data
      */
     function handleDecodedOpusAudio(audioData) {
-        if (!audioContext || isMuted) {
+        if (!audioContext) {
+            console.warn('[RDP Client] No audio context for decoded audio');
+            audioData.close();
+            return;
+        }
+        if (isMuted) {
             audioData.close();
             return;
         }
@@ -873,6 +943,7 @@
         try {
             // Resume audio context if suspended (browser autoplay policy)
             if (audioContext.state === 'suspended') {
+                console.log('[RDP Client] Resuming suspended AudioContext');
                 audioContext.resume();
             }
             
@@ -957,11 +1028,21 @@
      * Format: [OPUS magic (4)] [sample_rate (4)] [channels (2)] [frame_size (2)] [Opus data...]
      */
     async function handleOpusFrame(bytes) {
+        opusFramesReceived++;
+        
+        // Log first frame only
+        if (opusFramesReceived === 1) {
+            console.log('[RDP Client] Opus audio stream started');
+        }
+        
         if (!audioContext) {
             initAudio();
         }
         
         if (isMuted) return;
+        
+        // Skip if recovery is pending
+        if (opusRecoveryPending) return;
         
         try {
             // Resume audio context if suspended
@@ -975,9 +1056,24 @@
             const channels = dataView.getUint16(8, true);
             const frameSize = dataView.getUint16(10, true);
             
-            // Initialize decoder if needed
-            if (!opusInitialized) {
+            // Validate frame size to prevent decoding garbage
+            if (frameSize === 0 || frameSize > 4000) {
+                console.warn('[RDP Client] Invalid Opus frame size:', frameSize);
+                return;
+            }
+            
+            // Initialize decoder if needed or if format changed
+            if (!opusInitialized || !opusDecoder || 
+                opusSampleRate !== sampleRate || opusChannels !== channels) {
                 const success = await initOpusDecoder(sampleRate, channels);
+                if (!success) return;
+            }
+            
+            // Check decoder state before decoding
+            if (opusDecoder.state === 'closed') {
+                console.warn('[RDP Client] Opus decoder is closed, reinitializing...');
+                opusInitialized = false;
+                const success = await initOpusDecoder(sampleRate, channels, true);
                 if (!success) return;
             }
             
@@ -995,6 +1091,12 @@
             
         } catch (e) {
             console.error('[RDP Client] Opus frame error:', e);
+            opusDecodeErrors++;
+            
+            // Schedule recovery if we're seeing repeated frame handling errors
+            if (opusDecodeErrors >= 3 && !opusRecoveryPending) {
+                scheduleOpusRecovery();
+            }
         }
     }
 
@@ -1065,47 +1167,60 @@
 
     /**
      * Queue audio buffer for playback with jitter buffering
+     * 
+     * Key insight: We track audioNextPlayTime separately from the queue.
+     * This prevents gaps when the queue empties (all buffers finished playing)
+     * because we still know when the last buffer ended.
      */
     function queueAudioBuffer(audioBuffer) {
+        opusFramesQueued++;
+        
         const source = audioContext.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(audioGainNode);
         
-        // Calculate when to start this buffer
         const currentTime = audioContext.currentTime;
         const bufferDuration = audioBuffer.duration;
         
-        // Clean up finished buffers first
+        // Clean up finished buffers from queue (for tracking purposes)
         audioQueue = audioQueue.filter(item => item.endTime > currentTime);
         
-        // Calculate start time for new buffer
-        const lastEndTime = audioQueue.length > 0 
-            ? Math.max(...audioQueue.map(item => item.endTime))
-            : currentTime;
+        // Determine start time for this buffer
+        let startTime;
         
-        // Jitter buffer: add initial delay to absorb network jitter
-        // Use 150ms initial buffer, then schedule seamlessly
-        const initialBufferDelay = audioQueue.length === 0 ? 0.15 : 0;
-        
-        // Limit queue size to prevent excessive latency buildup
-        // With 20ms Opus frames, 25 buffers = 500ms max latency
-        const maxQueueSize = 25;
-        
-        if (audioQueue.length < maxQueueSize) {
-            // Schedule buffer to play after previous one ends
-            const startTime = Math.max(currentTime + initialBufferDelay, lastEndTime);
-            source.start(startTime);
-            audioQueue.push({ endTime: startTime + bufferDuration, source: source });
-        } else {
-            // Queue full - drop oldest buffer to reduce latency
-            // This shouldn't happen often if encoding/decoding keeps up
-            const oldest = audioQueue.shift();
-            if (oldest && oldest.source) {
-                try { oldest.source.stop(); } catch(e) {}
+        if (audioNextPlayTime <= currentTime) {
+            // No audio scheduled or we've fallen behind - need to resync
+            // Add small initial buffer (100ms) for jitter absorption
+            startTime = currentTime + 0.1;
+            
+            // Log initial start only
+            if (opusFramesQueued === 1) {
+                console.log('[RDP Client] Audio playback started');
             }
-            const startTime = Math.max(currentTime, lastEndTime);
-            source.start(startTime);
-            audioQueue.push({ endTime: startTime + bufferDuration, source: source });
+        } else {
+            // Schedule immediately after the previous buffer
+            startTime = audioNextPlayTime;
+        }
+        
+        // Limit latency: if we're too far ahead, skip forward
+        // Max latency = 500ms (25 buffers at 20ms each)
+        const maxLatency = 0.5;
+        if (startTime > currentTime + maxLatency) {
+            // Too much latency - drop some time
+            startTime = currentTime + 0.1;
+            // Latency reset - don't log to avoid spam during bursts
+        }
+        
+        // Schedule the buffer
+        source.start(startTime);
+        
+        // Update tracking
+        audioNextPlayTime = startTime + bufferDuration;
+        audioQueue.push({ endTime: audioNextPlayTime, source: source });
+        
+        // Limit queue size (for memory, not scheduling)
+        while (audioQueue.length > 50) {
+            audioQueue.shift();
         }
     }
 
@@ -1128,6 +1243,7 @@
      */
     function cleanupAudio() {
         audioQueue = [];
+        audioNextPlayTime = 0;
         
         // Clean up Opus decoder
         if (opusDecoder) {
@@ -1139,6 +1255,14 @@
             opusDecoder = null;
             opusInitialized = false;
         }
+        
+        // Reset audio error tracking and counters
+        opusDecodeErrors = 0;
+        opusLastSuccessTime = 0;
+        opusRecoveryPending = false;
+        opusFramesReceived = 0;
+        opusFramesDecoded = 0;
+        opusFramesQueued = 0;
         
         if (audioContext) {
             audioContext.close();

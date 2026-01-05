@@ -400,6 +400,13 @@ class NativeLibrary:
         lib.rdp_get_opus_frame.argtypes = [c_void_p, POINTER(c_uint8), c_int]
         lib.rdp_get_opus_frame.restype = c_int
         
+        # rdp_get_audio_stats - for debugging audio buffer state
+        lib.rdp_get_audio_stats.argtypes = [
+            c_void_p, POINTER(c_int), POINTER(ctypes.c_size_t), 
+            POINTER(ctypes.c_size_t), POINTER(ctypes.c_size_t)
+        ]
+        lib.rdp_get_audio_stats.restype = c_int
+        
         # GFX/H.264 API functions
         # rdp_gfx_is_active
         lib.rdp_gfx_is_active.argtypes = [c_void_p]
@@ -692,6 +699,9 @@ class RDPBridge:
                             await self._send_h264_frame(h264_frame)
                             h264_count -= 1
                             h264_sent += 1
+                            # Yield periodically during burst to allow audio loop to run
+                            if h264_sent % 5 == 0:
+                                await asyncio.sleep(0)
                         else:
                             break
                     
@@ -702,6 +712,8 @@ class RDPBridge:
                         # Consume the full frame flag to prevent full WebP
                         self._lib.rdp_needs_full_frame(self._session)
                         # But DON'T clear dirty rects - fall through to process them!
+                        # Yield after H.264 burst to give audio loop a chance
+                        await asyncio.sleep(0)
                     
                     # First check if we need a full frame (e.g., dirty rect overflow)
                     needs_full = self._lib.rdp_needs_full_frame(self._session)
@@ -736,6 +748,8 @@ class RDPBridge:
                             await self._send_delta_frame(pixel_data, w, h, s, rects, rect_count)
                         
                         # Note: rdp_get_dirty_rects now clears atomically, no need to call clear
+                        # Yield after delta frame to allow audio loop to run
+                        await asyncio.sleep(0)
                     
                     # If we sent H.264 or deltas, continue to next poll
                     if h264_sent > 0 or rect_count > 0:
@@ -743,13 +757,13 @@ class RDPBridge:
                     
                     # GFX active but no updates - wait for more
                     if result == 0:
-                        await asyncio.sleep(0.0001)
+                        await asyncio.sleep(0)
                         continue
                 
                 # Fallback: GDI mode (legacy WebP encoding)
                 if result == 0:
                     # No frame update, but still connected
-                    await asyncio.sleep(0.0001)
+                    await asyncio.sleep(0)
                     continue
                 
                 # Check if we need a full frame
@@ -784,7 +798,7 @@ class RDPBridge:
                 break
             except Exception as e:
                 logger.error(f"Frame streaming error: {e}")
-                await asyncio.sleep(0.0001)
+                await asyncio.sleep(0)
         
         logger.info(f"Frame streaming ended after {self._frame_count} frames")
     
@@ -953,19 +967,14 @@ class RDPBridge:
             await self.websocket.send(message.getvalue())
             self._frame_count += 1
             
-            # Log first few H.264 frames for debugging
-            if self._frame_count <= 5:
+            # Log first H.264 frame only
+            if self._frame_count == 1:
                 codec_name = {
                     RDP_GFX_CODEC_AVC420: "AVC420",
                     RDP_GFX_CODEC_AVC444: "AVC444",
                     RDP_GFX_CODEC_AVC444v2: "AVC444v2",
                 }.get(frame.codec_id, f"0x{frame.codec_id:X}")
-                frame_type = {0: "IDR", 1: "P", 2: "B"}.get(frame.frame_type, "?")
-                logger.info(
-                    f"H.264 frame #{self._frame_count}: {codec_name} {frame_type} "
-                    f"{frame.dest_rect.width}x{frame.dest_rect.height} "
-                    f"NAL:{frame.nal_size}b chroma:{len(chroma_data)}b"
-                )
+                logger.info(f"H.264 stream started: {codec_name} {frame.dest_rect.width}x{frame.dest_rect.height}")
                 
         except Exception as e:
             logger.error(f"H.264 frame send error: {e}")
@@ -1004,7 +1013,25 @@ class RDPBridge:
         last_channels = 2
         
         frames_sent = 0
-        last_frame_time = 0
+        
+        # Audio health monitoring
+        last_frame_time = asyncio.get_event_loop().time()
+        consecutive_empty_polls = 0
+        max_empty_polls_before_warning = 500  # ~50ms of no audio at 0.1ms polling
+        stall_warning_logged = False
+        stall_diag_logged = False  # Detailed diagnostic logged once per stall
+        error_count = 0
+        max_errors_before_reset = 10
+        
+        # Audio buffer stats for diagnostics
+        audio_initialized = c_int()
+        audio_write_pos = ctypes.c_size_t()
+        audio_read_pos = ctypes.c_size_t()
+        audio_buffer_size = ctypes.c_size_t()
+        
+        # Log initial audio state after a short delay to let connection stabilize
+        startup_check_done = False
+        startup_check_time = asyncio.get_event_loop().time() + 3.0  # Check after 3 seconds
         
         # Target ~20ms between sends (Opus frame duration)
         target_interval = 0.018  # slightly less than 20ms to avoid underruns
@@ -1013,8 +1040,82 @@ class RDPBridge:
             try:
                 # Check if Opus data is available
                 if not self._lib.rdp_has_opus_data(self._session):
-                    await asyncio.sleep(0.0001)  # 0.1ms polling when idle
+                    consecutive_empty_polls += 1
+                    
+                    # Startup check - log audio state after connection stabilizes
+                    if not startup_check_done and asyncio.get_event_loop().time() > startup_check_time:
+                        startup_check_done = True
+                        try:
+                            ret = self._lib.rdp_get_audio_stats(
+                                self._session,
+                                ctypes.byref(audio_initialized),
+                                ctypes.byref(audio_write_pos),
+                                ctypes.byref(audio_read_pos),
+                                ctypes.byref(audio_buffer_size)
+                            )
+                            if audio_initialized.value:
+                                logger.info(
+                                    f"Audio startup check: initialized=True, frames_sent={frames_sent}, "
+                                    f"buffer_data={audio_write_pos.value - audio_read_pos.value} bytes"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Audio startup check: NOT INITIALIZED after 3s! "
+                                    f"frames_sent={frames_sent}, ret={ret}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Audio startup check failed: {e}")
+                    
+                    # Log warning if audio stream appears stalled (after initial startup)
+                    if frames_sent > 0 and consecutive_empty_polls >= max_empty_polls_before_warning:
+                        if not stall_warning_logged:
+                            elapsed = asyncio.get_event_loop().time() - last_frame_time
+                            if elapsed > 2.0:  # Only warn after 2+ seconds of silence
+                                logger.warning(
+                                    f"Audio stream may be stalled: no frames for {elapsed:.1f}s "
+                                    f"(sent {frames_sent} frames total)"
+                                )
+                                stall_warning_logged = True
+                        
+                        # Log detailed diagnostics once per stall event
+                        if not stall_diag_logged:
+                            try:
+                                ret = self._lib.rdp_get_audio_stats(
+                                    self._session,
+                                    ctypes.byref(audio_initialized),
+                                    ctypes.byref(audio_write_pos),
+                                    ctypes.byref(audio_read_pos),
+                                    ctypes.byref(audio_buffer_size)
+                                )
+                                logger.warning(
+                                    f"Audio buffer diagnostics: ret={ret}, initialized={audio_initialized.value}, "
+                                    f"write_pos={audio_write_pos.value}, read_pos={audio_read_pos.value}, "
+                                    f"buffer_size={audio_buffer_size.value}, "
+                                    f"data_available={audio_write_pos.value - audio_read_pos.value}"
+                                )
+                            except Exception as diag_err:
+                                logger.warning(f"Failed to get audio stats: {diag_err}")
+                            stall_diag_logged = True
+                    
+                    # Adaptive sleep: back off when idle to reduce CPU usage
+                    if consecutive_empty_polls < 100:
+                        await asyncio.sleep(0.0001)  # 0.1ms for responsiveness
+                    elif consecutive_empty_polls < 1000:
+                        await asyncio.sleep(0.001)   # 1ms when idle
+                    else:
+                        await asyncio.sleep(0.005)   # 5ms for extended idle
                     continue
+                
+                # Mark startup check done on first successful frame
+                startup_check_done = True
+                
+                # Reset counters when we get data
+                if stall_warning_logged:
+                    logger.info(f"Audio stream resumed after stall (frames_sent was {frames_sent})")
+                consecutive_empty_polls = 0
+                stall_warning_logged = False
+                stall_diag_logged = False  # Reset diagnostic flag so we log again on next stall
+                error_count = 0  # Reset error count on successful data
                 
                 # Get audio format
                 if self._lib.rdp_get_opus_format(
@@ -1050,10 +1151,11 @@ class RDPBridge:
                         await self.websocket.send(message.getvalue())
                         frames_sent += 1
                         frames_this_batch += 1
+                        last_frame_time = asyncio.get_event_loop().time()
                         
-                        if frames_sent <= 5:
-                            logger.debug(f"Sent Opus frame #{frames_sent}: {frame_size} bytes, "
-                                       f"{last_sample_rate}Hz, {last_channels}ch")
+                        # Log first audio frame only
+                        if frames_sent == 1:
+                            logger.info(f"Audio stream started: {last_sample_rate}Hz, {last_channels}ch")
                     elif frame_size == -2:
                         logger.warning("Opus frame buffer too small")
                         break
@@ -1066,8 +1168,16 @@ class RDPBridge:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Native audio streaming error: {e}")
-                await asyncio.sleep(0)
+                error_count += 1
+                if error_count <= 3 or error_count % 100 == 0:
+                    logger.error(f"Native audio streaming error (#{error_count}): {e}")
+                
+                # Exponential backoff on repeated errors
+                if error_count >= max_errors_before_reset:
+                    logger.warning(f"Audio stream encountered {error_count} errors, backing off")
+                    await asyncio.sleep(0.1)  # 100ms backoff
+                else:
+                    await asyncio.sleep(0.001)  # 1ms between retries
         
         logger.info(f"Native audio streaming ended after {frames_sent} frames")
     

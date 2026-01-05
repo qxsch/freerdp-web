@@ -527,8 +527,11 @@ RdpSession* rdp_create(
     ctx->gfx_cache_size = RDP_MAX_GFX_CACHE_SLOTS;
     ctx->gfx_cache = (GfxCacheEntry*)calloc(ctx->gfx_cache_size, sizeof(GfxCacheEntry));
     
-    /* Initialize Opus buffer for native audio streaming */
-    ctx->opus_buffer_size = 64 * 1024;  /* 64KB for ~1 second of Opus at 64kbps */
+    /* Initialize Opus buffer for native audio streaming.
+     * 256KB allows ~4 seconds of Opus audio at 64kbps, which provides
+     * enough headroom during graphics-intensive operations (window moves,
+     * video playback) when the Python audio streaming loop may be delayed. */
+    ctx->opus_buffer_size = 256 * 1024;  /* 256KB for ~4 seconds of Opus at 64kbps */
     ctx->opus_buffer = (uint8_t*)calloc(1, ctx->opus_buffer_size);
     ctx->opus_write_pos = 0;
     ctx->opus_read_pos = 0;
@@ -2612,6 +2615,12 @@ static bool queue_h264_frame(BridgeContext* bctx, uint32_t frame_id, uint16_t su
     bctx->h264_write_idx = (bctx->h264_write_idx + 1) % RDP_MAX_H264_FRAMES;
     bctx->h264_count++;
     
+    /* Log first H.264 frame only (h264_count is 1 after first increment) */
+    if (bctx->h264_count == 1 && bctx->h264_write_idx == 1) {
+        fprintf(stderr, "[rdp_bridge] H.264 stream started: codec=%d size=%u\n",
+                codec_id, output_nal_size);
+    }
+    
     /* Track negotiated codec (report original, not transcoded) */
     if (codec_id == RDP_GFX_CODEC_AVC420 && chroma_data) {
         /* Was AVC444, transcoded to AVC420 */
@@ -3349,6 +3358,32 @@ __attribute__((visibility("default")))
 void* rdp_get_current_audio_context(void)
 {
     return &g_audio_ctx;
+}
+
+/* Get audio buffer debug statistics for diagnostics */
+int rdp_get_audio_stats(RdpSession* session, int* initialized, size_t* write_pos, 
+                        size_t* read_pos, size_t* buffer_size)
+{
+    if (!session) return -1;
+    
+    rdpContext* context = (rdpContext*)session;
+    BridgeContext* ctx = (BridgeContext*)context;
+    
+    if (initialized) *initialized = ctx->opus_initialized;
+    if (buffer_size) *buffer_size = ctx->opus_buffer_size;
+    
+    if (!ctx->opus_buffer) {
+        if (write_pos) *write_pos = 0;
+        if (read_pos) *read_pos = 0;
+        return -2;  /* Buffer not allocated */
+    }
+    
+    pthread_mutex_lock(&ctx->opus_mutex);
+    if (write_pos) *write_pos = ctx->opus_write_pos;
+    if (read_pos) *read_pos = ctx->opus_read_pos;
+    pthread_mutex_unlock(&ctx->opus_mutex);
+    
+    return 0;
 }
 
 bool rdp_has_opus_data(RdpSession* session)
