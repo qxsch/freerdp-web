@@ -16,6 +16,7 @@ from websockets.http11 import Response
 from websockets.datastructures import Headers
 
 from rdp_bridge import RDPBridge, RDPConfig, NativeLibrary
+from wire_format import parse_frame_ack, parse_backpressure, get_message_type, Magic
 
 # Load environment variables
 load_dotenv()
@@ -169,6 +170,41 @@ def process_request(connection, request):
     return None
 
 
+async def handle_binary_message(data: bytes, rdp_bridge: Optional[RDPBridge], client_id: int):
+    """Handle binary backchannel messages from browser (FACK, BPRS)
+    
+    Args:
+        data: Binary message data
+        rdp_bridge: RDP bridge instance (may be None if not connected)
+        client_id: Client ID for logging
+    """
+    if len(data) < 4:
+        logger.warning(f"Client {client_id}: Binary message too short ({len(data)} bytes)")
+        return
+    
+    msg_type = get_message_type(data)
+    
+    if msg_type == 'frameAck':
+        # Frame acknowledgment from browser
+        parsed = parse_frame_ack(data)
+        if parsed and rdp_bridge:
+            frame_id = parsed['frame_id']
+            await rdp_bridge.ack_h264_frame(frame_id)
+            
+    elif msg_type == 'backpressure':
+        # Backpressure signal from browser - queue is getting full
+        parsed = parse_backpressure(data)
+        if parsed:
+            queue_depth = parsed['queue_depth']
+            # TODO: Implement adaptive bitrate/frame rate based on backpressure
+            logger.debug(f"Client {client_id}: Backpressure signal, queue_depth={queue_depth}")
+            
+    else:
+        # Unknown binary message
+        magic = data[:4].decode('latin-1', errors='replace')
+        logger.warning(f"Client {client_id}: Unknown binary message type '{magic}'")
+
+
 async def handle_client(websocket: ServerConnection):
     """Handle a WebSocket client connection"""
     client_id = id(websocket)
@@ -179,6 +215,11 @@ async def handle_client(websocket: ServerConnection):
     try:
         async for message in websocket:
             try:
+                # Handle binary messages (backchannel: FACK, BPRS)
+                if isinstance(message, bytes):
+                    await handle_binary_message(message, rdp_bridge, client_id)
+                    continue
+                
                 data = json.loads(message)
                 msg_type = data.get('type')
                 

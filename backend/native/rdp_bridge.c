@@ -197,6 +197,13 @@ typedef struct {
     GfxCacheEntry* gfx_cache;     /* Dynamically allocated cache */
     int gfx_cache_size;           /* Number of slots allocated */
     
+    /* GFX event queue for wire format streaming (Python consumption) */
+    RdpGfxEvent gfx_events[RDP_MAX_GFX_EVENTS];
+    int gfx_event_write_idx;
+    int gfx_event_read_idx;
+    int gfx_event_count;
+    pthread_mutex_t gfx_event_mutex;
+    
 } BridgeContext;
 
 /* Forward declarations */
@@ -228,6 +235,9 @@ static UINT gfx_on_cache_to_surface(RdpgfxClientContext* context, const RDPGFX_C
 static UINT gfx_on_evict_cache(RdpgfxClientContext* context, const RDPGFX_EVICT_CACHE_ENTRY_PDU* evict);
 static UINT gfx_on_delete_encoding_context(RdpgfxClientContext* context, const RDPGFX_DELETE_ENCODING_CONTEXT_PDU* del);
 static UINT gfx_on_cache_import_reply(RdpgfxClientContext* context, const RDPGFX_CACHE_IMPORT_REPLY_PDU* reply);
+
+/* GFX event queue helper */
+static void gfx_queue_event(BridgeContext* ctx, const RdpGfxEvent* event);
 
 /* Transcoder forward declarations */
 static bool init_transcoder(BridgeContext* ctx, int width, int height);
@@ -501,6 +511,7 @@ RdpSession* rdp_create(
     pthread_mutex_init(&ctx->opus_mutex, NULL);
     pthread_mutex_init(&ctx->gfx_mutex, NULL);
     pthread_mutex_init(&ctx->h264_mutex, NULL);
+    pthread_mutex_init(&ctx->gfx_event_mutex, NULL);
     ctx->audio_initialized = false;
     ctx->audio_buffer = NULL;
     ctx->audio_buffer_size = 0;
@@ -517,6 +528,12 @@ RdpSession* rdp_create(
     ctx->h264_write_idx = 0;
     ctx->h264_read_idx = 0;
     ctx->h264_count = 0;
+    
+    /* Initialize GFX event queue for wire format streaming */
+    memset(ctx->gfx_events, 0, sizeof(ctx->gfx_events));
+    ctx->gfx_event_write_idx = 0;
+    ctx->gfx_event_read_idx = 0;
+    ctx->gfx_event_count = 0;
     
     /* Initialize codec decoders for non-H.264 GFX codecs */
     ctx->clear_decoder = clear_context_new(FALSE);  /* FALSE = decompressor */
@@ -579,9 +596,17 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE)) goto fail;
     /* DISABLE progressive codec - it causes crashes in GDI's gdi_OutputUpdate.
      * The server will use H.264 if available, otherwise fall back to other codecs.
-     * Progressive (codec 0x0008) has a thread-safety issue with FreeRDP's GDI subsystem. */
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE)) goto fail;
+     * Progressive codec can be enabled via RDP_ENABLE_PROGRESSIVE=1 environment variable.
+     * When enabled, Progressive tiles are sent to the browser for WASM-based decoding. */
+    {
+        const char* prog_env = getenv("RDP_ENABLE_PROGRESSIVE");
+        BOOL enable_progressive = (prog_env && (strcmp(prog_env, "1") == 0 || strcasecmp(prog_env, "true") == 0));
+        if (enable_progressive) {
+            fprintf(stderr, "[rdp_bridge] Progressive codec ENABLED via RDP_ENABLE_PROGRESSIVE\n");
+        }
+        if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, enable_progressive)) goto fail;
+        if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, enable_progressive)) goto fail;
+    }
     /* Disable legacy codecs - we want H.264 only */
     if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, FALSE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_NSCodec, FALSE)) goto fail;
@@ -2014,6 +2039,16 @@ static UINT gfx_on_create_surface(RdpgfxClientContext* context, const RDPGFX_CRE
     }
     
     pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    /* Queue CREATE_SURFACE event for Python wire format streaming */
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_CREATE_SURFACE;
+    event.surface_id = create->surfaceId;
+    event.width = create->width;
+    event.height = create->height;
+    event.pixel_format = create->pixelFormat;
+    gfx_queue_event(bctx, &event);
+    
     return CHANNEL_RC_OK;
 }
 
@@ -2047,6 +2082,13 @@ static UINT gfx_on_delete_surface(RdpgfxClientContext* context, const RDPGFX_DEL
     }
     
     pthread_mutex_unlock(&bctx->gfx_mutex);
+    
+    /* Queue DELETE_SURFACE event for Python wire format streaming */
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_DELETE_SURFACE;
+    event.surface_id = del->surfaceId;
+    gfx_queue_event(bctx, &event);
+    
     return CHANNEL_RC_OK;
 }
 
@@ -3037,6 +3079,12 @@ static UINT gfx_on_start_frame(RdpgfxClientContext* context, const RDPGFX_START_
     bctx->frame_cmd_count = 0;  /* Reset command count for this frame */
     bctx->h264_queued_this_frame = false;  /* Reset H.264 flag for this frame */
     
+    /* Queue START_FRAME event for Python wire format streaming */
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_START_FRAME;
+    event.frame_id = start->frameId;
+    gfx_queue_event(bctx, &event);
+    
     return CHANNEL_RC_OK;
 }
 
@@ -3057,6 +3105,12 @@ static UINT gfx_on_end_frame(RdpgfxClientContext* context, const RDPGFX_END_FRAM
     /* Update last_completed_frame_id so Python knows a frame finished */
     bctx->last_completed_frame_id = end->frameId;
     pthread_mutex_unlock(&bctx->rect_mutex);
+    
+    /* Queue END_FRAME event for Python wire format streaming */
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_END_FRAME;
+    event.frame_id = end->frameId;
+    gfx_queue_event(bctx, &event);
     
     /* DON'T set needs_full_frame here! 
      * - If H.264 was sent, the frontend handles it via the H.264 pipeline
@@ -3203,6 +3257,86 @@ uint16_t rdp_gfx_get_primary_surface(RdpSession* session)
     pthread_mutex_unlock(&ctx->gfx_mutex);
     
     return id;
+}
+
+/* ============================================================================
+ * GFX Event Queue API (for wire format streaming)
+ * ============================================================================ */
+
+/* Internal helper: queue a GFX event (caller must NOT hold gfx_event_mutex) */
+static void gfx_queue_event(BridgeContext* ctx, const RdpGfxEvent* event)
+{
+    if (!ctx || !event) return;
+    
+    pthread_mutex_lock(&ctx->gfx_event_mutex);
+    
+    if (ctx->gfx_event_count >= RDP_MAX_GFX_EVENTS) {
+        /* Queue full - drop oldest event */
+        ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % RDP_MAX_GFX_EVENTS;
+        ctx->gfx_event_count--;
+    }
+    
+    ctx->gfx_events[ctx->gfx_event_write_idx] = *event;
+    ctx->gfx_event_write_idx = (ctx->gfx_event_write_idx + 1) % RDP_MAX_GFX_EVENTS;
+    ctx->gfx_event_count++;
+    
+    pthread_mutex_unlock(&ctx->gfx_event_mutex);
+}
+
+int rdp_gfx_has_events(RdpSession* session)
+{
+    if (!session) return 0;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_event_mutex);
+    int count = ctx->gfx_event_count;
+    pthread_mutex_unlock(&ctx->gfx_event_mutex);
+    
+    return count;
+}
+
+int rdp_gfx_get_event(RdpSession* session, RdpGfxEvent* event)
+{
+    if (!session || !event) return -1;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_event_mutex);
+    
+    if (ctx->gfx_event_count == 0) {
+        pthread_mutex_unlock(&ctx->gfx_event_mutex);
+        return -1;
+    }
+    
+    *event = ctx->gfx_events[ctx->gfx_event_read_idx];
+    ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % RDP_MAX_GFX_EVENTS;
+    ctx->gfx_event_count--;
+    
+    pthread_mutex_unlock(&ctx->gfx_event_mutex);
+    return 0;
+}
+
+void rdp_gfx_clear_events(RdpSession* session)
+{
+    if (!session) return;
+    BridgeContext* ctx = (BridgeContext*)session;
+    
+    pthread_mutex_lock(&ctx->gfx_event_mutex);
+    ctx->gfx_event_write_idx = 0;
+    ctx->gfx_event_read_idx = 0;
+    ctx->gfx_event_count = 0;
+    pthread_mutex_unlock(&ctx->gfx_event_mutex);
+}
+
+int rdp_gfx_is_progressive_enabled(RdpSession* session)
+{
+    if (!session) return 0;
+    
+    rdpContext* context = (rdpContext*)session;
+    rdpSettings* settings = context->settings;
+    
+    if (!settings) return 0;
+    
+    return freerdp_settings_get_bool(settings, FreeRDP_GfxProgressive) ? 1 : 0;
 }
 
 /* ============================================================================

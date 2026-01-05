@@ -12,6 +12,9 @@ services:
       - WS_HOST=0.0.0.0
       - WS_PORT=8765
       - LOG_LEVEL=INFO
+      # Enable Progressive codec for browser-side WASM decoding
+      # Set to 1 or true to enable, disabled by default
+      # - RDP_ENABLE_PROGRESSIVE=1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
       interval: 30s

@@ -6,6 +6,7 @@ Uses a native C library (librdp_bridge.so) for direct RDP connection with:
 - Dirty rectangle tracking for delta updates
 - Direct input injection (no X11/xdotool)
 - WebP encoding for efficient bandwidth usage
+- GFX event streaming with wire format binary protocol
 """
 
 import asyncio
@@ -23,6 +24,13 @@ from pathlib import Path
 from typing import Optional
 
 from PIL import Image
+
+# Import wire format for new binary protocol
+from wire_format import (
+    Magic, build_create_surface, build_delete_surface, build_start_frame,
+    build_end_frame, build_webp_tile, build_h264_frame, parse_frame_ack,
+    parse_backpressure, get_message_type
+)
 
 logger = logging.getLogger('rdp-bridge')
 
@@ -195,6 +203,34 @@ class RdpGfxSurface(Structure):
         ('mapped_to_output', c_bool),
         ('output_x', c_int32),
         ('output_y', c_int32),
+    ]
+
+
+# GFX event type constants (match C enum RdpGfxEventType)
+RDP_GFX_EVENT_NONE = 0
+RDP_GFX_EVENT_CREATE_SURFACE = 1
+RDP_GFX_EVENT_DELETE_SURFACE = 2
+RDP_GFX_EVENT_START_FRAME = 3
+RDP_GFX_EVENT_END_FRAME = 4
+RDP_GFX_EVENT_SOLID_FILL = 5
+RDP_GFX_EVENT_SURFACE_TO_SURFACE = 6
+
+
+class RdpGfxEvent(Structure):
+    """GFX event for wire format streaming (matches C struct)"""
+    _fields_ = [
+        ('type', c_int),
+        ('frame_id', c_uint32),
+        ('surface_id', c_uint16),
+        ('dst_surface_id', c_uint16),
+        ('width', c_uint32),
+        ('height', c_uint32),
+        ('pixel_format', c_uint32),
+        ('x', c_int32),
+        ('y', c_int32),
+        ('src_x', c_int32),
+        ('src_y', c_int32),
+        ('color', c_uint32),
     ]
 
 
@@ -436,6 +472,23 @@ class NativeLibrary:
         lib.rdp_gfx_get_primary_surface.argtypes = [c_void_p]
         lib.rdp_gfx_get_primary_surface.restype = c_uint16
         
+        # GFX event queue API (for wire format streaming)
+        # rdp_gfx_has_events
+        lib.rdp_gfx_has_events.argtypes = [c_void_p]
+        lib.rdp_gfx_has_events.restype = c_int
+        
+        # rdp_gfx_get_event
+        lib.rdp_gfx_get_event.argtypes = [c_void_p, POINTER(RdpGfxEvent)]
+        lib.rdp_gfx_get_event.restype = c_int
+        
+        # rdp_gfx_clear_events
+        lib.rdp_gfx_clear_events.argtypes = [c_void_p]
+        lib.rdp_gfx_clear_events.restype = None
+        
+        # rdp_gfx_is_progressive_enabled
+        lib.rdp_gfx_is_progressive_enabled.argtypes = [c_void_p]
+        lib.rdp_gfx_is_progressive_enabled.restype = c_int
+        
         # Session registry functions
         # rdp_set_max_sessions
         lib.rdp_set_max_sessions.argtypes = [c_int]
@@ -529,6 +582,19 @@ class RDPBridge:
         self._audio_enabled = True
         self._audio_buffer_size = 8192  # PCM buffer size for reading
     
+    @property
+    def is_progressive_enabled(self) -> bool:
+        """Check if Progressive codec is enabled for browser-side WASM decoding.
+        
+        Progressive codec is enabled via RDP_ENABLE_PROGRESSIVE=1 environment variable.
+        
+        Returns:
+            True if Progressive codec is enabled, False otherwise
+        """
+        if not self._session or not self._lib:
+            return False
+        return self._lib.rdp_gfx_is_progressive_enabled(self._session) == 1
+    
     async def connect(self) -> bool:
         """Connect to the RDP server"""
         try:
@@ -610,6 +676,32 @@ class RDPBridge:
             logger.error(f"Resize error: {e}")
             return False
     
+    def _build_gfx_event_message(self, event: RdpGfxEvent) -> Optional[bytes]:
+        """Build binary wire format message for a GFX event.
+        
+        Args:
+            event: GFX event from native library
+            
+        Returns:
+            Binary message or None if event type is not handled
+        """
+        if event.type == RDP_GFX_EVENT_CREATE_SURFACE:
+            return build_create_surface(
+                event.surface_id, 
+                event.width, 
+                event.height, 
+                event.pixel_format
+            )
+        elif event.type == RDP_GFX_EVENT_DELETE_SURFACE:
+            return build_delete_surface(event.surface_id)
+        elif event.type == RDP_GFX_EVENT_START_FRAME:
+            return build_start_frame(event.frame_id)
+        elif event.type == RDP_GFX_EVENT_END_FRAME:
+            return build_end_frame(event.frame_id)
+        else:
+            # Unhandled event type
+            return None
+    
     def _read_frame_buffer_safe(self) -> tuple:
         """Read frame buffer with lock protection against resize races.
         
@@ -657,7 +749,11 @@ class RDPBridge:
         rects = (RdpRect * max_rects)()
         poll_count = 0
         h264_frame = RdpH264Frame()
+        gfx_event = RdpGfxEvent()
         gfx_mode_logged = False
+        
+        # Track current frame ID for wire format tile messages
+        current_frame_id = 0
         
         while self.running:
             try:
@@ -686,6 +782,27 @@ class RDPBridge:
                     }.get(codec, f"Unknown({codec})")
                     logger.info(f"GFX pipeline active with codec: {codec_name}")
                     gfx_mode_logged = True
+                
+                # Priority 0: Send GFX lifecycle events (surface create/delete, frame start/end)
+                if gfx_active:
+                    events_sent = 0
+                    while self._lib.rdp_gfx_has_events(self._session) > 0:
+                        ret = self._lib.rdp_gfx_get_event(
+                            self._session, ctypes.byref(gfx_event)
+                        )
+                        if ret == 0:
+                            msg = self._build_gfx_event_message(gfx_event)
+                            if msg:
+                                await self.websocket.send(msg)
+                                events_sent += 1
+                                # Track frame ID for tile messages
+                                if gfx_event.type == RDP_GFX_EVENT_START_FRAME:
+                                    current_frame_id = gfx_event.frame_id
+                        else:
+                            break
+                    
+                    if events_sent > 0 and events_sent % 10 == 0:
+                        await asyncio.sleep(0)  # Yield periodically
                 
                 # Priority 1: Stream H.264 frames from GFX pipeline
                 if gfx_active:

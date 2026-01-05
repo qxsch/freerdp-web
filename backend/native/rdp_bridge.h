@@ -27,6 +27,7 @@ extern "C" {
 #define RDP_MAX_GFX_CACHE_SLOTS 4096  /* Max bitmap cache slots for GFX */
 #define RDP_MAX_H264_FRAMES 16
 #define RDP_H264_FRAME_BUFFER_SIZE (2 * 1024 * 1024)  /* 2MB per frame max */
+#define RDP_MAX_GFX_EVENTS 64  /* Max pending GFX lifecycle events */
 
 /* Session registry limits (compile-time defaults, runtime configurable) */
 #define RDP_MAX_SESSIONS_DEFAULT 100
@@ -112,6 +113,33 @@ typedef struct {
     int32_t output_x;             /* Output origin X */
     int32_t output_y;             /* Output origin Y */
 } RdpGfxSurface;
+
+/* GFX event types for wire format streaming */
+typedef enum {
+    RDP_GFX_EVENT_NONE = 0,
+    RDP_GFX_EVENT_CREATE_SURFACE,   /* Surface created */
+    RDP_GFX_EVENT_DELETE_SURFACE,   /* Surface deleted */
+    RDP_GFX_EVENT_START_FRAME,      /* Frame processing started */
+    RDP_GFX_EVENT_END_FRAME,        /* Frame processing ended */
+    RDP_GFX_EVENT_SOLID_FILL,       /* Solid fill operation */
+    RDP_GFX_EVENT_SURFACE_TO_SURFACE, /* Surface copy operation */
+} RdpGfxEventType;
+
+/* GFX event for Python consumption */
+typedef struct {
+    RdpGfxEventType type;
+    uint32_t frame_id;              /* Frame ID (for START_FRAME/END_FRAME) */
+    uint16_t surface_id;            /* Surface ID */
+    uint16_t dst_surface_id;        /* Destination surface (for SURFACE_TO_SURFACE) */
+    uint32_t width;                 /* Width (for CREATE_SURFACE, SOLID_FILL) */
+    uint32_t height;                /* Height (for CREATE_SURFACE, SOLID_FILL) */
+    uint32_t pixel_format;          /* Pixel format (for CREATE_SURFACE) */
+    int32_t x;                      /* X coordinate */
+    int32_t y;                      /* Y coordinate */
+    int32_t src_x;                  /* Source X (for SURFACE_TO_SURFACE) */
+    int32_t src_y;                  /* Source Y (for SURFACE_TO_SURFACE) */
+    uint32_t color;                 /* Fill color (ARGB, for SOLID_FILL) */
+} RdpGfxEvent;
 
 /* Opaque session handle */
 typedef struct RdpSession RdpSession;
@@ -531,6 +559,45 @@ int rdp_gfx_get_surface(RdpSession* session, uint16_t surface_id, RdpGfxSurface*
  * @return          Primary surface ID or 0 if not mapped
  */
 uint16_t rdp_gfx_get_primary_surface(RdpSession* session);
+
+/* ============================================================================
+ * GFX Event Queue API (for wire format streaming)
+ * ============================================================================ */
+
+/**
+ * Check if GFX events are available
+ * 
+ * @param session   Session handle
+ * @return          Number of events available (0 if none)
+ */
+int rdp_gfx_has_events(RdpSession* session);
+
+/**
+ * Get next GFX event from the queue
+ * 
+ * @param session   Session handle
+ * @param event     Output: event descriptor
+ * @return          0 on success, -1 if no events
+ */
+int rdp_gfx_get_event(RdpSession* session, RdpGfxEvent* event);
+
+/**
+ * Clear all pending GFX events
+ * 
+ * @param session   Session handle
+ */
+void rdp_gfx_clear_events(RdpSession* session);
+
+/**
+ * Check if Progressive codec is enabled
+ * 
+ * Progressive codec allows browser-side decoding of compressed tiles
+ * using WebAssembly. Enable via RDP_ENABLE_PROGRESSIVE=1 environment variable.
+ * 
+ * @param session   Session handle
+ * @return          1 if enabled, 0 if disabled
+ */
+int rdp_gfx_is_progressive_enabled(RdpSession* session);
 
 #ifdef __cplusplus
 }

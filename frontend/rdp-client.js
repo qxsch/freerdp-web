@@ -298,6 +298,18 @@ const OPUS_MAGIC = [0x4F, 0x50, 0x55, 0x53];  // "OPUS"
 const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49]; // "AUDI"
 const H264_MAGIC = [0x48, 0x32, 0x36, 0x34];  // "H264"
 
+// New GFX event stream magic codes (4 bytes each)
+const SURF_MAGIC = [0x53, 0x55, 0x52, 0x46];  // "SURF" - createSurface
+const DELS_MAGIC = [0x44, 0x45, 0x4C, 0x53];  // "DELS" - deleteSurface
+const STFR_MAGIC = [0x53, 0x54, 0x46, 0x52];  // "STFR" - startFrame
+const ENFR_MAGIC = [0x45, 0x4E, 0x46, 0x52];  // "ENFR" - endFrame
+const PROG_MAGIC = [0x50, 0x52, 0x4F, 0x47];  // "PROG" - progressive tile
+const WEBP_MAGIC = [0x57, 0x45, 0x42, 0x50];  // "WEBP" - WebP tile
+const TILE_MAGIC = [0x54, 0x49, 0x4C, 0x45];  // "TILE" - raw RGBA tile
+const SFIL_MAGIC = [0x53, 0x46, 0x49, 0x4C];  // "SFIL" - solidFill
+const S2SF_MAGIC = [0x53, 0x32, 0x53, 0x46];  // "S2SF" - surfaceToSurface
+const C2SF_MAGIC = [0x43, 0x32, 0x53, 0x46];  // "C2SF" - cacheToSurface
+
 // ============================================================
 // RDP CLIENT CLASS
 // ============================================================
@@ -380,14 +392,11 @@ export class RDPClient {
         this._opusSampleRate = 48000;
         this._opusChannels = 2;
         
-        // H.264 decoder
-        this._videoDecoder = null;
-        this._h264Initialized = false;
-        this._h264DecodeQueue = [];
-        this._h264DecoderError = false;
-        this._h264ConfiguredWidth = 0;
-        this._h264ConfiguredHeight = 0;
-        this._h264FrameCount = 0;
+        // GFX Worker for progressive/tile rendering
+        this._gfxWorker = null;
+        this._gfxWorkerReady = false;
+        this._useOffscreenCanvas = typeof OffscreenCanvas !== 'undefined';
+        this._pendingGfxMessages = [];
         
         // Event callbacks
         this._eventHandlers = {};
@@ -419,7 +428,130 @@ export class RDPClient {
         };
         
         this._canvas = this._el.canvas;
-        this._ctx = this._canvas.getContext('2d');
+        
+        // Initialize GFX worker - OffscreenCanvas is required
+        this._initGfxWorker();
+    }
+    
+    /**
+     * Initialize the GFX compositor worker
+     * OffscreenCanvas is REQUIRED - will fail if not supported
+     */
+    _initGfxWorker() {
+        if (!this._useOffscreenCanvas) {
+            const msg = 'OffscreenCanvas is required but not supported by this browser';
+            console.error('[RDPClient]', msg);
+            this._handleError(msg);
+            return;
+        }
+        
+        try {
+            this._gfxWorker = new Worker('./gfx-worker.js', { type: 'module' });
+            
+            this._gfxWorker.onmessage = (event) => {
+                this._handleGfxWorkerMessage(event.data);
+            };
+            
+            this._gfxWorker.onerror = (err) => {
+                console.error('[RDPClient] GFX Worker error:', err);
+                this._gfxWorker = null;
+                this._gfxWorkerReady = false;
+                this._handleError('GFX Worker failed to initialize');
+            };
+            
+            console.log('[RDPClient] GFX Worker created');
+        } catch (err) {
+            console.error('[RDPClient] Failed to create GFX Worker:', err);
+            this._gfxWorker = null;
+            this._handleError('Failed to create GFX Worker: ' + err.message);
+        }
+    }
+    
+    /**
+     * Handle messages from GFX worker
+     */
+    _handleGfxWorkerMessage(msg) {
+        switch (msg.type) {
+            case 'loaded':
+                console.log('[RDPClient] GFX Worker loaded');
+                break;
+                
+            case 'ready':
+                this._gfxWorkerReady = true;
+                console.log('[RDPClient] GFX Worker ready, WASM:', msg.wasmReady);
+                // Flush pending messages
+                for (const pending of this._pendingGfxMessages) {
+                    this._gfxWorker.postMessage(pending.msg, pending.transfer);
+                }
+                this._pendingGfxMessages = [];
+                break;
+                
+            case 'frameAck':
+                // Send frame acknowledgment back to server
+                if (this._ws && this._ws.readyState === WebSocket.OPEN && msg.data) {
+                    this._ws.send(msg.data);
+                }
+                break;
+                
+            case 'backpressure':
+                // Send backpressure signal to server
+                if (this._ws && this._ws.readyState === WebSocket.OPEN && msg.data) {
+                    this._ws.send(msg.data);
+                }
+                break;
+                
+            case 'unhandled':
+                // Unhandled message from worker - process on main thread
+                if (msg.data) {
+                    this._handleFrameUpdate(msg.data);
+                }
+                break;
+        }
+    }
+    
+    /**
+     * Initialize GFX worker canvas when connected
+     */
+    _initGfxWorkerCanvas(width, height) {
+        if (!this._gfxWorker || !this._useOffscreenCanvas) {
+            this._handleError('GFX Worker not available');
+            this.disconnect();
+            return;
+        }
+        
+        try {
+            // Transfer canvas control to worker
+            const offscreen = this._canvas.transferControlToOffscreen();
+            
+            this._gfxWorker.postMessage({
+                type: 'init',
+                data: { canvas: offscreen, width, height }
+            }, [offscreen]);
+            
+            console.log('[RDPClient] Canvas transferred to GFX Worker');
+        } catch (err) {
+            console.error('[RDPClient] Failed to transfer canvas:', err);
+            this._handleError('Failed to transfer canvas to worker: ' + err.message);
+            this.disconnect();
+        }
+    }
+    
+    /**
+     * Send message to GFX worker
+     */
+    _sendToGfxWorker(data) {
+        if (!this._gfxWorker) return false;
+        
+        const msg = { type: 'binary', data };
+        const transfer = data instanceof ArrayBuffer ? [data] : [];
+        
+        if (this._gfxWorkerReady) {
+            this._gfxWorker.postMessage(msg, transfer);
+        } else {
+            this._pendingGfxMessages.push({ msg, transfer });
+        }
+        
+        return true;
     }
 
     _setupEventListeners() {
@@ -662,6 +794,10 @@ export class RDPClient {
      */
     destroy() {
         this.disconnect();
+        if (this._gfxWorker) {
+            this._gfxWorker.terminate();
+            this._gfxWorker = null;
+        }
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
         }
@@ -733,6 +869,7 @@ export class RDPClient {
         if (event.data instanceof ArrayBuffer) {
             const bytes = new Uint8Array(event.data);
             
+            // Audio - always handle on main thread
             if (this._matchMagic(bytes, OPUS_MAGIC)) {
                 this._handleOpusFrame(bytes);
                 return;
@@ -742,6 +879,23 @@ export class RDPClient {
                 return;
             }
             
+            // When using GFX worker, route ALL non-audio frames to worker
+            // (canvas is transferred, so main thread cannot draw)
+            if (this._gfxWorkerReady && this._sendToGfxWorker(event.data)) {
+                return;
+            }
+            
+            // If worker exists but not ready yet, queue frames
+            // (canvas is transferred, but worker hasn't confirmed ready)
+            if (this._gfxWorker && this._useOffscreenCanvas && !this._gfxWorkerReady) {
+                this._pendingGfxMessages.push({
+                    msg: { type: 'binary', data: event.data },
+                    transfer: [event.data]
+                });
+                return;
+            }
+            
+            // Main thread fallback (when worker not available)
             this._handleFrameUpdate(event.data);
             return;
         }
@@ -770,6 +924,24 @@ export class RDPClient {
         }
     }
 
+    /**
+     * Check if message is a new GFX event stream format
+     */
+    _isGfxEventMessage(bytes) {
+        if (bytes.length < 4) return false;
+        
+        return this._matchMagic(bytes, SURF_MAGIC) ||
+               this._matchMagic(bytes, DELS_MAGIC) ||
+               this._matchMagic(bytes, STFR_MAGIC) ||
+               this._matchMagic(bytes, ENFR_MAGIC) ||
+               this._matchMagic(bytes, PROG_MAGIC) ||
+               this._matchMagic(bytes, WEBP_MAGIC) ||
+               this._matchMagic(bytes, TILE_MAGIC) ||
+               this._matchMagic(bytes, SFIL_MAGIC) ||
+               this._matchMagic(bytes, S2SF_MAGIC) ||
+               this._matchMagic(bytes, C2SF_MAGIC);
+    }
+
     _matchMagic(bytes, magic) {
         return bytes.length > 12 &&
             bytes[0] === magic[0] && bytes[1] === magic[1] &&
@@ -791,6 +963,12 @@ export class RDPClient {
         if (msg.width && msg.height) {
             this._handleServerResize(msg.width, msg.height);
         }
+        
+        // Initialize GFX worker with canvas
+        // Note: We only transfer canvas control on connect, not earlier,
+        // because the canvas dimensions need to match the session size
+        this._initGfxWorkerCanvas(msg.width || this._canvas.width, 
+                                  msg.height || this._canvas.height);
 
         setInterval(() => this._sendPing(), 5000);
         
@@ -816,9 +994,50 @@ export class RDPClient {
         this._el.btnMute.disabled = true;
         
         this._cleanupAudio();
-        this._cleanupH264();
+        this._cleanupGfxWorker();
         
         this._emit('disconnected');
+    }
+    
+    /**
+     * Clean up GFX worker
+     */
+    _cleanupGfxWorker() {
+        if (this._gfxWorker) {
+            this._gfxWorker.terminate();
+            this._gfxWorker = null;
+        }
+        this._gfxWorkerReady = false;
+        this._pendingGfxMessages = [];
+        
+        // Re-acquire canvas context for next connection
+        // (transferControlToOffscreen is one-way, so we need to recreate canvas)
+        if (this._useOffscreenCanvas && this._el.canvas) {
+            const parent = this._el.canvas.parentElement;
+            const oldCanvas = this._el.canvas;
+            const newCanvas = document.createElement('canvas');
+            newCanvas.className = oldCanvas.className;
+            newCanvas.width = oldCanvas.width;
+            newCanvas.height = oldCanvas.height;
+            newCanvas.style.display = oldCanvas.style.display;
+            newCanvas.setAttribute('tabindex', '0');
+            parent.replaceChild(newCanvas, oldCanvas);
+            this._el.canvas = newCanvas;
+            this._canvas = newCanvas;
+            // Note: Do NOT acquire 2D context here - _initGfxWorker will handle it
+            // or _initGfxWorkerCanvas will acquire context if transfer fails
+            
+            // Re-attach event listeners to new canvas
+            this._canvas.addEventListener('click', () => this._canvas.focus());
+            this._canvas.addEventListener('mousemove', (e) => this._handleMouseMove(e));
+            this._canvas.addEventListener('mousedown', (e) => this._handleMouseDown(e));
+            this._canvas.addEventListener('mouseup', (e) => this._handleMouseUp(e));
+            this._canvas.addEventListener('wheel', (e) => this._handleMouseWheel(e));
+            this._canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+            
+            // Re-initialize worker for next connection
+            this._initGfxWorker();
+        }
     }
 
     _handleError(message) {
@@ -843,200 +1062,13 @@ export class RDPClient {
     // PRIVATE: VIDEO FRAMES
     // --------------------------------------------------
 
+    /**
+     * Handle frame update on main thread (fallback - should not be called)
+     * All rendering is handled by the GFX worker via OffscreenCanvas
+     */
     _handleFrameUpdate(data) {
-        const bytes = new Uint8Array(data);
-        
-        if (this._matchMagic(bytes, H264_MAGIC)) {
-            this._handleH264Frame(bytes);
-            return;
-        }
-        
-        // Delta frame: "DELT"
-        if (bytes.length > 8 && bytes[0] === 0x44 && bytes[1] === 0x45 && 
-            bytes[2] === 0x4C && bytes[3] === 0x54) {
-            this._handleDeltaFrame(bytes);
-            return;
-        }
-        
-        // Full frame (WebP/JPEG)
-        let mimeType = 'image/webp';
-        if (bytes[0] === 0xFF && bytes[1] === 0xD8) mimeType = 'image/jpeg';
-        
-        const blob = new Blob([data], { type: mimeType });
-        const url = URL.createObjectURL(blob);
-        const img = new Image();
-        
-        img.onload = () => {
-            this._ctx.drawImage(img, 0, 0, this._canvas.width, this._canvas.height);
-            URL.revokeObjectURL(url);
-        };
-        img.onerror = () => URL.revokeObjectURL(url);
-        img.src = url;
-    }
-
-    _handleDeltaFrame(bytes) {
-        try {
-            const jsonLength = bytes[4] | (bytes[5] << 8) | (bytes[6] << 16) | (bytes[7] << 24);
-            if (jsonLength <= 0 || jsonLength > bytes.length - 8) return;
-            
-            const jsonStr = new TextDecoder().decode(bytes.slice(8, 8 + jsonLength));
-            const metadata = JSON.parse(jsonStr);
-            
-            if (!metadata.rects) return;
-            
-            let offset = 8 + jsonLength;
-            
-            for (const rect of metadata.rects) {
-                if (offset + rect.size > bytes.length) break;
-                
-                const tileData = bytes.slice(offset, offset + rect.size);
-                offset += rect.size;
-                
-                const blob = new Blob([tileData], { type: 'image/webp' });
-                const url = URL.createObjectURL(blob);
-                const img = new Image();
-                const { x, y } = rect;
-                
-                img.onload = () => {
-                    this._ctx.drawImage(img, x, y);
-                    URL.revokeObjectURL(url);
-                };
-                img.onerror = () => URL.revokeObjectURL(url);
-                img.src = url;
-            }
-        } catch (e) {
-            console.error('[RDPClient] Delta frame error:', e);
-        }
-    }
-
-    // --------------------------------------------------
-    // PRIVATE: H.264
-    // --------------------------------------------------
-
-    async _handleH264Frame(bytes) {
-        try {
-            const view = new DataView(bytes.buffer, bytes.byteOffset);
-            let offset = 4;
-            
-            offset += 4; // frameId
-            offset += 2; // surfaceId
-            offset += 2; // codecId
-            const frameType = bytes[offset]; offset += 1;
-            const destX = view.getInt16(offset, true); offset += 2;
-            const destY = view.getInt16(offset, true); offset += 2;
-            const destW = view.getUint16(offset, true); offset += 2;
-            const destH = view.getUint16(offset, true); offset += 2;
-            const nalSize = view.getUint32(offset, true); offset += 4;
-            offset += 4; // chromaNalSize
-            
-            if (offset + nalSize > bytes.length) return;
-            
-            const nalData = bytes.slice(offset, offset + nalSize);
-            
-            this._h264FrameCount++;
-            
-            if (!this._h264Initialized) {
-                const success = await this._initH264(this._canvas.width, this._canvas.height);
-                if (!success) return;
-            }
-            
-            await this._decodeH264(nalData, frameType, destX, destY, destW, destH);
-        } catch (e) {
-            console.error('[RDPClient] H.264 error:', e);
-        }
-    }
-
-    async _initH264(width, height) {
-        if (typeof VideoDecoder === 'undefined') return false;
-        
-        try {
-            const config = {
-                codec: 'avc1.64001f',
-                codedWidth: width,
-                codedHeight: height,
-                optimizeForLatency: true,
-                hardwareAcceleration: 'prefer-hardware',
-            };
-            
-            const support = await VideoDecoder.isConfigSupported(config);
-            if (!support.supported) return false;
-            
-            this._videoDecoder = new VideoDecoder({
-                output: (frame) => {
-                    const meta = this._h264DecodeQueue.shift();
-                    if (meta) {
-                        this._ctx.drawImage(frame, 
-                            meta.destX, meta.destY, meta.destW, meta.destH,
-                            meta.destX, meta.destY, meta.destW, meta.destH);
-                    }
-                    frame.close();
-                    this._h264DecoderError = false;
-                },
-                error: (e) => {
-                    console.error('[RDPClient] H.264 decode error:', e);
-                    this._h264DecoderError = true;
-                    this._h264DecodeQueue = [];
-                }
-            });
-            
-            await this._videoDecoder.configure(config);
-            this._h264Initialized = true;
-            this._h264ConfiguredWidth = width;
-            this._h264ConfiguredHeight = height;
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    async _decodeH264(nalData, frameType, destX, destY, destW, destH) {
-        const isKeyframe = (frameType === 0);
-        const surfaceW = this._canvas.width;
-        const surfaceH = this._canvas.height;
-        
-        const needsReconfigure = this._h264Initialized && isKeyframe &&
-            (surfaceW !== this._h264ConfiguredWidth || surfaceH !== this._h264ConfiguredHeight);
-        
-        if (isKeyframe && (this._h264DecoderError || !this._videoDecoder || 
-            this._videoDecoder.state === 'closed' || needsReconfigure)) {
-            if (this._videoDecoder && this._videoDecoder.state !== 'closed') {
-                try { this._videoDecoder.close(); } catch (e) {}
-            }
-            this._h264Initialized = false;
-            this._h264DecoderError = false;
-            this._h264DecodeQueue = [];
-            
-            const success = await this._initH264(surfaceW, surfaceH);
-            if (!success) return;
-        }
-        
-        if (!this._videoDecoder || this._videoDecoder.state === 'closed') return;
-        if (this._h264DecoderError && !isKeyframe) return;
-        
-        try {
-            this._h264DecodeQueue.push({ destX, destY, destW, destH });
-            
-            const chunk = new EncodedVideoChunk({
-                type: isKeyframe ? 'key' : 'delta',
-                timestamp: performance.now() * 1000,
-                data: nalData
-            });
-            
-            this._videoDecoder.decode(chunk);
-        } catch (e) {
-            this._h264DecodeQueue.pop();
-            this._h264DecoderError = true;
-        }
-    }
-
-    _cleanupH264() {
-        if (this._videoDecoder) {
-            try { this._videoDecoder.close(); } catch (e) {}
-            this._videoDecoder = null;
-        }
-        this._h264Initialized = false;
-        this._h264DecodeQueue = [];
-        this._h264FrameCount = 0;
+        // This should not be reached - all frames go to GFX worker
+        console.warn('[RDPClient] Unexpected frame on main thread - GFX worker should handle all frames');
     }
 
     // --------------------------------------------------
@@ -1403,6 +1435,14 @@ export class RDPClient {
         this._canvas.width = width;
         this._canvas.height = height;
         this._el.resolution.textContent = `Resolution: ${width}x${height}`;
+        
+        // Notify GFX worker of resize
+        if (this._gfxWorker && this._gfxWorkerReady) {
+            this._gfxWorker.postMessage({
+                type: 'resize',
+                data: { width, height }
+            });
+        }
         
         this._emit('resize', { width, height });
     }

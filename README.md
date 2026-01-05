@@ -92,43 +92,16 @@ The backend requires building the native C library against FreeRDP3. This is bes
 
 ```bash
 cd backend
-
-# Using Docker (recommended)
 docker build -t rdp-backend .
 docker run --rm -it -p 8765:8765 rdp-backend
-```
-
-For local development without Docker (requires FreeRDP3 dev libraries):
-
-```bash
-# Install FreeRDP3 dev packages (Ubuntu 24.04+)
-sudo apt install freerdp3-dev libwinpr3-dev cmake build-essential
-
-# Build native library
-cd native
-cmake -B build && cmake --build build
-sudo cmake --install build
-sudo ldconfig
-
-# Install Python dependencies
-cd ..
-pip install -r requirements.txt
-
-# Start server
-python server.py
 ```
 
 ### Frontend
 
 ```bash
 cd frontend
-
-# Using Docker
 docker build -t rdp-frontend .
 docker run --rm -it -p 8000:8000 rdp-frontend
-
-# Or using Python's built-in server
-python -m http.server 8000
 
 # Then open http://localhost:8000
 ```
