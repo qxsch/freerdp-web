@@ -199,6 +199,15 @@ RdpSession* rdp_create(
 int rdp_connect(RdpSession* session);
 
 /**
+ * Set progressive codec enabled state
+ * Must be called AFTER rdp_create() but BEFORE rdp_connect()
+ * 
+ * @param session   Session handle from rdp_create()
+ * @param enabled   1 to enable progressive codec, 0 to disable
+ */
+void rdp_set_progressive_enabled(RdpSession* session, int enabled);
+
+/**
  * Get current session state
  */
 RdpState rdp_get_state(RdpSession* session);

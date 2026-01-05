@@ -19,6 +19,7 @@ RUN mkdir -p build && \
     emcc -O3 -msimd128 -pthread \
         -s WASM=1 \
         -s MODULARIZE=1 \
+        -s EXPORT_ES6=1 \
         -s EXPORT_NAME="ProgressiveDecoderModule" \
         -s EXPORTED_FUNCTIONS="['_prog_create','_prog_free','_prog_create_surface','_prog_delete_surface','_prog_decompress','_prog_decompress_parallel','_prog_get_tile_data','_prog_get_dirty_tile_count','_prog_get_dirty_tile_info','_malloc','_free']" \
         -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap','getValue','setValue']" \

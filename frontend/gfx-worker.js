@@ -158,12 +158,11 @@ let parallelDecompressAvailable = false;
  */
 async function initWasm() {
     try {
-        // Dynamic import of the WASM module
+        // Dynamic import of the WASM module (ES6 module output from Emscripten)
         const module = await import('./progressive/progressive_decoder.js');
         
-        // Emscripten MODULARIZE exports the factory function
-        // It may be default export, named export (EXPORT_NAME), or module itself
-        const ModuleFactory = module.default || module.ProgressiveDecoderModule || module;
+        // Emscripten MODULARIZE + EXPORT_ES6 exports the factory as default
+        const ModuleFactory = module.default;
         
         if (typeof ModuleFactory !== 'function') {
             throw new Error('WASM module factory not found in exports');
@@ -738,10 +737,8 @@ self.onmessage = async (event) => {
             createSurface(0, data.width, data.height);
             mapSurfaceToPrimary(0);
             
-            // Initialize WASM (non-blocking)
-            initWasm().then(() => {
-                self.postMessage({ type: 'ready', wasmReady });
-            });
+            // WASM already loaded during worker startup
+            self.postMessage({ type: 'ready', wasmReady });
             break;
             
         case 'binary':
@@ -776,5 +773,14 @@ self.onmessage = async (event) => {
     }
 };
 
-// Report that worker is loaded
-self.postMessage({ type: 'loaded' });
+// ============================================================================
+// Worker startup - initialize WASM before reporting ready
+// ============================================================================
+
+(async () => {
+    // Load WASM at worker startup so we know immediately if it works
+    await initWasm();
+    
+    // Report that worker is loaded with WASM status
+    self.postMessage({ type: 'loaded', wasmReady });
+})();

@@ -231,7 +231,8 @@ async def handle_client(websocket: ServerConnection):
                         username=data['username'],
                         password=data['password'],
                         width=data.get('width', 1280),
-                        height=data.get('height', 720)
+                        height=data.get('height', 720),
+                        progressive_enabled=data.get('progressiveEnabled', False)
                     )
                     
                     rdp_bridge = RDPBridge(config, websocket)

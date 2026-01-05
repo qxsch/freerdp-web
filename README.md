@@ -117,6 +117,19 @@ docker run --rm -it -p 8000:8000 rdp-frontend
 
 The RDP client is available as a reusable ES module with Shadow DOM isolation, making it easy to integrate into any web application.
 
+### Required HTTP Headers
+
+The frontend requires cross-origin isolation headers for SharedArrayBuffer support (used by WASM pthreads). Your web server must include these headers:
+
+```nginx
+# Required for SharedArrayBuffer (WASM pthreads)
+# These headers enable cross-origin isolation
+add_header Cross-Origin-Opener-Policy "same-origin" always;
+add_header Cross-Origin-Embedder-Policy "require-corp" always;
+```
+
+Without these headers, the progressive codec WASM decoder will not function. The included `nginx.conf` already has these configured.
+
 ### Quick Start
 
 #### 1. Import the module
@@ -315,11 +328,6 @@ const client = new RDPClient(container, {
 });
 ```
 
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RDP_ENABLE_PROGRESSIVE` | `0` | Enable progressive codec (experimental) |
 
 ## Project Structure
 
@@ -368,16 +376,16 @@ The RDPGFX channel (MS-RDPEGFX) provides a client-side compositor with off-main-
                                            (SURF, H264, TILE, WEBP, ...)         │
                                                                                  ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                        Browser                                              │
-│  ┌───────────────────────┐           postMessage          ┌───────────────────────────┐   │
-│  │      Main Thread      │ ─────────────────────────────► │       GFX Worker          │   │
-│  │  • WebSocket receive  │                                │  • Wire format parsing    │   │
-│  │  • Audio decode/play  │ ◄───────────────────────────── │  • Surface management     │   │
-│  │  • Keyboard/mouse     │        frameAck/backpressure   │  • H.264 VideoDecoder     │   │
-│  │  • UI events          │                                │  • Tile decoding          │   │
-│  └───────────────────────┘                                │  • Frame composition      │   │
-│                                                           │  • OffscreenCanvas render │   │
-│                                                           └───────────────────────────┘   │
+│                                        Browser                                             │
+│  ┌───────────────────────┐           postMessage          ┌───────────────────────────┐    │
+│  │      Main Thread      │ ─────────────────────────────► │       GFX Worker          │    │
+│  │  • WebSocket receive  │                                │  • Wire format parsing    │    │
+│  │  • Audio decode/play  │ ◄───────────────────────────── │  • Surface management     │    │
+│  │  • Keyboard/mouse     │        frameAck/backpressure   │  • H.264 VideoDecoder     │    │
+│  │  • UI events          │                                │  • Tile decoding          │    │
+│  └───────────────────────┘                                │  • Frame composition      │    │
+│                                                           │  • OffscreenCanvas render │    │
+│                                                           └───────────────────────────┘    │
 └────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 

@@ -220,6 +220,18 @@ const STYLES = `
     border-color: var(--rdp-accent);
 }
 
+.rdp-form-checkbox label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+
+.rdp-form-checkbox input[type="checkbox"] {
+    width: auto;
+    cursor: pointer;
+}
+
 .rdp-modal-buttons {
     display: flex;
     gap: 8px;
@@ -281,6 +293,12 @@ const TEMPLATE = `
             <div class="rdp-form-group">
                 <label>Password</label>
                 <input type="password" class="rdp-input-pass" placeholder="Password">
+            </div>
+            <div class="rdp-form-group rdp-form-checkbox">
+                <label>
+                    <input type="checkbox" class="rdp-input-disable-progressive">
+                    <span>Disable Progressive/RFX</span>
+                </label>
             </div>
             <div class="rdp-modal-buttons">
                 <button class="rdp-btn rdp-btn-primary rdp-modal-connect">Connect</button>
@@ -397,6 +415,7 @@ export class RDPClient {
         this._gfxWorkerReady = false;
         this._useOffscreenCanvas = typeof OffscreenCanvas !== 'undefined';
         this._pendingGfxMessages = [];
+        this._wasmAvailable = false;  // Set by GFX worker on load
         
         // Event callbacks
         this._eventHandlers = {};
@@ -423,6 +442,7 @@ export class RDPClient {
             inputPort: $('.rdp-input-port'),
             inputUser: $('.rdp-input-user'),
             inputPass: $('.rdp-input-pass'),
+            inputDisableProgressive: $('.rdp-input-disable-progressive'),
             resolution: $('.rdp-resolution'),
             latency: $('.rdp-latency'),
         };
@@ -473,7 +493,12 @@ export class RDPClient {
     _handleGfxWorkerMessage(msg) {
         switch (msg.type) {
             case 'loaded':
-                console.log('[RDPClient] GFX Worker loaded');
+                // Worker loaded with WASM pre-initialized
+                this._wasmAvailable = !!msg.wasmReady;
+                console.log('[RDPClient] GFX Worker loaded, WASM:', this._wasmAvailable);
+                if (!this._wasmAvailable) {
+                    console.warn('[RDPClient] Progressive WASM not available - will use fallback decoders');
+                }
                 break;
                 
             case 'ready':
@@ -599,6 +624,7 @@ export class RDPClient {
      * @param {number} [credentials.port=3389] - RDP port
      * @param {string} credentials.user - Username
      * @param {string} credentials.pass - Password
+     * @param {boolean} [credentials.disableProgressive=false] - Disable Progressive/RFX codecs
      * @returns {Promise<void>}
      */
     connect(credentials) {
@@ -622,6 +648,9 @@ export class RDPClient {
                 this._canvas.width = width;
                 this._canvas.height = height;
 
+                // Determine if progressive codec should be enabled
+                const progressiveEnabled = this._wasmAvailable && !credentials.disableProgressive;
+                
                 this._sendMessage({
                     type: 'connect',
                     host: credentials.host,
@@ -629,8 +658,12 @@ export class RDPClient {
                     username: credentials.user,
                     password: credentials.pass,
                     width,
-                    height
+                    height,
+                    progressiveEnabled
                 });
+                
+                console.log('[RDPClient] Connect request - Progressive:', progressiveEnabled, 
+                            '(WASM:', this._wasmAvailable, ', disabled:', !!credentials.disableProgressive, ')');
             };
 
             this._ws.onmessage = (e) => this._handleMessage(e);
@@ -828,6 +861,7 @@ export class RDPClient {
         const port = parseInt(this._el.inputPort.value) || 3389;
         const user = this._el.inputUser.value.trim();
         const pass = this._el.inputPass.value;
+        const disableProgressive = this._el.inputDisableProgressive.checked;
 
         if (!host || !user) {
             alert('Please enter host and username');
@@ -835,7 +869,7 @@ export class RDPClient {
         }
 
         this._hideModal();
-        this.connect({ host, port, user, pass });
+        this.connect({ host, port, user, pass, disableProgressive });
     }
 
     _updateStatus(state, text) {
