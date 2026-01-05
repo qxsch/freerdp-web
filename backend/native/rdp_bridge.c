@@ -2614,13 +2614,7 @@ static bool queue_h264_frame(BridgeContext* bctx, uint32_t frame_id, uint16_t su
     
     bctx->h264_write_idx = (bctx->h264_write_idx + 1) % RDP_MAX_H264_FRAMES;
     bctx->h264_count++;
-    
-    /* Log first H.264 frame only (h264_count is 1 after first increment) */
-    if (bctx->h264_count == 1 && bctx->h264_write_idx == 1) {
-        fprintf(stderr, "[rdp_bridge] H.264 stream started: codec=%d size=%u\n",
-                codec_id, output_nal_size);
-    }
-    
+      
     /* Track negotiated codec (report original, not transcoded) */
     if (codec_id == RDP_GFX_CODEC_AVC420 && chroma_data) {
         /* Was AVC444, transcoded to AVC420 */

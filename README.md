@@ -134,6 +134,134 @@ python -m http.server 8000
 # Then open http://localhost:8000
 ```
 
+## Frontend Integration
+
+The RDP client is available as a reusable ES module with Shadow DOM isolation, making it easy to integrate into any web application.
+
+### Quick Start
+
+#### 1. Import the module
+
+```javascript
+import { RDPClient } from './rdp-client.js';
+```
+
+#### 2. Create an instance
+
+```javascript
+const client = new RDPClient(document.getElementById('container'), {
+  wsUrl: 'ws://localhost:8765',
+  showTopBar: true,    // Show/hide the connection toolbar
+  showBottomBar: true  // Show/hide the status bar
+});
+```
+
+#### 3. Connect programmatically
+
+```javascript
+await client.connect({
+  host: '192.168.1.100',
+  port: 3389,
+  user: 'Administrator',
+  pass: 'password'
+});
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `wsUrl` | string | `'ws://localhost:8765'` | WebSocket server URL |
+| `showTopBar` | boolean | `true` | Show/hide the top toolbar |
+| `showBottomBar` | boolean | `true` | Show/hide the bottom status bar |
+| `reconnectDelay` | number | `3000` | Reconnection delay in milliseconds |
+| `mouseThrottleMs` | number | `16` | Mouse move event throttle (~60fps) |
+| `resizeDebounceMs` | number | `2000` | Resize debounce delay |
+
+### Public API
+
+| Method | Description |
+|--------|-------------|
+| `connect(credentials)` | Connect to RDP server. Returns a Promise. |
+| `disconnect()` | Disconnect the current session |
+| `sendKeys(keys, opts)` | Send keystrokes. Options: `{ ctrl, alt, shift, meta, delay }` |
+| `sendKeyCombo(combo)` | Send key combination (e.g., `'Ctrl+Alt+Delete'`) |
+| `sendCtrlAltDel()` | Shortcut for `sendKeyCombo('Ctrl+Alt+Delete')` |
+| `getStatus()` | Returns `{ connected, resolution, muted }` |
+| `getMuted()` | Returns current mute state (boolean) |
+| `setMuted(bool)` | Set audio mute state |
+| `getResolution()` | Returns `{ width, height }` or `null` if not connected |
+| `on(event, handler)` | Register an event handler |
+| `off(event, handler)` | Remove an event handler |
+| `destroy()` | Clean up resources and remove from DOM |
+
+### Events
+
+| Event | Data | Description |
+|-------|------|-------------|
+| `'connected'` | `{ width, height }` | RDP session established |
+| `'disconnected'` | - | Session ended |
+| `'resize'` | `{ width, height }` | Resolution changed |
+| `'error'` | `{ message }` | Error occurred |
+
+### Full Example
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+  <title>My RDP App</title>
+  <style>
+    #rdp-container {
+      width: 100%;
+      height: 600px;
+    }
+  </style>
+</head>
+<body>
+  <div id="rdp-container"></div>
+  
+  <script type="module">
+    import { RDPClient } from './rdp-client.js';
+
+    const client = new RDPClient(document.getElementById('rdp-container'), {
+      wsUrl: 'ws://localhost:8765',
+      showTopBar: true,
+      showBottomBar: false
+    });
+
+    // Event handlers
+    client.on('connected', ({ width, height }) => {
+      console.log(`Connected at ${width}x${height}`);
+    });
+
+    client.on('disconnected', () => {
+      console.log('Session ended');
+    });
+
+    client.on('error', ({ message }) => {
+      console.error('RDP Error:', message);
+    });
+
+    client.on('resize', ({ width, height }) => {
+      console.log(`Resolution changed to ${width}x${height}`);
+    });
+
+    // Connect automatically
+    client.connect({
+      host: '192.168.1.100',
+      port: 3389,
+      user: 'admin',
+      pass: 'secret'
+    }).catch(err => console.error(err));
+
+    // Expose for debugging
+    window.rdpClient = client;
+  </script>
+</body>
+</html>
+```
+
 ## Usage
 
 1. Open http://localhost:8000 in your browser
