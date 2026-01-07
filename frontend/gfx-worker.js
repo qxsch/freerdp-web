@@ -8,6 +8,9 @@
  * - Frame lifecycle and acknowledgment
  */
 
+const BUILD_VERSION = '__BUILD_TIME__';
+console.log(`[GFX-WORKER] ===== BUILD ${BUILD_VERSION} =====`);
+
 import {
     Magic, matchMagic, parseMessage,
     readU16LE, readU32LE, buildFrameAck, buildBackpressure
@@ -48,6 +51,22 @@ let pendingOps = 0;
 const MAX_PENDING_OPS = 64;
 
 // ============================================================================
+// Codec IDs (matching rdp_bridge.h RdpGfxCodecId enum)
+// ============================================================================
+
+const CODEC_ID = {
+    UNCOMPRESSED: 0x0000,
+    CLEARCODEC: 0x0003,
+    PLANAR: 0x0004,
+    AVC420: 0x0009,
+    ALPHA: 0x000A,
+    AVC444: 0x000B,
+    PROGRESSIVE: 0x000C,
+    PROGRESSIVE_V2: 0x000D,
+    AVC444v2: 0x000E,
+};
+
+// ============================================================================
 // H.264 decoder state
 // ============================================================================
 
@@ -68,6 +87,9 @@ let h264DecodeQueue = [];
 
 /** @type {boolean} Whether there was a decoder error */
 let h264DecoderError = false;
+
+/** @type {boolean} Whether we need a keyframe (after init/reset/error) */
+let h264NeedsKeyframe = true;
 
 // ============================================================================
 // Surface management
@@ -212,7 +234,7 @@ async function initWasm() {
 
 /**
  * Decode and draw a progressive tile
- * Uses parallel decompress when available for better performance
+ * Uses batch-oriented API: decodes all tiles, then renders after frame complete
  */
 function decodeProgressiveTile(msg) {
     if (!wasmReady || !progCtx) {
@@ -253,49 +275,64 @@ function decodeProgressiveTile(msg) {
         return;
     }
     
-    // Get dirty tiles and draw them
-    const dirtyCount = wasmModule._prog_get_dirty_tile_count(progCtx, msg.surfaceId);
+    // Check frame state - only render when frame is complete
+    const frameComplete = wasmModule._prog_is_frame_complete(progCtx);
     
-    // Temporary buffer for tile coords
-    const coordsPtr = wasmModule._malloc(8);  // 4 x uint16_t
+    // Use new batch tile tracking API for efficient iteration
+    const updatedCount = wasmModule._prog_get_updated_tile_count(progCtx);
     
-    for (let i = 0; i < dirtyCount; i++) {
-        const infoResult = wasmModule._prog_get_dirty_tile_info(
-            progCtx, msg.surfaceId, i,
-            coordsPtr, coordsPtr + 2, coordsPtr + 4, coordsPtr + 6
-        );
-        
-        if (infoResult !== 0) continue;
-        
-        const tileX = wasmModule.getValue(coordsPtr, 'i16');
-        const tileY = wasmModule.getValue(coordsPtr + 2, 'i16');
-        const xIdx = wasmModule.getValue(coordsPtr + 4, 'i16');
-        const yIdx = wasmModule.getValue(coordsPtr + 6, 'i16');
-        
-        // Get tile pixel data
-        const tileDataPtr = wasmModule._prog_get_tile_data(progCtx, msg.surfaceId, xIdx, yIdx);
-        if (!tileDataPtr) continue;
-        
-        // Calculate actual tile dimensions (may be clipped at edges)
-        const tileW = Math.min(64, surface.width - tileX);
-        const tileH = Math.min(64, surface.height - tileY);
-        
-        // Create ImageData from WASM memory
-        const tileSize = 64 * 64 * 4;
-        const pixelData = new Uint8ClampedArray(
-            wasmModule.HEAPU8.buffer, tileDataPtr, tileSize
-        );
-        
-        // Note: we need to copy because the WASM buffer may be detached/resized
-        const imageData = new ImageData(
-            new Uint8ClampedArray(pixelData), 64, 64
-        );
-        
-        // Draw tile to surface
-        surface.ctx.putImageData(imageData, tileX, tileY, 0, 0, tileW, tileH);
+    // Skip rendering if no tiles updated
+    if (updatedCount === 0) {
+        return;
     }
     
-    wasmModule._free(coordsPtr);
+    let tilesDrawn = 0;
+    
+    // Get surface grid dimensions for index-to-coordinates conversion
+    const gridWidth = Math.ceil(surface.width / 64);
+    
+    try {
+        // Iterate using batch tile tracking (more efficient than scanning dirty flags)
+        for (let i = 0; i < updatedCount; i++) {
+            const tileIdx = wasmModule._prog_get_updated_tile_index(progCtx, i);
+            if (tileIdx === 0xFFFFFFFF) {
+                continue;
+            }
+            
+            // Convert grid index to coordinates
+            const xIdx = tileIdx % gridWidth;
+            const yIdx = Math.floor(tileIdx / gridWidth);
+            const tileX = xIdx * 64;
+            const tileY = yIdx * 64;
+            
+            // Get tile pixel data
+            const tileDataPtr = wasmModule._prog_get_tile_data(progCtx, msg.surfaceId, xIdx, yIdx);
+            if (!tileDataPtr) {
+                continue;
+            }
+            
+            // Calculate actual tile dimensions (may be clipped at edges)
+            const tileW = Math.min(64, surface.width - tileX);
+            const tileH = Math.min(64, surface.height - tileY);
+            
+            // Create ImageData from WASM memory
+            const tileSize = 64 * 64 * 4;
+            const pixelData = new Uint8ClampedArray(
+                wasmModule.HEAPU8.buffer, tileDataPtr, tileSize
+            );
+            
+            // Note: we need to copy because the WASM buffer may be detached/resized
+            const imageData = new ImageData(
+                new Uint8ClampedArray(pixelData), 64, 64
+            );
+            
+            // Draw tile to surface
+            surface.ctx.putImageData(imageData, tileX, tileY, 0, 0, tileW, tileH);
+            tilesDrawn++;
+        }
+    } catch (e) {
+        console.error(`[GFX Worker] Progressive tile loop error at tile ${tilesDrawn}:`, e);
+    }
 }
 
 /**
@@ -453,6 +490,7 @@ async function initH264(width, height) {
         
         await videoDecoder.configure(config);
         h264Initialized = true;
+        h264NeedsKeyframe = true;  // Must receive keyframe after configure
         h264ConfiguredWidth = width;
         h264ConfiguredHeight = height;
         console.log(`[GFX Worker] H.264 decoder initialized: ${width}x${height}`);
@@ -503,9 +541,20 @@ async function decodeH264Frame(msg) {
                 hardwareAcceleration: 'prefer-hardware',
             });
             h264DecoderError = false;
+            h264NeedsKeyframe = true;  // Need keyframe after reset
         } else {
             return; // Wait for keyframe
         }
+    }
+    
+    // After init/reset, we must receive a keyframe before delta frames
+    if (h264NeedsKeyframe) {
+        if (msg.frameType !== 0) {
+            // Skip delta frames until we get a keyframe
+            return;
+        }
+        h264NeedsKeyframe = false;
+        console.log('[GFX Worker] H.264 received first keyframe');
     }
     
     pendingOps++;
@@ -580,6 +629,20 @@ function applyCacheToSurface(msg) {
 // ============================================================================
 // Frame lifecycle
 // ============================================================================
+
+/**
+ * Composite a surface to the primary canvas
+ * Used for Progressive frames that come via H264 queue (no StartFrame/EndFrame)
+ */
+function compositeSurfaceToPrimary(surfaceId) {
+    if (!primaryCanvas || !primaryCtx) return;
+    
+    const surface = surfaces.get(surfaceId);
+    if (!surface) return;
+    
+    // Draw the surface to the primary canvas
+    primaryCtx.drawImage(surface.canvas, 0, 0);
+}
 
 /**
  * Start a new frame
@@ -705,8 +768,30 @@ async function handleBinaryMessage(data) {
             break;
             
         case 'videoFrame':
-            // Decode H.264 in worker using VideoDecoder
-            await decodeH264Frame(msg);
+            // Route by codec ID: Progressive goes to WASM decoder, H.264 to VideoDecoder
+            if (msg.codecId === CODEC_ID.PROGRESSIVE || msg.codecId === CODEC_ID.PROGRESSIVE_V2) {
+                // Convert H264 frame format to progressive tile format for decoder
+                decodeProgressiveTile({
+                    surfaceId: msg.surfaceId,
+                    frameId: msg.frameId,
+                    x: msg.destX,
+                    y: msg.destY,
+                    w: msg.destW,
+                    h: msg.destH,
+                    payload: msg.nalData,  // Progressive raw data passed as nalData
+                });
+                
+                // Progressive frames via H264 queue need manual compositing and ack
+                // (normal GFX flow would have StartFrame/EndFrame messages)
+                compositeSurfaceToPrimary(msg.surfaceId);
+                
+                // Send frame acknowledgment for Progressive
+                const ackMsg = buildFrameAck(msg.frameId);
+                self.postMessage({ type: 'frameAck', frameId: msg.frameId, data: ackMsg.buffer }, [ackMsg.buffer]);
+            } else {
+                // H.264/AVC420/AVC444 - decode in worker using VideoDecoder
+                await decodeH264Frame(msg);
+            }
             break;
             
         default:

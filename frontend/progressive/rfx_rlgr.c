@@ -1,204 +1,638 @@
 /**
- * RLGR (Run-Length Golomb-Rice) Entropy Decoder
- * Based on FreeRDP's rfx_rlgr.c (Apache 2.0 License)
- * 
- * Decodes RLGR1 encoded wavelet coefficients used by RFX Progressive codec.
+ * FreeRDP: A Remote Desktop Protocol Implementation
+ * RemoteFX Codec Library - RLGR
+ *
+ * Copyright 2011 Vic Lee
+ * Adapted for WASM
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ *
+ * This implementation of RLGR refers to
+ * [MS-RDPRFX] 3.1.8.1.7.3 RLGR1/RLGR3 Pseudocode
  */
 
 #include "rfx_types.h"
+#include <string.h>
 
-/* Bit reader state */
+/* Constants used in RLGR1/RLGR3 algorithm */
+#define KPMAX (80)  /* max value for kp or krp */
+#define LSGR (3)    /* shift count to convert kp to k */
+#define UP_GR (4)   /* increase in kp after a zero run in RL mode */
+#define DN_GR (6)   /* decrease in kp after a nonzero symbol in RL mode */
+#define UQ_GR (3)   /* increase in kp after zero symbol in GR mode */
+#define DQ_GR (3)   /* decrease in kp after nonzero symbol in GR mode */
+
+/**
+ * Bitstream structure - matches FreeRDP's wBitStream with prefetch
+ * 
+ * Uses a 32-bit accumulator with a 32-bit prefetch register.
+ * When bits are shifted out, bits from prefetch are shifted in.
+ * When 32 bits have been consumed, prefetch is refilled from buffer.
+ */
 typedef struct {
-    const uint8_t* data;
-    size_t size;
-    size_t offset;       /* byte offset */
-    int bits_left;       /* bits remaining in current byte */
-    uint32_t accumulator;
-} BitReader;
+    const uint8_t* buffer;    /* Original buffer start */
+    const uint8_t* pointer;   /* Current read position (advances by 4 bytes) */
+    uint32_t capacity;        /* Total buffer size in bytes */
+    uint32_t length;          /* Total bits available (capacity * 8) */
+    uint32_t position;        /* Bits consumed so far */
+    uint32_t offset;          /* Bits consumed within current 32-bit word (0-31) */
+    uint32_t accumulator;     /* Current 32 bits being read */
+    uint32_t prefetch;        /* Next 32 bits to be read */
+    uint32_t mask;            /* Temporary mask for extraction */
+} BITSTREAM;
 
-static void bit_reader_init(BitReader* br, const uint8_t* data, size_t size) {
-    br->data = data;
-    br->size = size;
-    br->offset = 0;
-    br->bits_left = 0;
-    br->accumulator = 0;
-}
-
-static inline uint32_t bit_reader_peek(BitReader* br, int nbits) {
-    while (br->bits_left < nbits && br->offset < br->size) {
-        br->accumulator = (br->accumulator << 8) | br->data[br->offset++];
-        br->bits_left += 8;
-    }
-    if (br->bits_left < nbits) {
-        return 0;
-    }
-    return (br->accumulator >> (br->bits_left - nbits)) & ((1u << nbits) - 1);
-}
-
-static inline void bit_reader_skip(BitReader* br, int nbits) {
-    br->bits_left -= nbits;
-    if (br->bits_left < 0) {
-        br->bits_left = 0;
-    }
-}
-
-static inline uint32_t bit_reader_read(BitReader* br, int nbits) {
-    uint32_t val = bit_reader_peek(br, nbits);
-    bit_reader_skip(br, nbits);
-    return val;
-}
-
-static inline bool bit_reader_eof(BitReader* br) {
-    return br->offset >= br->size && br->bits_left == 0;
-}
-
-/* RLGR adaptive parameters */
-#define RLGR_K_MIN 0
-#define RLGR_K_MAX 15
-
-/* Get the number of leading zeros */
-static inline int count_leading_zeros(uint32_t val) {
-    if (val == 0) return 32;
-    int n = 0;
-    if ((val & 0xFFFF0000) == 0) { n += 16; val <<= 16; }
-    if ((val & 0xFF000000) == 0) { n += 8; val <<= 8; }
-    if ((val & 0xF0000000) == 0) { n += 4; val <<= 4; }
-    if ((val & 0xC0000000) == 0) { n += 2; val <<= 2; }
-    if ((val & 0x80000000) == 0) { n += 1; }
+/**
+ * Count leading zeros in a 32-bit value
+ */
+static inline uint32_t lzcnt32(uint32_t x)
+{
+    if (x == 0) return 32;
+    
+    uint32_t n = 0;
+    if ((x & 0xFFFF0000) == 0) { n += 16; x <<= 16; }
+    if ((x & 0xFF000000) == 0) { n += 8;  x <<= 8; }
+    if ((x & 0xF0000000) == 0) { n += 4;  x <<= 4; }
+    if ((x & 0xC0000000) == 0) { n += 2;  x <<= 2; }
+    if ((x & 0x80000000) == 0) { n += 1; }
     return n;
 }
 
-/* Update K parameter based on decoded value */
-static inline void update_k(int* k, int val, int mode) {
-    if (mode == 1) {
-        /* RLGR1: For run length encoding */
-        if (val == 0) {
-            (*k)++;
-            if (*k > RLGR_K_MAX) *k = RLGR_K_MAX;
-        } else if (val > 0) {
-            (*k) -= 2;
-            if (*k < RLGR_K_MIN) *k = RLGR_K_MIN;
+/**
+ * Prefetch next 32 bits from buffer (bytes 4-7 from current pointer)
+ */
+static inline void BitStream_Prefetch(BITSTREAM* bs)
+{
+    bs->prefetch = 0;
+    intptr_t diff = bs->pointer - bs->buffer;
+    
+    if ((diff + 4) < (intptr_t)bs->capacity)
+        bs->prefetch |= ((uint32_t)bs->pointer[4] << 24);
+    if ((diff + 5) < (intptr_t)bs->capacity)
+        bs->prefetch |= ((uint32_t)bs->pointer[5] << 16);
+    if ((diff + 6) < (intptr_t)bs->capacity)
+        bs->prefetch |= ((uint32_t)bs->pointer[6] << 8);
+    if ((diff + 7) < (intptr_t)bs->capacity)
+        bs->prefetch |= ((uint32_t)bs->pointer[7] << 0);
+}
+
+/**
+ * Fetch current 32 bits into accumulator (bytes 0-3 from current pointer)
+ */
+static inline void BitStream_Fetch(BITSTREAM* bs)
+{
+    bs->accumulator = 0;
+    intptr_t diff = bs->pointer - bs->buffer;
+    
+    if ((diff + 0) < (intptr_t)bs->capacity)
+        bs->accumulator |= ((uint32_t)bs->pointer[0] << 24);
+    if ((diff + 1) < (intptr_t)bs->capacity)
+        bs->accumulator |= ((uint32_t)bs->pointer[1] << 16);
+    if ((diff + 2) < (intptr_t)bs->capacity)
+        bs->accumulator |= ((uint32_t)bs->pointer[2] << 8);
+    if ((diff + 3) < (intptr_t)bs->capacity)
+        bs->accumulator |= ((uint32_t)bs->pointer[3] << 0);
+    
+    BitStream_Prefetch(bs);
+}
+
+/**
+ * Attach buffer to bitstream
+ */
+static void BitStream_Attach(BITSTREAM* bs, const uint8_t* buffer, uint32_t nbytes)
+{
+    bs->buffer = buffer;
+    bs->pointer = buffer;
+    bs->capacity = nbytes;
+    bs->length = nbytes * 8;
+    bs->position = 0;
+    bs->offset = 0;
+    bs->accumulator = 0;
+    bs->prefetch = 0;
+    bs->mask = 0;
+}
+
+/**
+ * Get remaining bits in stream
+ */
+static inline uint32_t BitStream_GetRemainingLength(BITSTREAM* bs)
+{
+    if (bs->position >= bs->length)
+        return 0;
+    return bs->length - bs->position;
+}
+
+/**
+ * Shift accumulator by n bits and refill from prefetch
+ * This matches FreeRDP's BitStream_Shift exactly
+ */
+static void BitStream_Shift(BITSTREAM* bs, uint32_t nbits)
+{
+    if (nbits == 0)
+        return;
+    
+    if (nbits > 0 && nbits < 32)
+    {
+        bs->accumulator <<= nbits;
+        bs->position += nbits;
+        bs->offset += nbits;
+        
+        if (bs->offset < 32)
+        {
+            /* Still within current 32-bit word, pull from prefetch */
+            bs->mask = ((1u << nbits) - 1);
+            bs->accumulator |= ((bs->prefetch >> (32 - nbits)) & bs->mask);
+            bs->prefetch <<= nbits;
         }
-    } else {
-        /* RLGR3: For coefficient values */
-        if (val == 0) {
-            (*k)++;
-            if (*k > RLGR_K_MAX) *k = RLGR_K_MAX;
-        } else {
-            int logval = 31 - count_leading_zeros((uint32_t)val + 1);
-            (*k) -= logval;
-            if (*k < RLGR_K_MIN) *k = RLGR_K_MIN;
+        else
+        {
+            /* Crossed 32-bit boundary */
+            bs->mask = ((1u << nbits) - 1);
+            bs->accumulator |= ((bs->prefetch >> (32 - nbits)) & bs->mask);
+            bs->prefetch <<= nbits;
+            bs->offset -= 32;
+            bs->pointer += 4;
+            BitStream_Prefetch(bs);
+            
+            if (bs->offset)
+            {
+                bs->mask = ((1u << bs->offset) - 1);
+                bs->accumulator |= ((bs->prefetch >> (32 - bs->offset)) & bs->mask);
+                bs->prefetch <<= bs->offset;
+            }
         }
     }
 }
 
 /**
- * Decode RLGR1 encoded data
+ * Shift accumulator by exactly 32 bits (two 16-bit shifts)
+ */
+static inline void BitStream_Shift32(BITSTREAM* bs)
+{
+    BitStream_Shift(bs, 16);
+    BitStream_Shift(bs, 16);
+}
+
+/**
+ * Update parameter and clamp to [0, KPMAX], return parameter >> LSGR
+ */
+static inline uint32_t UpdateParam(int32_t* param, int32_t deltaP)
+{
+    *param += deltaP;
+    if (*param < 0)
+        *param = 0;
+    if (*param > KPMAX)
+        *param = KPMAX;
+    return (uint32_t)(*param >> LSGR);
+}
+
+/**
+ * rfx_rlgr_decode - RLGR1 decoder matching FreeRDP algorithm exactly
  * 
  * @param input     Input RLGR1 bitstream
  * @param inputSize Input size in bytes
- * @param output    Output coefficient buffer
+ * @param output    Output coefficient buffer (int16_t)
  * @param outputSize Maximum output count
  * @return Number of coefficients decoded, or -1 on error
  */
 int rfx_rlgr_decode(const uint8_t* input, size_t inputSize,
-                    int16_t* output, size_t outputSize) {
-    BitReader br;
-    bit_reader_init(&br, input, inputSize);
+                    int16_t* output, size_t outputSize)
+{
+    BITSTREAM bs;
+    uint32_t vk, cnt;
+    int32_t k, kp, kr, krp;
+    uint16_t code;
+    int16_t mag;
+    size_t run, offset, size;
+    int16_t* pOutput;
     
-    int kR = 1;   /* Run length K */
-    int kGR = 1;  /* Golomb-Rice K for coefficients */
+    if (!input || inputSize == 0 || !output || outputSize == 0)
+        return -1;
     
-    size_t outIdx = 0;
+    /* Initialize parameters - k=1, kr=1 */
+    k = 1;
+    kp = k << LSGR;
+    kr = 1;
+    krp = kr << LSGR;
     
-    while (!bit_reader_eof(&br) && outIdx < outputSize) {
-        /* Read unary code for quotient */
-        int q = 0;
-        while (bit_reader_peek(&br, 1) == 0 && !bit_reader_eof(&br)) {
-            q++;
-            bit_reader_skip(&br, 1);
-            if (q > 1000) break; /* Sanity check */
+    pOutput = output;
+    BitStream_Attach(&bs, input, (uint32_t)inputSize);
+    BitStream_Fetch(&bs);  /* CRITICAL: Fetch initial 32 bits into accumulator */
+    
+    while ((BitStream_GetRemainingLength(&bs) > 0) && 
+           ((size_t)(pOutput - output) < outputSize))
+    {
+        if (k)
+        {
+            /* Run-Length (RL) Mode */
+            run = 0;
+            
+            /* Count number of leading 0s in accumulator */
+            cnt = lzcnt32(bs.accumulator);
+            
+            size_t nbits = BitStream_GetRemainingLength(&bs);
+            if (cnt > nbits)
+                cnt = (uint32_t)nbits;
+            
+            vk = cnt;
+            
+            /* Handle case where all 32 bits are zero */
+            while (cnt == 32 && BitStream_GetRemainingLength(&bs) > 0)
+            {
+                BitStream_Shift32(&bs);
+                cnt = lzcnt32(bs.accumulator);
+                
+                nbits = BitStream_GetRemainingLength(&bs);
+                if (cnt > nbits)
+                    cnt = (uint32_t)nbits;
+                
+                vk += cnt;
+            }
+            
+            /* Shift past the zeros */
+            BitStream_Shift(&bs, vk % 32);
+            
+            if (BitStream_GetRemainingLength(&bs) < 1)
+                break;
+            
+            /* Shift past the terminating 1 bit */
+            BitStream_Shift(&bs, 1);
+            
+            /* Accumulate run length from unary part */
+            while (vk--)
+            {
+                run += ((size_t)1 << k);  /* add (1 << k) to run length */
+                
+                /* Update k, kp params */
+                kp += UP_GR;
+                if (kp > KPMAX)
+                    kp = KPMAX;
+                k = kp >> LSGR;
+            }
+            
+            /* Next k bits contain run length remainder */
+            if (BitStream_GetRemainingLength(&bs) < (uint32_t)k)
+                break;
+            
+            bs.mask = ((1u << k) - 1);
+            run += ((bs.accumulator >> (32 - k)) & bs.mask);
+            BitStream_Shift(&bs, (uint32_t)k);
+            
+            /* Read sign bit */
+            if (BitStream_GetRemainingLength(&bs) < 1)
+                break;
+            
+            uint32_t sign = (bs.accumulator & 0x80000000) ? 1 : 0;
+            BitStream_Shift(&bs, 1);
+            
+            /* Count number of leading 1s (for GR code of magnitude) */
+            cnt = lzcnt32(~bs.accumulator);
+            
+            nbits = BitStream_GetRemainingLength(&bs);
+            if (cnt > nbits)
+                cnt = (uint32_t)nbits;
+            
+            vk = cnt;
+            
+            while (cnt == 32 && BitStream_GetRemainingLength(&bs) > 0)
+            {
+                BitStream_Shift32(&bs);
+                cnt = lzcnt32(~bs.accumulator);
+                
+                nbits = BitStream_GetRemainingLength(&bs);
+                if (cnt > nbits)
+                    cnt = (uint32_t)nbits;
+                
+                vk += cnt;
+            }
+            
+            BitStream_Shift(&bs, vk % 32);
+            
+            if (BitStream_GetRemainingLength(&bs) < 1)
+                break;
+            
+            BitStream_Shift(&bs, 1);  /* Skip terminating 0 bit */
+            
+            /* Next kr bits contain code remainder */
+            if (BitStream_GetRemainingLength(&bs) < (uint32_t)kr)
+                break;
+            
+            bs.mask = ((1u << kr) - 1);
+            if (kr > 0)
+                code = (uint16_t)((bs.accumulator >> (32 - kr)) & bs.mask);
+            else
+                code = 0;
+            BitStream_Shift(&bs, (uint32_t)kr);
+            
+            /* Add (vk << kr) to code */
+            code |= (uint16_t)(vk << kr);
+            
+            /* Update kr, krp params */
+            if (vk == 0)
+            {
+                if (krp > 2)
+                    krp -= 2;
+                else
+                    krp = 0;
+                kr = krp >> LSGR;
+            }
+            else if (vk != 1)
+            {
+                krp += (int32_t)vk;
+                if (krp > KPMAX)
+                    krp = KPMAX;
+                kr = krp >> LSGR;
+            }
+            
+            /* Update k, kp params */
+            if (kp > DN_GR)
+                kp -= DN_GR;
+            else
+                kp = 0;
+            k = kp >> LSGR;
+            
+            /* Compute magnitude from code */
+            if (sign)
+                mag = (int16_t)(-((int32_t)code + 1));
+            else
+                mag = (int16_t)(code + 1);
+            
+            /* Write run of zeros to output */
+            offset = (size_t)(pOutput - output);
+            size = run;
+            
+            if ((offset + size) > outputSize)
+                size = outputSize - offset;
+            
+            if (size)
+            {
+                memset(pOutput, 0, size * sizeof(int16_t));
+                pOutput += size;
+            }
+            
+            /* Write non-zero value */
+            if ((size_t)(pOutput - output) < outputSize)
+            {
+                *pOutput = mag;
+                pOutput++;
+            }
         }
-        
-        if (bit_reader_eof(&br)) break;
-        bit_reader_skip(&br, 1); /* Skip the terminating 1 */
-        
-        if (q == 0) {
-            /* Zero run */
-            uint32_t runLen = 1;
-            if (kR > 0) {
-                runLen += bit_reader_read(&br, kR);
+        else
+        {
+            /* Golomb-Rice (GR) Mode */
+            
+            /* Count number of leading 1s */
+            cnt = lzcnt32(~bs.accumulator);
+            
+            size_t nbits = BitStream_GetRemainingLength(&bs);
+            if (cnt > nbits)
+                cnt = (uint32_t)nbits;
+            
+            vk = cnt;
+            
+            while (cnt == 32 && BitStream_GetRemainingLength(&bs) > 0)
+            {
+                BitStream_Shift32(&bs);
+                cnt = lzcnt32(~bs.accumulator);
+                
+                nbits = BitStream_GetRemainingLength(&bs);
+                if (cnt > nbits)
+                    cnt = (uint32_t)nbits;
+                
+                vk += cnt;
             }
             
-            update_k(&kR, 0, 1);
+            BitStream_Shift(&bs, vk % 32);
             
-            for (uint32_t i = 0; i < runLen && outIdx < outputSize; i++) {
-                output[outIdx++] = 0;
+            if (BitStream_GetRemainingLength(&bs) < 1)
+                break;
+            
+            BitStream_Shift(&bs, 1);  /* Skip terminating 0 bit */
+            
+            /* Next kr bits contain code remainder */
+            if (BitStream_GetRemainingLength(&bs) < (uint32_t)kr)
+                break;
+            
+            bs.mask = ((1u << kr) - 1);
+            if (kr > 0)
+                code = (uint16_t)((bs.accumulator >> (32 - kr)) & bs.mask);
+            else
+                code = 0;
+            BitStream_Shift(&bs, (uint32_t)kr);
+            
+            /* Add (vk << kr) to code */
+            code |= (uint16_t)(vk << kr);
+            
+            /* Update kr, krp params */
+            if (vk == 0)
+            {
+                if (krp > 2)
+                    krp -= 2;
+                else
+                    krp = 0;
+                kr = krp >> LSGR;
             }
-        } else {
-            /* Non-zero coefficient */
-            uint32_t remainder = 0;
-            if (kGR > 0) {
-                remainder = bit_reader_read(&br, kGR);
+            else if (vk != 1)
+            {
+                krp += (int32_t)vk;
+                if (krp > KPMAX)
+                    krp = KPMAX;
+                kr = krp >> LSGR;
             }
             
-            uint32_t mag = ((q - 1) << kGR) + remainder;
+            /* RLGR1 mode: code = 2 * mag - sign */
+            if (code == 0)
+            {
+                /* Update k, kp params - increase k for zero */
+                kp += UQ_GR;
+                if (kp > KPMAX)
+                    kp = KPMAX;
+                k = kp >> LSGR;
+                
+                mag = 0;
+            }
+            else
+            {
+                /* Update k, kp params - decrease k for nonzero */
+                if (kp > DQ_GR)
+                    kp -= DQ_GR;
+                else
+                    kp = 0;
+                k = kp >> LSGR;
+                
+                /*
+                 * code = 2 * mag - sign
+                 * sign + code = 2 * mag
+                 */
+                if (code & 1)
+                    mag = (int16_t)(-((int32_t)(code + 1) >> 1));
+                else
+                    mag = (int16_t)(code >> 1);
+            }
             
-            /* Sign bit (1 = negative) */
-            int sign = bit_reader_read(&br, 1);
-            
-            int16_t val = (int16_t)(mag + 1);
-            if (sign) val = -val;
-            
-            output[outIdx++] = val;
-            
-            update_k(&kGR, (int)mag, 0);
-            update_k(&kR, 1, 1); /* Reset run K */
+            if ((size_t)(pOutput - output) < outputSize)
+            {
+                *pOutput = mag;
+                pOutput++;
+            }
         }
     }
     
-    /* Fill remaining with zeros */
-    while (outIdx < outputSize) {
-        output[outIdx++] = 0;
+    /* Zero-fill remaining output */
+    offset = (size_t)(pOutput - output);
+    if (offset < outputSize)
+    {
+        size = outputSize - offset;
+        memset(pOutput, 0, size * sizeof(int16_t));
+        pOutput += size;
     }
     
-    return (int)outIdx;
+    return (int)(pOutput - output);
 }
 
 /**
- * Decode SRL (Subband Residual Layer) data for progressive upgrade
- * SRL uses a different encoding than initial RLGR
+ * SRL (Subband Residual Layer) state for progressive upgrades
  */
-int rfx_srl_decode(const uint8_t* input, size_t inputSize,
-                   int16_t* current, int8_t* sign,
-                   size_t coeffCount, int bitPos) {
-    if (inputSize == 0 || coeffCount == 0) {
+typedef struct {
+    BITSTREAM* bs;
+    int32_t kp;
+    int32_t nz;       /* remaining zeros in current run */
+    int mode;         /* 0 = zero encoding, 1 = unary encoding */
+} SRL_STATE;
+
+/**
+ * Read a single SRL-encoded value
+ */
+static int16_t srl_read_value(SRL_STATE* state, uint32_t numBits)
+{
+    BITSTREAM* bs = state->bs;
+    
+    if (state->nz > 0)
+    {
+        state->nz--;
         return 0;
     }
     
-    BitReader br;
-    bit_reader_init(&br, input, inputSize);
+    uint32_t k = state->kp / 8;
     
-    for (size_t i = 0; i < coeffCount && !bit_reader_eof(&br); i++) {
-        if (current[i] == 0) {
-            /* Check if this coefficient becomes non-zero */
-            if (bit_reader_read(&br, 1)) {
-                /* Read sign if this is first non-zero */
-                if (sign[i] == 0) {
-                    sign[i] = bit_reader_read(&br, 1) ? -1 : 1;
-                }
-                current[i] = (int16_t)(sign[i] * (1 << bitPos));
+    if (state->mode == 0)
+    {
+        /* Zero encoding mode */
+        uint32_t bit = (bs->accumulator & 0x80000000) ? 1 : 0;
+        BitStream_Shift(bs, 1);
+        
+        if (bit == 0)
+        {
+            /* '0' bit: nz >= (1 << k), nz = (1 << k) */
+            state->nz = (1 << k);
+            state->kp += 4;
+            if (state->kp > 80)
+                state->kp = 80;
+            
+            state->nz--;
+            return 0;
+        }
+        else
+        {
+            /* '1' bit: nz < (1 << k), nz = next k bits */
+            state->nz = 0;
+            state->mode = 1;  /* Switch to unary encoding */
+            
+            if (k > 0)
+            {
+                bs->mask = ((1u << k) - 1);
+                state->nz = (int32_t)((bs->accumulator >> (32 - k)) & bs->mask);
+                BitStream_Shift(bs, k);
             }
-        } else {
-            /* Refine existing non-zero coefficient */
-            if (bit_reader_read(&br, 1)) {
-                if (current[i] > 0) {
-                    current[i] += (1 << bitPos);
-                } else {
-                    current[i] -= (1 << bitPos);
-                }
+            
+            if (state->nz > 0)
+            {
+                state->nz--;
+                return 0;
             }
         }
+    }
+    
+    /* Unary encoding mode - decode a non-zero value */
+    state->mode = 0;  /* Switch back to zero encoding */
+    
+    /* Read sign bit */
+    uint32_t sign = (bs->accumulator & 0x80000000) ? 1 : 0;
+    BitStream_Shift(bs, 1);
+    
+    /* Update kp */
+    if (state->kp < 6)
+        state->kp = 0;
+    else
+        state->kp -= 6;
+    
+    if (numBits == 1)
+        return sign ? -1 : 1;
+    
+    /* Read magnitude using unary encoding */
+    uint32_t mag = 1;
+    uint32_t max = (1u << numBits) - 1;
+    
+    while (mag < max)
+    {
+        uint32_t bit = (bs->accumulator & 0x80000000) ? 1 : 0;
+        BitStream_Shift(bs, 1);
+        
+        if (bit)
+            break;
+        
+        mag++;
+    }
+    
+    if (mag > 32767)
+        mag = 32767;
+    
+    return sign ? -(int16_t)mag : (int16_t)mag;
+}
+
+/**
+ * rfx_srl_decode - SRL decoder for progressive tile upgrades
+ * 
+ * This decodes the SRL (Subband Residual Layer) data used in progressive
+ * tile refinement. The sign array stores the sign of previously decoded
+ * coefficients, which determines whether to read from SRL or RAW stream.
+ *
+ * @param srlData     SRL bitstream data
+ * @param srlLen      SRL data length in bytes
+ * @param current     Current coefficient buffer (modified in place)
+ * @param sign        Sign buffer from previous decode
+ * @param length      Number of coefficients
+ * @param numBits     Number of bits per coefficient for this pass
+ * @return 0 on success, -1 on error
+ */
+int rfx_srl_decode(const uint8_t* srlData, size_t srlLen,
+                   int16_t* current, int8_t* sign,
+                   size_t length, int numBits)
+{
+    if (!srlData || srlLen == 0 || !current || !sign || length == 0)
+        return -1;
+    
+    BITSTREAM bs;
+    BitStream_Attach(&bs, srlData, (uint32_t)srlLen);
+    BitStream_Fetch(&bs);  /* CRITICAL: Fetch initial 32 bits */
+    
+    SRL_STATE state;
+    state.bs = &bs;
+    state.kp = 8;
+    state.nz = 0;
+    state.mode = 0;
+    
+    for (size_t i = 0; i < length && BitStream_GetRemainingLength(&bs) > 0; i++)
+    {
+        if (sign[i] == 0)
+        {
+            /* Zero sign means read from SRL stream */
+            int16_t val = srl_read_value(&state, (uint32_t)numBits);
+            current[i] += val;
+            sign[i] = (int8_t)val;  /* Update sign for next pass */
+        }
+        /* Non-zero sign means coefficient already has a value, 
+           would need to read from RAW stream (not implemented here) */
     }
     
     return 0;

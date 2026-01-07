@@ -94,6 +94,11 @@ typedef struct {
     RfxComponentCodecQuant cbQuant;
     RfxComponentCodecQuant crQuant;
     
+    /* Progressive quantization values (from quality index) */
+    RfxComponentCodecQuant yProgQuant;
+    RfxComponentCodecQuant cbProgQuant;
+    RfxComponentCodecQuant crProgQuant;
+    
     /* Dirty flag for this frame */
     bool dirty;
 } RfxTile;
@@ -114,6 +119,12 @@ typedef struct {
     uint32_t frameId;
 } RfxSurface;
 
+/* Block state tracking flags */
+#define FLAG_WBT_SYNC        0x01
+#define FLAG_WBT_CONTEXT     0x02
+#define FLAG_WBT_FRAME_BEGIN 0x04
+#define FLAG_WBT_FRAME_END   0x08
+
 /* Main progressive decoder context */
 typedef struct {
     /* Surface contexts */
@@ -130,6 +141,25 @@ typedef struct {
     /* Current frame state */
     uint32_t frameId;
     uint16_t currentSurfaceId;
+    
+    /* Block state tracking (like FreeRDP's progressive->state) */
+    uint32_t state;
+    
+    /* Context block values */
+    uint8_t ctxId;
+    uint16_t tileSize;
+    uint8_t ctxFlags;
+    
+    /* Region flags - bit 0 = RFX_DWT_REDUCE_EXTRAPOLATE */
+    bool extrapolate;
+    
+    /* Frame tracking */
+    uint32_t frameIndex;
+    uint16_t regionCount;
+    
+    /* Updated tile tracking (for batch surface writes) */
+    uint32_t numUpdatedTiles;
+    uint32_t updatedTileIndices[RFX_MAX_TILES_PER_SURFACE];
     
     /* Temporary decode buffers */
     int16_t* yBuffer;   /* 64*64 */

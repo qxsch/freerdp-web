@@ -13,6 +13,11 @@ WORKDIR /build
 # Copy Progressive codec sources
 COPY progressive/ ./progressive/
 
+# Inject build timestamp into source files
+RUN BUILD_TIME=$(date +%H:%M:%S) && \
+    sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" ./progressive/progressive_wasm.c && \
+    echo "Build time: $BUILD_TIME"
+
 # Build WASM with optimizations, SIMD, and pthreads for parallel tile decoding
 WORKDIR /build/progressive
 RUN mkdir -p build && \
@@ -46,6 +51,11 @@ COPY rdp-client.js /usr/share/nginx/html/
 COPY wire-format.js /usr/share/nginx/html/
 COPY gfx-worker.js /usr/share/nginx/html/
 COPY favicons/ /usr/share/nginx/html/favicons/
+
+# Inject build timestamp into gfx-worker.js
+RUN BUILD_TIME=$(date +%H:%M:%S) && \
+    sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" /usr/share/nginx/html/gfx-worker.js && \
+    echo "gfx-worker.js build time: $BUILD_TIME"
 
 # Copy built WASM from builder stage (includes pthread worker)
 COPY --from=wasm-builder /build/progressive/build/progressive_decoder.js /usr/share/nginx/html/progressive/
