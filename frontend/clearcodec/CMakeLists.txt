@@ -35,13 +35,14 @@ if(EMSCRIPTEN)
     set_target_properties(clearcodec_decoder PROPERTIES
         SUFFIX ".js"
         LINK_FLAGS "\
-            -sEXPORTED_FUNCTIONS='[${EXPORTED_FUNCTIONS_STR}]' \
-            -sEXPORTED_RUNTIME_METHODS='[\"cwrap\",\"getValue\",\"setValue\",\"HEAPU8\",\"HEAPU16\",\"HEAPU32\"]' \
+            -sEXPORTED_FUNCTIONS=[${EXPORTED_FUNCTIONS_STR}] \
+            -sEXPORTED_RUNTIME_METHODS=[ccall,cwrap,getValue,setValue,HEAPU8,HEAPU16,HEAPU32] \
             -sALLOW_MEMORY_GROWTH=1 \
             -sWASM=1 \
             -sMODULARIZE=1 \
-            -sEXPORT_NAME='ClearCodecDecoderModule' \
-            -sENVIRONMENT='web,worker' \
+            -sEXPORT_ES6=1 \
+            -sEXPORT_NAME=ClearCodecDecoderModule \
+            -sENVIRONMENT=web,worker \
             -sINITIAL_MEMORY=16777216 \
             -sSTACK_SIZE=1048576 \
             -sNO_EXIT_RUNTIME=1 \

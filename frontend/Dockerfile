@@ -16,47 +16,21 @@ COPY progressive/ ./progressive/
 # Copy ClearCodec codec sources
 COPY clearcodec/ ./clearcodec/
 
-# Build Progressive WASM with optimizations, SIMD, and pthreads for parallel tile decoding
+# Build Progressive WASM using CMakeLists.txt (single source of truth for build config)
 WORKDIR /build/progressive
-RUN mkdir -p build && \
-    emcc -O3 -msimd128 -pthread \
-        -s WASM=1 \
-        -s MODULARIZE=1 \
-        -s EXPORT_ES6=1 \
-        -s EXPORT_NAME="ProgressiveDecoderModule" \
-        -s EXPORTED_FUNCTIONS="['_prog_create','_prog_free','_prog_create_surface','_prog_delete_surface','_prog_decompress','_prog_decompress_parallel','_prog_get_tile_data','_prog_get_dirty_tile_count','_prog_get_dirty_tile_info','_prog_get_extrapolate','_malloc','_free']" \
-        -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap','getValue','setValue']" \
-        -s USE_PTHREADS=1 \
-        -s PTHREAD_POOL_SIZE=4 \
-        -s ALLOW_MEMORY_GROWTH=1 \
-        -s INITIAL_MEMORY=67108864 \
-        -s STACK_SIZE=1048576 \
-        -s ENVIRONMENT='web,worker' \
-        -I. \
-        rfx_rlgr.c rfx_dwt.c rfx_decode.c progressive_wasm.c \
-        -o build/progressive_decoder.js && \
+RUN mkdir -p build && cd build && \
+    emcmake cmake .. && \
+    emmake make && \
     echo "Progressive WASM decoder built successfully with pthread support" && \
-    ls -la build/
+    ls -la
 
-# Build ClearCodec WASM decoder (no pthreads needed - simpler codec)
+# Build ClearCodec WASM using CMakeLists.txt (single source of truth for build config)
 WORKDIR /build/clearcodec
-RUN mkdir -p build && \
-    emcc -O3 -msimd128 \
-        -s WASM=1 \
-        -s MODULARIZE=1 \
-        -s EXPORT_ES6=1 \
-        -s EXPORT_NAME="ClearCodecDecoderModule" \
-        -s EXPORTED_FUNCTIONS="['_clear_create','_clear_free','_clear_context_reset','_clear_decompress','_clear_alloc_output','_clear_free_output','_malloc','_free']" \
-        -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap','getValue','setValue']" \
-        -s ALLOW_MEMORY_GROWTH=1 \
-        -s INITIAL_MEMORY=16777216 \
-        -s STACK_SIZE=1048576 \
-        -s ENVIRONMENT='web,worker' \
-        -I. \
-        clearcodec_wasm.c \
-        -o build/clearcodec_decoder.js && \
+RUN mkdir -p build && cd build && \
+    emcmake cmake .. && \
+    emmake make && \
     echo "ClearCodec WASM decoder built successfully" && \
-    ls -la build/
+    ls -la
 
 # ==============================================================================
 # Stage 2: Serve with nginx

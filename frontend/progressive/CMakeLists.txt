@@ -35,6 +35,7 @@ if(EMSCRIPTEN)
         "_prog_get_dirty_tile_count"
         "_prog_get_dirty_tile_info"
         "_prog_get_surface_info"
+        "_prog_get_extrapolate"
         "_malloc"
         "_free"
     )
@@ -49,14 +50,15 @@ if(EMSCRIPTEN)
             -pthread \
             -sUSE_PTHREADS=1 \
             -sPTHREAD_POOL_SIZE=4 \
-            -sEXPORTED_FUNCTIONS='[${EXPORTED_FUNCTIONS_STR}]' \
-            -sEXPORTED_RUNTIME_METHODS='[\"cwrap\",\"getValue\",\"setValue\",\"HEAPU8\",\"HEAPU16\",\"HEAPU32\"]' \
+            -sEXPORTED_FUNCTIONS=[${EXPORTED_FUNCTIONS_STR}] \
+            -sEXPORTED_RUNTIME_METHODS=[ccall,cwrap,getValue,setValue,HEAPU8,HEAPU16,HEAPU32] \
             -sALLOW_MEMORY_GROWTH=1 \
             -sWASM=1 \
             -sMODULARIZE=1 \
-            -sEXPORT_NAME='ProgressiveDecoderModule' \
-            -sENVIRONMENT='web,worker' \
-            -sINITIAL_MEMORY=33554432 \
+            -sEXPORT_ES6=1 \
+            -sEXPORT_NAME=ProgressiveDecoderModule \
+            -sENVIRONMENT=web,worker \
+            -sINITIAL_MEMORY=67108864 \
             -sSTACK_SIZE=1048576 \
             -sNO_EXIT_RUNTIME=1 \
             -sFILESYSTEM=0 \
