@@ -542,11 +542,13 @@ RdpSession* rdp_create(
     
     /* Enable GFX pipeline with H.264/AVC444 for modern, low-latency graphics.
      * This enables the RDPEGFX channel which carries H.264-encoded frames.
-     * Server must have "Prioritize H.264/AVC 444" policy enabled for best results. */
+     * Server must have "Prioritize H.264/AVC 444" policy enabled for best results.
+     * TODO: Right now AVC420 and not AVC444 because transcoding causes worse quality in docker.
+     */
     if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, FALSE)) goto fail;
     
     /* Progressive codec: Enabled by default for optimal quality.
      * RemoteFX progressive tiles are passed through to browser for WASM decoding. */
