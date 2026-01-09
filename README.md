@@ -33,7 +33,8 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 🎨 **ClearCodec WASM decoder** - Clear codec tiles decoded in WebAssembly
 - 🔊 Native audio streaming with Opus encoding (per-session isolation)
 - ⌨️ Full keyboard support with scan code translation
-- 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
+- � **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
+- �🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
 - 📺 Fullscreen mode with dynamic resolution
 - 📊 Latency monitoring (ping/pong)
 - 🩺 Health check endpoint (`/health`)
@@ -181,6 +182,9 @@ await client.connect({
 | `sendKeys(keys, opts)` | Send keystrokes. Options: `{ ctrl, alt, shift, meta, delay }` |
 | `sendKeyCombo(combo)` | Send key combination (e.g., `'Ctrl+Alt+Delete'`) |
 | `sendCtrlAltDel()` | Shortcut for `sendKeyCombo('Ctrl+Alt+Delete')` |
+| `showKeyboard()` | Show the virtual on-screen keyboard |
+| `hideKeyboard()` | Hide the virtual on-screen keyboard |
+| `isKeyboardVisible()` | Returns `true` if virtual keyboard is visible |
 | `getStatus()` | Returns `{ connected, resolution, muted }` |
 | `getMuted()` | Returns current mute state (boolean) |
 | `setMuted(bool)` | Set audio mute state |
@@ -197,6 +201,44 @@ await client.connect({
 | `'disconnected'` | - | Session ended |
 | `'resize'` | `{ width, height }` | Resolution changed |
 | `'error'` | `{ message }` | Error occurred |
+| `'keyboardShow'` | - | Virtual keyboard was shown |
+| `'keyboardHide'` | - | Virtual keyboard was hidden |
+
+### Virtual Keyboard
+
+The RDP client includes a built-in virtual on-screen keyboard, ideal for touch devices or when physical keyboard access is limited.
+
+#### Features
+
+- **US keyboard layout** (without numeric keypad)
+- **Movable & resizable** overlay that stays within canvas bounds
+- **Touch-friendly** with support for both mouse and touch events
+- **Modifier key toggle** - Shift, Ctrl, Alt, and Win keys stay pressed until a regular key is typed
+- **Special key combos**:
+  - `Alt+Tab` - Switch windows
+  - `Ctrl+Alt+Delete` - Security attention sequence
+- **Scalable UI** - Keyboard scales between 50% and 120% of its original size
+
+#### Usage
+
+```javascript
+// Show the virtual keyboard
+client.showKeyboard();
+
+// Hide the virtual keyboard
+client.hideKeyboard();
+
+// Check visibility
+if (client.isKeyboardVisible()) {
+  console.log('Keyboard is open');
+}
+
+// Listen for keyboard events
+client.on('keyboardShow', () => console.log('Keyboard opened'));
+client.on('keyboardHide', () => console.log('Keyboard closed'));
+```
+
+The keyboard can also be toggled using the ⌨️ button in the top toolbar when connected.
 
 ### Full Example
 
