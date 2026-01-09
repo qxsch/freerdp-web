@@ -29,6 +29,8 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 🖼️ **Off-main-thread rendering** - GFX Worker with OffscreenCanvas for smooth 60fps
 - 🧩 **Wire format protocol** - Binary messages with typed headers (SURF, TILE, H264, etc.)
 - 🎯 **Client-side GFX compositor** - Surface management, tile decoding, frame composition
+- 🧮 **Progressive codec WASM decoder** - RFX Progressive tiles decoded in WebAssembly (pthreads)
+- 🎨 **ClearCodec WASM decoder** - Clear codec tiles decoded in WebAssembly
 - 🔊 Native audio streaming with Opus encoding (per-session isolation)
 - ⌨️ Full keyboard support with scan code translation
 - 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
@@ -39,7 +41,6 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 👥 Multi-user support (isolated RDP sessions per WebSocket connection)
 
 ## Todo (Best Effort)
-- Progressive codec WASM decoder (RFX_PROGRESSIVE)
 - Clipboard support (copy/paste)
 - File transfer support
 - NVENC/VAAPI hardware transcoding (currently software FFmpeg)
@@ -286,17 +287,29 @@ All binary messages use a 4-byte ASCII magic header for efficient parsing:
 |-------|------|-------------|
 | `SURF` | createSurface | Create a new GFX surface |
 | `DELS` | deleteSurface | Delete a surface |
+| `MAPS` | mapSurfaceToOutput | Map surface to primary output |
 | `STFR` | startFrame | Begin frame composition |
 | `ENFR` | endFrame | End frame, commit to screen |
 | `H264` | H.264 frame | Encoded video NAL units |
 | `WEBP` | WebP tile | Compressed image tile |
-| `TILE` | Raw tile | Uncompressed BGRA pixels |
+| `TILE` | Raw tile | Uncompressed RGBA pixels |
+| `PROG` | Progressive tile | RFX Progressive compressed (WASM decoded) |
+| `CLRC` | ClearCodec tile | ClearCodec compressed (WASM decoded) |
 | `SFIL` | solidFill | Fill rectangle with color |
 | `S2SF` | surfaceToSurface | Copy region between surfaces |
-| `C2SF` | cacheToSurface | Restore cached bitmap |
-| `PROG` | Progressive tile | RFX_PROGRESSIVE compressed |
+| `S2CH` | surfaceToCache | Store surface region in bitmap cache |
+| `C2SF` | cacheToSurface | Restore cached bitmap to surface |
+| `EVCT` | evictCache | Delete bitmap cache slot |
+| `RSGR` | resetGraphics | Reset all GFX state (surfaces, cache, codec) |
 | `OPUS` | Audio frame | Opus-encoded audio |
 | `AUDI` | PCM Audio | Raw PCM audio data |
+
+### Client → Server Messages (Wire Format)
+
+| Magic | Type | Description |
+|-------|------|-------------|
+| `FACK` | frameAck | Acknowledge frame completion |
+| `BPRS` | backpressure | Signal decode queue pressure |
 
 ### JSON Messages
 
@@ -349,9 +362,16 @@ const client = new RDPClient(container, {
     ├── Dockerfile          # nginx:alpine image
     ├── index.html          # SPA entry point
     ├── rdp-client.js       # RDP client (Shadow DOM, WebSocket, audio)
-    ├── gfx-worker.js       # GFX compositor worker (OffscreenCanvas, H.264)
+    ├── gfx-worker.js       # GFX compositor worker (OffscreenCanvas, H.264, WASM)
     ├── wire-format.js      # Binary protocol parser
-    └── nginx.conf          # nginx configuration
+    ├── nginx.conf          # nginx configuration
+    ├── progressive/        # RFX Progressive codec WASM decoder (Emscripten)
+    │   ├── progressive_wasm.c
+    │   ├── rfx_decode.c
+    │   ├── rfx_dwt.c
+    │   └── rfx_rlgr.c
+    └── clearcodec/         # ClearCodec WASM decoder (Emscripten)
+        └── clearcodec_wasm.c
 ```
 
 ## Video Architecture (GFX Pipeline)
@@ -396,32 +416,60 @@ All GFX events are encoded with a 4-byte ASCII magic header:
 ```
 ┌───────┬────────────────────────────────────────────────────┐
 │ Magic │ Payload (variable length, little-endian)           │
-│ 4B    │ surfaceId, x, y, width, height, data, ...          │
+│ 4B    │ frameId, surfaceId, x, y, width, height, data, ... │
 └───────┴────────────────────────────────────────────────────┘
 ```
 
-| Magic | Event | Payload |
-|-------|-------|---------|
-| `SURF` | createSurface | surfaceId(2) + width(2) + height(2) |
-| `DELS` | deleteSurface | surfaceId(2) |
-| `STFR` | startFrame | frameId(4) + timestamp(4) |
-| `ENFR` | endFrame | frameId(4) |
-| `H264` | H.264 tile | frameId(4) + surfaceId(2) + codecId(2) + frameType(1) + destRect(8) + nalSize(4) + chromaSize(4) + NAL data |
-| `WEBP` | WebP tile | surfaceId(2) + x(2) + y(2) + w(2) + h(2) + size(4) + WebP data |
-| `TILE` | Raw BGRA | surfaceId(2) + x(2) + y(2) + w(2) + h(2) + BGRA pixels |
-| `SFIL` | solidFill | surfaceId(2) + color(4) + rectCount(2) + rects[] |
-| `S2SF` | surfaceToSurface | srcId(2) + srcRect(8) + dstId(2) + dstPoints[] |
-| `C2SF` | cacheToSurface | cacheSlot(2) + surfaceId(2) + dstPoints[] |
+#### Surface Management
+
+| Magic | Event | Payload (bytes) |
+|-------|-------|----------------|
+| `SURF` | createSurface | surfaceId(2) + width(2) + height(2) + format(2) = 8B |
+| `DELS` | deleteSurface | surfaceId(2) = 2B |
+| `MAPS` | mapSurfaceToOutput | surfaceId(2) + outputX(2) + outputY(2) = 6B |
+| `RSGR` | resetGraphics | width(2) + height(2) = 4B |
+
+#### Frame Lifecycle
+
+| Magic | Event | Payload (bytes) |
+|-------|-------|----------------|
+| `STFR` | startFrame | frameId(4) = 4B |
+| `ENFR` | endFrame | frameId(4) = 4B |
+| `FACK` | frameAck | frameId(4) + totalFramesDecoded(4) = 8B |
+| `BPRS` | backpressure | level(1) = 1B |
+
+#### Tile Codecs
+
+| Magic | Event | Payload (bytes) |
+|-------|-------|----------------|
+| `H264` | H.264 frame | frameId(4) + surfaceId(2) + codecId(2) + frameType(1) + x(2) + y(2) + w(2) + h(2) + nalSize(4) + chromaSize(4) + NAL data |
+| `PROG` | Progressive tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
+| `CLRC` | ClearCodec tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
+| `WEBP` | WebP tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
+| `TILE` | Raw RGBA tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
+
+#### Surface Operations
+
+| Magic | Event | Payload (bytes) |
+|-------|-------|----------------|
+| `SFIL` | solidFill | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + color(4) = 18B |
+| `S2SF` | surfaceToSurface | frameId(4) + srcId(2) + dstId(2) + srcX(2) + srcY(2) + srcW(2) + srcH(2) + dstX(2) + dstY(2) = 20B |
+| `S2CH` | surfaceToCache | frameId(4) + surfaceId(2) + cacheSlot(2) + x(2) + y(2) + w(2) + h(2) = 16B |
+| `C2SF` | cacheToSurface | frameId(4) + surfaceId(2) + cacheSlot(2) + dstX(2) + dstY(2) = 12B |
+| `EVCT` | evictCache | frameId(4) + cacheSlot(2) = 6B |
 
 ### GFX Worker Responsibilities
 
 The GFX Worker handles all rendering on a dedicated thread:
 
-1. **Surface Management**: Create/delete surfaces, track dimensions
-2. **H.264 Decoding**: VideoDecoder with hardware acceleration
-3. **Tile Decoding**: WebP via createImageBitmap, raw BGRA via ImageData
-4. **Frame Composition**: startFrame → tiles/H.264 → endFrame → commit
-5. **Flow Control**: Frame acknowledgments (FACK) and backpressure signals (BPRS)
+1. **Surface Management**: Create/delete surfaces, map to output, track dimensions
+2. **H.264 Decoding**: WebCodecs VideoDecoder with hardware acceleration
+3. **Progressive Decoding**: RFX Progressive codec via WASM (with pthreads support)
+4. **ClearCodec Decoding**: ClearCodec tiles via WASM decoder
+5. **Tile Decoding**: WebP via createImageBitmap, raw RGBA via ImageData
+6. **Bitmap Cache**: Store/restore surface regions for efficient updates
+7. **Frame Composition**: startFrame → tiles/H.264 → endFrame → commit
+8. **Flow Control**: Frame acknowledgments (FACK) and backpressure signals (BPRS)
 
 ## Audio Architecture
 
@@ -496,8 +544,11 @@ flowchart TB
         subgraph GFXWorker["GFX Worker (Dedicated Thread)"]
             WireParser["Wire Format<br/>Parser"]
             SurfaceMgr["Surface<br/>Manager"]
+            BitmapCache["Bitmap<br/>Cache"]
             VideoDecoder["WebCodecs<br/>VideoDecoder"]
-            TileDecoder["Tile Decoder<br/>(WebP/BGRA)"]
+            ProgWasm["Progressive<br/>WASM Decoder"]
+            ClearWasm["ClearCodec<br/>WASM Decoder"]
+            TileDecoder["Tile Decoder<br/>(WebP/RGBA)"]
             Compositor["Frame<br/>Compositor"]
             OffscreenCanvas["OffscreenCanvas"]
         end
@@ -514,8 +565,9 @@ flowchart TB
             subgraph GFX["RDPGFX Channel"]
                 H264Codecs["H.264 Codecs<br/>(AVC420/444)"]
                 FFmpeg["FFmpeg Transcode<br/>4:4:4 → 4:2:0"]
-                TileCodecs["Tile Codecs<br/>(Clear/Planar)"]
-                SurfaceOps["Surface Ops<br/>(Fill/Copy)"]
+                TileCodecs["Tile Codecs<br/>(Planar/WebP)"]
+                ProgCodec["Progressive/Clear<br/>(passthrough)"]
+                SurfaceOps["Surface Ops<br/>(Fill/Copy/Cache)"]
             end
             
             subgraph Audio["RDPSND Channel"]
@@ -537,15 +589,17 @@ flowchart TB
     %% GFX event processing
     FreeRDP --> H264Codecs
     FreeRDP --> TileCodecs
+    FreeRDP --> ProgCodec
     FreeRDP --> SurfaceOps
     H264Codecs --> FFmpeg
     FFmpeg --> GFXQueue
     TileCodecs --> GFXQueue
+    ProgCodec --> GFXQueue
     SurfaceOps --> GFXQueue
     
     %% Wire format encoding
     GFXQueue --> WireFormat
-    WireFormat -->|"SURF/H264/TILE/..."| WS_Server
+    WireFormat -->|"SURF/H264/PROG/CLRC/..."| WS_Server
     
     %% WebSocket to browser
     WS_Server -->|"Binary Messages"| WS_Client
@@ -553,11 +607,17 @@ flowchart TB
     
     %% GFX Worker processing
     WireParser --> SurfaceMgr
+    WireParser --> BitmapCache
     WireParser --> VideoDecoder
+    WireParser --> ProgWasm
+    WireParser --> ClearWasm
     WireParser --> TileDecoder
     VideoDecoder --> Compositor
+    ProgWasm --> Compositor
+    ClearWasm --> Compositor
     TileDecoder --> Compositor
     SurfaceMgr --> Compositor
+    BitmapCache --> Compositor
     Compositor --> OffscreenCanvas
 
     %% Audio flow (main thread)
@@ -594,13 +654,21 @@ flowchart TB
 |--------|-----------|---------------------|--------|
 | H.264 (AVC420) | `H264` | GFX Worker VideoDecoder | Canvas frame |
 | H.264 (AVC444) | `H264` | Backend FFmpeg → Worker VideoDecoder | Canvas frame |
+| Progressive tiles | `PROG` | GFX Worker WASM decoder (pthreads) | Canvas blit |
+| ClearCodec tiles | `CLRC` | GFX Worker WASM decoder | Canvas blit |
 | WebP tiles | `WEBP` | GFX Worker createImageBitmap | Canvas blit |
-| Raw BGRA | `TILE` | GFX Worker ImageData | Canvas blit |
+| Raw RGBA | `TILE` | GFX Worker ImageData | Canvas blit |
 | Solid fills | `SFIL` | GFX Worker fillRect | Canvas draw |
 | Surface copy | `S2SF` | GFX Worker drawImage | Canvas blit |
+| Store to cache | `S2CH` | GFX Worker getImageData | Bitmap cache |
 | Cache restore | `C2SF` | GFX Worker drawImage | Canvas blit |
+| Evict cache | `EVCT` | GFX Worker Cache Manager | Cache cleanup |
 | Create surface | `SURF` | GFX Worker Surface Manager | New canvas |
 | Delete surface | `DELS` | GFX Worker Surface Manager | Cleanup |
+| Map surface | `MAPS` | GFX Worker Surface Manager | Primary output |
+| Reset graphics | `RSGR` | GFX Worker | Full state reset |
 | Start frame | `STFR` | GFX Worker Compositor | Begin batch |
 | End frame | `ENFR` | GFX Worker Compositor | Commit + ack |
+| Frame ack | `FACK` | Backend (from browser) | Flow control |
+| Backpressure | `BPRS` | Backend (from browser) | Throttle output |
 | Audio | `OPUS` | Main Thread AudioDecoder | Speakers |
