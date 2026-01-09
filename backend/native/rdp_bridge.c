@@ -94,7 +94,6 @@ typedef struct {
     RdpGfxCodecId gfx_codec;        /* Negotiated codec */
     bool gfx_pipeline_needs_init;   /* Deferred GDI pipeline init flag */
     bool gfx_pipeline_ready;        /* GDI pipeline initialized for decoding */
-    bool progressive_enabled;       /* Progressive codec enabled by client (set before connect) */
     rdpGdi* gdi;                    /* GDI pointer for chaining to GDI handlers */
     
     /* Saved GDI pipeline callbacks for chaining */
@@ -553,12 +552,10 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE)) goto fail;
     
-    /* Progressive codec: Disabled by default. Client enables via
-     * rdp_set_progressive_enabled(session, 1) before connect when
-     * browser has WASM progressive decoder available. */
-    ctx->progressive_enabled = false;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE)) goto fail;
+    /* Progressive codec: Enabled by default for optimal quality.
+     * RemoteFX progressive tiles are passed through to browser for WASM decoding. */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, TRUE)) goto fail;
     
     /* Disable legacy codecs - we want H.264 only */
     if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, FALSE)) goto fail;
@@ -669,26 +666,6 @@ fail:
         freerdp_client_context_free(context);
     }
     return NULL;
-}
-
-void rdp_set_progressive_enabled(RdpSession* session, int enabled)
-{
-    if (!session) return;
-    
-    rdpContext* context = (rdpContext*)session;
-    BridgeContext* ctx = (BridgeContext*)context;
-    rdpSettings* settings = context->settings;
-    
-    ctx->progressive_enabled = (enabled != 0);
-    
-    /* Update FreeRDP settings to announce progressive codec to server */
-    if (ctx->progressive_enabled) {
-        freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE);
-        freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, TRUE);
-    } else {
-        freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE);
-        freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE);
-    }
 }
 
 int rdp_connect(RdpSession* session)
@@ -2912,18 +2889,6 @@ void rdp_free_gfx_event_data(void* data)
     if (data) {
         free(data);
     }
-}
-
-int rdp_gfx_is_progressive_enabled(RdpSession* session)
-{
-    if (!session) return 0;
-    
-    rdpContext* context = (rdpContext*)session;
-    rdpSettings* settings = context->settings;
-    
-    if (!settings) return 0;
-    
-    return freerdp_settings_get_bool(settings, FreeRDP_GfxProgressive) ? 1 : 0;
 }
 
 /* ============================================================================

@@ -196,7 +196,8 @@
   {
     wsUrl: 'ws://localhost:8765',
     showTopBar: true,
-    showBottomBar: true
+    showBottomBar: true,
+    keepConnectionModalOpen: false
   }
 );</code></div>
 
@@ -249,7 +250,8 @@
         const client = new RDPClient(document.getElementById('rdp-container'), {
             wsUrl: 'ws://localhost:8765',
             showTopBar: true,
-            showBottomBar: true
+            showBottomBar: true,
+            keepConnectionModalOpen: false
         });
 
         // Register event handlers

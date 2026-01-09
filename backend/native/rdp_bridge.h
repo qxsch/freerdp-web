@@ -192,15 +192,6 @@ RdpSession* rdp_create(
 int rdp_connect(RdpSession* session);
 
 /**
- * Set progressive codec enabled state
- * Must be called AFTER rdp_create() but BEFORE rdp_connect()
- * 
- * @param session   Session handle from rdp_create()
- * @param enabled   1 to enable progressive codec, 0 to disable
- */
-void rdp_set_progressive_enabled(RdpSession* session, int enabled);
-
-/**
  * Get current session state
  */
 RdpState rdp_get_state(RdpSession* session);
@@ -509,17 +500,6 @@ void rdp_gfx_clear_events(RdpSession* session);
  * @param data      Pointer returned in RdpGfxEvent.bitmap_data
  */
 void rdp_free_gfx_event_data(void* data);
-
-/**
- * Check if Progressive codec is enabled
- * 
- * Progressive codec allows browser-side decoding of compressed tiles
- * using WebAssembly. Enable via RDP_ENABLE_PROGRESSIVE=1 environment variable.
- * 
- * @param session   Session handle
- * @return          1 if enabled, 0 if disabled
- */
-int rdp_gfx_is_progressive_enabled(RdpSession* session);
 
 #ifdef __cplusplus
 }

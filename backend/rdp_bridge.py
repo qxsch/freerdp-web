@@ -45,7 +45,6 @@ class RDPConfig:
     width: int = 1280
     height: int = 720
     color_depth: int = 32
-    progressive_enabled: bool = False  # Enable progressive/RFX codec (requires browser WASM support)
 
 
 # Mouse button flags (matching native library)
@@ -259,10 +258,6 @@ class NativeLibrary:
         lib.rdp_connect.argtypes = [c_void_p]
         lib.rdp_connect.restype = c_int
         
-        # rdp_set_progressive_enabled
-        lib.rdp_set_progressive_enabled.argtypes = [c_void_p, c_int]
-        lib.rdp_set_progressive_enabled.restype = None
-        
         # rdp_get_state
         lib.rdp_get_state.argtypes = [c_void_p]
         lib.rdp_get_state.restype = c_int
@@ -385,10 +380,6 @@ class NativeLibrary:
         lib.rdp_free_gfx_event_data.argtypes = [c_void_p]
         lib.rdp_free_gfx_event_data.restype = None
         
-        # rdp_gfx_is_progressive_enabled
-        lib.rdp_gfx_is_progressive_enabled.argtypes = [c_void_p]
-        lib.rdp_gfx_is_progressive_enabled.restype = c_int
-        
         # Session registry functions
         # rdp_set_max_sessions
         lib.rdp_set_max_sessions.argtypes = [c_int]
@@ -474,19 +465,6 @@ class RDPBridge:
         self._audio_enabled = True
         self._audio_buffer_size = 8192  # PCM buffer size for reading
     
-    @property
-    def is_progressive_enabled(self) -> bool:
-        """Check if Progressive codec is enabled for browser-side WASM decoding.
-        
-        Progressive codec is enabled via RDP_ENABLE_PROGRESSIVE=1 environment variable.
-        
-        Returns:
-            True if Progressive codec is enabled, False otherwise
-        """
-        if not self._session or not self._lib:
-            return False
-        return self._lib.rdp_gfx_is_progressive_enabled(self._session) == 1
-    
     async def connect(self) -> bool:
         """Connect to the RDP server"""
         try:
@@ -514,14 +492,6 @@ class RDPBridge:
             if not self._session:
                 logger.error("Failed to create RDP session")
                 return False
-            
-            # Set progressive codec option based on client capability
-            if self.config.progressive_enabled:
-                logger.info("Progressive codec enabled by client")
-                self._lib.rdp_set_progressive_enabled(self._session, 1)
-            else:
-                logger.info("Progressive codec disabled (client does not support or disabled)")
-                self._lib.rdp_set_progressive_enabled(self._session, 0)
             
             # Connect (this may block briefly)
             logger.info(f"Connecting to {self.config.host}:{self.config.port}...")

@@ -8,7 +8,8 @@
  * const client = new RDPClient(document.getElementById('container'), {
  *   wsUrl: 'ws://localhost:8765',
  *   showTopBar: true,
- *   showBottomBar: true
+ *   showBottomBar: true,
+ *   keepConnectionModalOpen: false
  * });
  * 
  * await client.connect({ host: '192.168.1.100', user: 'admin', pass: 'secret' });
@@ -294,12 +295,6 @@ const TEMPLATE = `
                 <label>Password</label>
                 <input type="password" class="rdp-input-pass" placeholder="Password">
             </div>
-            <div class="rdp-form-group rdp-form-checkbox">
-                <label>
-                    <input type="checkbox" class="rdp-input-disable-progressive">
-                    <span>Disable Progressive/RFX</span>
-                </label>
-            </div>
             <div class="rdp-modal-buttons">
                 <button class="rdp-btn rdp-btn-primary rdp-modal-connect">Connect</button>
                 <button class="rdp-btn rdp-modal-cancel">Cancel</button>
@@ -340,6 +335,7 @@ export class RDPClient {
      * @param {boolean} [options.showTopBar=true] - Show top toolbar
      * @param {boolean} [options.showBottomBar=true] - Show bottom status bar
      * @param {number} [options.reconnectDelay=3000] - Reconnection delay in ms
+     * @param {boolean} [options.keepConnectionModalOpen=false] - Keep connection modal open when disconnected (cannot be closed)
      */
     constructor(container, options = {}) {
         this.options = {
@@ -349,6 +345,7 @@ export class RDPClient {
             reconnectDelay: 3000,
             mouseThrottleMs: 16,
             resizeDebounceMs: 2000,
+            keepConnectionModalOpen: false,
             ...options
         };
 
@@ -357,6 +354,11 @@ export class RDPClient {
         this._initState();
         this._bindElements();
         this._setupEventListeners();
+        
+        // Auto-show modal on init when keepConnectionModalOpen is enabled
+        if (this.options.keepConnectionModalOpen) {
+            this._showModal();
+        }
         
         console.log('[RDPClient] Initialized');
     }
@@ -442,7 +444,6 @@ export class RDPClient {
             inputPort: $('.rdp-input-port'),
             inputUser: $('.rdp-input-user'),
             inputPass: $('.rdp-input-pass'),
-            inputDisableProgressive: $('.rdp-input-disable-progressive'),
             resolution: $('.rdp-resolution'),
             latency: $('.rdp-latency'),
         };
@@ -624,7 +625,6 @@ export class RDPClient {
      * @param {number} [credentials.port=3389] - RDP port
      * @param {string} credentials.user - Username
      * @param {string} credentials.pass - Password
-     * @param {boolean} [credentials.disableProgressive=false] - Disable Progressive/RFX codecs
      * @returns {Promise<void>}
      */
     connect(credentials) {
@@ -654,8 +654,8 @@ export class RDPClient {
                 this._canvas.width = width;
                 this._canvas.height = height;
 
-                // Determine if progressive codec should be enabled
-                const progressiveEnabled = this._wasmAvailable && !credentials.disableProgressive;
+                // Progressive is enabled when WASM is available
+                const progressiveEnabled = this._wasmAvailable;
                 
                 this._sendMessage({
                     type: 'connect',
@@ -668,8 +668,7 @@ export class RDPClient {
                     progressiveEnabled
                 });
                 
-                console.log('[RDPClient] Connect request - Progressive:', progressiveEnabled, 
-                            '(WASM:', this._wasmAvailable, ', disabled:', !!credentials.disableProgressive, ')');
+                console.log('[RDPClient] Connect request - Progressive:', progressiveEnabled);
             };
 
             this._ws.onmessage = (e) => this._handleMessage(e);
@@ -855,10 +854,16 @@ export class RDPClient {
 
     _showModal() {
         this._el.modal.classList.add('active');
+        // Hide cancel button when keepConnectionModalOpen is enabled
+        this._el.modalCancel.style.display = this.options.keepConnectionModalOpen ? 'none' : '';
         this._el.inputHost.focus();
     }
 
     _hideModal() {
+        // Don't allow hiding modal if keepConnectionModalOpen is enabled and not connected
+        if (this.options.keepConnectionModalOpen && !this._isConnected) {
+            return;
+        }
         this._el.modal.classList.remove('active');
     }
 
@@ -867,7 +872,6 @@ export class RDPClient {
         const port = parseInt(this._el.inputPort.value) || 3389;
         const user = this._el.inputUser.value.trim();
         const pass = this._el.inputPass.value;
-        const disableProgressive = this._el.inputDisableProgressive.checked;
 
         if (!host || !user) {
             alert('Please enter host and username');
@@ -875,7 +879,7 @@ export class RDPClient {
         }
 
         this._hideModal();
-        this.connect({ host, port, user, pass, disableProgressive });
+        this.connect({ host, port, user, pass });
     }
 
     _updateStatus(state, text) {
@@ -1037,6 +1041,11 @@ export class RDPClient {
         this._cleanupGfxWorker();
         
         this._emit('disconnected');
+        
+        // Auto-show modal when keepConnectionModalOpen is enabled
+        if (this.options.keepConnectionModalOpen) {
+            this._showModal();
+        }
     }
     
     /**
