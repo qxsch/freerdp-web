@@ -269,7 +269,7 @@ await client.connect({
 
 ## WebSocket Protocol
 
-### Client → Server Messages
+### Client → Server Messages (JSON Format)
 
 | Type | Description | Fields |
 |------|-------------|--------|
@@ -279,6 +279,15 @@ await client.connect({
 | `key` | Keyboard event | `action`, `code`, `key` |
 | `resize` | Request resolution change | `width`, `height` |
 | `ping` | Latency measurement | - |
+
+### Server → Client Messages (JSON Format)
+
+| Type | Description | Fields |
+|------|-------------|--------|
+| `connected` | Session started | `width`, `height` |
+| `disconnected` | Session ended | - |
+| `error` | Error occurred | `message` |
+| `pong` | Ping response | - |
 
 ### Server → Client Messages (Wire Format)
 
@@ -312,14 +321,6 @@ All binary messages use a 4-byte ASCII magic header for efficient parsing:
 | `FACK` | frameAck | Acknowledge frame completion |
 | `BPRS` | backpressure | Signal decode queue pressure |
 
-### JSON Messages
-
-| Type | Description | Fields |
-|------|-------------|--------|
-| `connected` | Session started | `width`, `height` |
-| `disconnected` | Session ended | - |
-| `error` | Error occurred | `message` |
-| `pong` | Ping response | - |
 
 ## Configuration
 
