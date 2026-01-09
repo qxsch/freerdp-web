@@ -220,6 +220,9 @@
                 <li><code>getMuted()</code> - Get audio mute state</li>
                 <li><code>setMuted(bool)</code> - Set audio mute</li>
                 <li><code>getResolution()</code> - Get current resolution</li>
+                <li><code>showKeyboard()</code> - Show virtual keyboard</li>
+                <li><code>hideKeyboard()</code> - Hide virtual keyboard</li>
+                <li><code>isKeyboardVisible()</code> - Check keyboard visibility</li>
                 <li><code>on(event, fn)</code> - Add event listener</li>
                 <li><code>off(event, fn)</code> - Remove listener</li>
                 <li><code>destroy()</code> - Cleanup resources</li>
@@ -231,6 +234,8 @@
                 <li><code>'disconnected'</code> - Session ended</li>
                 <li><code>'resize'</code> - Resolution changed</li>
                 <li><code>'error'</code> - Error occurred</li>
+                <li><code>'keyboardShow'</code> - Virtual keyboard shown</li>
+                <li><code>'keyboardHide'</code> - Virtual keyboard hidden</li>
             </ul>
 
             <h2>Try It</h2>
@@ -239,6 +244,7 @@
                 <button class="demo-btn" id="btn-ctrlaltdel">Ctrl+Alt+Del</button>
                 <button class="demo-btn" id="btn-type">Type "Hello"</button>
                 <button class="demo-btn" id="btn-mute">Toggle Mute</button>
+                <button class="demo-btn" id="btn-keyboard">Toggle Keyboard</button>
             </div>
         </aside>
     </main>
@@ -317,6 +323,17 @@
             client.setMuted(!status.muted);
             console.log('Muted:', !status.muted);
         });
+
+        document.getElementById('btn-keyboard').addEventListener('click', () => {
+            if (client.isKeyboardVisible()) {
+                client.hideKeyboard();
+                console.log('Keyboard hidden');
+            } else {
+                client.showKeyboard();
+                console.log('Keyboard shown');
+            }
+        });
+
 
     </script>
 </body>

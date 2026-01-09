@@ -241,6 +241,133 @@ const STYLES = `
 
 .rdp-modal-buttons .rdp-btn { flex: 1; }
 .rdp-modal-buttons .rdp-btn-primary { background: var(--rdp-accent); color: #000; }
+
+/* Virtual Keyboard Overlay */
+.rdp-keyboard-overlay {
+    display: none;
+    position: absolute;
+    background: rgba(30, 30, 50, 0.95);
+    border: 2px solid var(--rdp-border);
+    border-radius: 8px;
+    padding: 8px;
+    z-index: 100;
+    user-select: none;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+}
+
+.rdp-keyboard-overlay.visible { display: block; }
+
+.rdp-keyboard-titlebar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 8px;
+    margin-bottom: 8px;
+    background: var(--rdp-header-bg);
+    border-radius: 4px;
+    cursor: move;
+}
+
+.rdp-keyboard-title {
+    font-size: 0.8rem;
+    color: var(--rdp-text-muted);
+}
+
+.rdp-keyboard-close {
+    background: transparent;
+    border: none;
+    color: var(--rdp-text-muted);
+    font-size: 1.2rem;
+    cursor: pointer;
+    padding: 2px 6px;
+    line-height: 1;
+}
+
+.rdp-keyboard-close:hover { color: var(--rdp-error); }
+
+.rdp-keyboard-content {
+    transform-origin: top left;
+    width: max-content;
+}
+
+.rdp-keyboard-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.rdp-keyboard-row {
+    display: flex;
+    gap: 4px;
+    justify-content: center;
+}
+
+.rdp-key {
+    background: var(--rdp-btn-bg);
+    border: 1px solid var(--rdp-border);
+    color: var(--rdp-text);
+    padding: 8px 12px;
+    min-width: 36px;
+    height: 36px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    font-family: inherit;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s, transform 0.05s;
+}
+
+.rdp-key:hover { background: var(--rdp-btn-hover); }
+.rdp-key:active { transform: scale(0.95); background: var(--rdp-accent); color: #000; }
+.rdp-key.pressed { background: var(--rdp-accent); color: #000; }
+
+.rdp-key-wide { min-width: 60px; }
+.rdp-key-wider { min-width: 80px; }
+.rdp-key-widest { min-width: 100px; }
+.rdp-key-space { min-width: 200px; }
+.rdp-key-special { background: #2a3a5a; }
+.rdp-key-special:hover { background: #3a4a6a; }
+
+.rdp-keyboard-resize {
+    position: absolute;
+    bottom: 4px;
+    right: 4px;
+    width: 16px;
+    height: 16px;
+    cursor: nwse-resize;
+    opacity: 0.5;
+}
+
+.rdp-keyboard-resize:hover { opacity: 1; }
+
+.rdp-keyboard-resize::before,
+.rdp-keyboard-resize::after {
+    content: '';
+    position: absolute;
+    background: var(--rdp-text-muted);
+    border-radius: 1px;
+}
+
+.rdp-keyboard-resize::before {
+    width: 12px;
+    height: 2px;
+    bottom: 2px;
+    right: 0;
+    transform: rotate(-45deg);
+    transform-origin: right bottom;
+}
+
+.rdp-keyboard-resize::after {
+    width: 8px;
+    height: 2px;
+    bottom: 6px;
+    right: 0;
+    transform: rotate(-45deg);
+    transform-origin: right bottom;
+}
 `;
 
 // ============================================================
@@ -256,6 +383,7 @@ const TEMPLATE = `
         <div class="rdp-controls">
             <button class="rdp-btn rdp-btn-connect">Connect</button>
             <button class="rdp-btn rdp-btn-disconnect" disabled>Disconnect</button>
+            <button class="rdp-btn rdp-btn-keyboard" disabled title="Toggle Virtual Keyboard">⌨️</button>
             <button class="rdp-btn rdp-btn-mute" disabled title="Toggle Audio">🔊</button>
             <button class="rdp-btn rdp-btn-fullscreen">⛶</button>
         </div>
@@ -268,6 +396,119 @@ const TEMPLATE = `
                 <p>Click Connect to start</p>
             </div>
             <canvas class="rdp-canvas" width="1280" height="720" style="display: none;"></canvas>
+            
+            <!-- Virtual Keyboard Overlay -->
+            <div class="rdp-keyboard-overlay">
+                <div class="rdp-keyboard-titlebar">
+                    <span class="rdp-keyboard-title">Virtual Keyboard</span>
+                    <button class="rdp-keyboard-close" title="Close">×</button>
+                </div>
+                <div class="rdp-keyboard-content">
+                    <div class="rdp-keyboard-rows">
+                        <!-- Row 1: Function keys + special -->
+                        <div class="rdp-keyboard-row">
+                        <button class="rdp-key" data-code="Escape">Esc</button>
+                        <button class="rdp-key" data-code="F1">F1</button>
+                        <button class="rdp-key" data-code="F2">F2</button>
+                        <button class="rdp-key" data-code="F3">F3</button>
+                        <button class="rdp-key" data-code="F4">F4</button>
+                        <button class="rdp-key" data-code="F5">F5</button>
+                        <button class="rdp-key" data-code="F6">F6</button>
+                        <button class="rdp-key" data-code="F7">F7</button>
+                        <button class="rdp-key" data-code="F8">F8</button>
+                        <button class="rdp-key" data-code="F9">F9</button>
+                        <button class="rdp-key" data-code="F10">F10</button>
+                        <button class="rdp-key" data-code="F11">F11</button>
+                        <button class="rdp-key" data-code="F12">F12</button>
+                        <button class="rdp-key rdp-key-wide" data-code="Delete">Del</button>
+                    </div>
+                    <!-- Row 2: Numbers -->
+                    <div class="rdp-keyboard-row">
+                        <button class="rdp-key" data-code="Backquote" data-key="\`" data-shift="~">\`</button>
+                        <button class="rdp-key" data-code="Digit1" data-key="1" data-shift="!">1</button>
+                        <button class="rdp-key" data-code="Digit2" data-key="2" data-shift="@">2</button>
+                        <button class="rdp-key" data-code="Digit3" data-key="3" data-shift="#">3</button>
+                        <button class="rdp-key" data-code="Digit4" data-key="4" data-shift="$">4</button>
+                        <button class="rdp-key" data-code="Digit5" data-key="5" data-shift="%">5</button>
+                        <button class="rdp-key" data-code="Digit6" data-key="6" data-shift="^">6</button>
+                        <button class="rdp-key" data-code="Digit7" data-key="7" data-shift="&">7</button>
+                        <button class="rdp-key" data-code="Digit8" data-key="8" data-shift="*">8</button>
+                        <button class="rdp-key" data-code="Digit9" data-key="9" data-shift="(">9</button>
+                        <button class="rdp-key" data-code="Digit0" data-key="0" data-shift=")">0</button>
+                        <button class="rdp-key" data-code="Minus" data-key="-" data-shift="_">-</button>
+                        <button class="rdp-key" data-code="Equal" data-key="=" data-shift="+">=</button>
+                        <button class="rdp-key rdp-key-wider" data-code="Backspace">⌫</button>
+                    </div>
+                    <!-- Row 3: QWERTY top -->
+                    <div class="rdp-keyboard-row">
+                        <button class="rdp-key rdp-key-wide" data-code="Tab">Tab</button>
+                        <button class="rdp-key" data-code="KeyQ" data-key="q" data-shift="Q">Q</button>
+                        <button class="rdp-key" data-code="KeyW" data-key="w" data-shift="W">W</button>
+                        <button class="rdp-key" data-code="KeyE" data-key="e" data-shift="E">E</button>
+                        <button class="rdp-key" data-code="KeyR" data-key="r" data-shift="R">R</button>
+                        <button class="rdp-key" data-code="KeyT" data-key="t" data-shift="T">T</button>
+                        <button class="rdp-key" data-code="KeyY" data-key="y" data-shift="Y">Y</button>
+                        <button class="rdp-key" data-code="KeyU" data-key="u" data-shift="U">U</button>
+                        <button class="rdp-key" data-code="KeyI" data-key="i" data-shift="I">I</button>
+                        <button class="rdp-key" data-code="KeyO" data-key="o" data-shift="O">O</button>
+                        <button class="rdp-key" data-code="KeyP" data-key="p" data-shift="P">P</button>
+                        <button class="rdp-key" data-code="BracketLeft" data-key="[" data-shift="{">[</button>
+                        <button class="rdp-key" data-code="BracketRight" data-key="]" data-shift="}">]</button>
+                        <button class="rdp-key rdp-key-wide" data-code="Backslash" data-key="\\" data-shift="|">\\</button>
+                    </div>
+                    <!-- Row 4: ASDF middle -->
+                    <div class="rdp-keyboard-row">
+                        <button class="rdp-key rdp-key-wider" data-code="CapsLock">Caps</button>
+                        <button class="rdp-key" data-code="KeyA" data-key="a" data-shift="A">A</button>
+                        <button class="rdp-key" data-code="KeyS" data-key="s" data-shift="S">S</button>
+                        <button class="rdp-key" data-code="KeyD" data-key="d" data-shift="D">D</button>
+                        <button class="rdp-key" data-code="KeyF" data-key="f" data-shift="F">F</button>
+                        <button class="rdp-key" data-code="KeyG" data-key="g" data-shift="G">G</button>
+                        <button class="rdp-key" data-code="KeyH" data-key="h" data-shift="H">H</button>
+                        <button class="rdp-key" data-code="KeyJ" data-key="j" data-shift="J">J</button>
+                        <button class="rdp-key" data-code="KeyK" data-key="k" data-shift="K">K</button>
+                        <button class="rdp-key" data-code="KeyL" data-key="l" data-shift="L">L</button>
+                        <button class="rdp-key" data-code="Semicolon" data-key=";" data-shift=":">;</button>
+                        <button class="rdp-key" data-code="Quote" data-key="'" data-shift='"'>'</button>
+                        <button class="rdp-key rdp-key-widest" data-code="Enter">Enter</button>
+                    </div>
+                    <!-- Row 5: ZXCV bottom -->
+                    <div class="rdp-keyboard-row">
+                        <button class="rdp-key rdp-key-widest rdp-key-modifier" data-code="ShiftLeft" data-modifier="shift">Shift</button>
+                        <button class="rdp-key" data-code="KeyZ" data-key="z" data-shift="Z">Z</button>
+                        <button class="rdp-key" data-code="KeyX" data-key="x" data-shift="X">X</button>
+                        <button class="rdp-key" data-code="KeyC" data-key="c" data-shift="C">C</button>
+                        <button class="rdp-key" data-code="KeyV" data-key="v" data-shift="V">V</button>
+                        <button class="rdp-key" data-code="KeyB" data-key="b" data-shift="B">B</button>
+                        <button class="rdp-key" data-code="KeyN" data-key="n" data-shift="N">N</button>
+                        <button class="rdp-key" data-code="KeyM" data-key="m" data-shift="M">M</button>
+                        <button class="rdp-key" data-code="Comma" data-key="," data-shift="<">,</button>
+                        <button class="rdp-key" data-code="Period" data-key="." data-shift=">">.</button>
+                        <button class="rdp-key" data-code="Slash" data-key="/" data-shift="?">?</button>
+                        <button class="rdp-key rdp-key-widest rdp-key-modifier" data-code="ShiftRight" data-modifier="shift">Shift</button>
+                    </div>
+                    <!-- Row 6: Bottom row -->
+                    <div class="rdp-keyboard-row">
+                        <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="ControlLeft" data-modifier="ctrl">Ctrl</button>
+                        <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="MetaLeft" data-modifier="meta">Win</button>
+                        <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="AltLeft" data-modifier="alt">Alt</button>
+                        <button class="rdp-key rdp-key-space" data-code="Space" data-key=" ">Space</button>
+                        <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="AltRight" data-modifier="alt">Alt</button>
+                        <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="ControlRight" data-modifier="ctrl">Ctrl</button>
+                        <button class="rdp-key" data-code="ArrowLeft">←</button>
+                        <button class="rdp-key" data-code="ArrowUp">↑</button>
+                        <button class="rdp-key" data-code="ArrowDown">↓</button>
+                        <button class="rdp-key" data-code="ArrowRight">→</button>
+                    </div>
+                        <!-- Row 7: Special combos -->
+                        <div class="rdp-keyboard-row">
+                            <button class="rdp-key rdp-key-widest rdp-key-special" data-combo="alt+tab">Alt+Tab</button>
+                            <button class="rdp-key rdp-key-widest rdp-key-special" data-combo="ctrl+alt+delete">Ctrl+Alt+Del</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="rdp-keyboard-resize"></div>
+            </div>
         </div>
     </div>
 
@@ -419,6 +660,17 @@ export class RDPClient {
         this._pendingGfxMessages = [];
         this._wasmAvailable = false;  // Set by GFX worker on load
         
+        // Virtual keyboard state
+        this._keyboardVisible = false;
+        this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false };
+        this._keyboardDragging = false;
+        this._keyboardResizing = false;
+        this._keyboardDragOffset = { x: 0, y: 0 };
+        this._keyboardBaseWidth = 0;    // Natural width of keyboard content
+        this._keyboardBaseHeight = 0;   // Natural height of keyboard content (rows only)
+        this._keyboardTitlebarHeight = 0; // Height of titlebar (not scaled)
+        this._keyboardActiveKey = null;  // Currently pressed key element
+        
         // Event callbacks
         this._eventHandlers = {};
     }
@@ -446,6 +698,13 @@ export class RDPClient {
             inputPass: $('.rdp-input-pass'),
             resolution: $('.rdp-resolution'),
             latency: $('.rdp-latency'),
+            // Virtual keyboard elements
+            btnKeyboard: $('.rdp-btn-keyboard'),
+            keyboardOverlay: $('.rdp-keyboard-overlay'),
+            keyboardContent: $('.rdp-keyboard-content'),
+            keyboardTitlebar: $('.rdp-keyboard-titlebar'),
+            keyboardClose: $('.rdp-keyboard-close'),
+            keyboardResize: $('.rdp-keyboard-resize'),
         };
         
         this._canvas = this._el.canvas;
@@ -585,6 +844,7 @@ export class RDPClient {
         this._el.btnConnect.addEventListener('click', () => this._showModal());
         this._el.btnDisconnect.addEventListener('click', () => this.disconnect());
         this._el.btnMute.addEventListener('click', () => this._toggleMute());
+        this._el.btnKeyboard.addEventListener('click', () => this._toggleKeyboard());
         this._el.btnFullscreen.addEventListener('click', () => this._toggleFullscreen());
         
         // Modal
@@ -606,6 +866,9 @@ export class RDPClient {
         // Keyboard - scoped to shadow root
         this._shadow.addEventListener('keydown', (e) => this._handleKeyDown(e));
         this._shadow.addEventListener('keyup', (e) => this._handleKeyUp(e));
+        
+        // Virtual keyboard events
+        this._setupVirtualKeyboard();
 
         // Resize observer
         if (typeof ResizeObserver !== 'undefined') {
@@ -999,6 +1262,7 @@ export class RDPClient {
         this._el.loading.style.display = 'none';
         this._el.btnConnect.disabled = true;
         this._el.btnDisconnect.disabled = false;
+        this._el.btnKeyboard.disabled = false;
         this._el.btnMute.disabled = false;
         this._canvas.focus();
         
@@ -1035,7 +1299,11 @@ export class RDPClient {
         this._el.loading.querySelector('p').textContent = 'Click Connect to start';
         this._el.btnConnect.disabled = false;
         this._el.btnDisconnect.disabled = true;
+        this._el.btnKeyboard.disabled = true;
         this._el.btnMute.disabled = true;
+        
+        // Hide virtual keyboard on disconnect
+        this.hideKeyboard();
         
         this._cleanupAudio();
         this._cleanupGfxWorker();
@@ -1438,6 +1706,531 @@ export class RDPClient {
             ctrlKey: e.ctrlKey, shiftKey: e.shiftKey,
             altKey: e.altKey, metaKey: e.metaKey
         });
+    }
+
+    // --------------------------------------------------
+    // PRIVATE: VIRTUAL KEYBOARD
+    // --------------------------------------------------
+    
+    /**
+     * Setup virtual keyboard event listeners
+     */
+    _setupVirtualKeyboard() {
+        const overlay = this._el.keyboardOverlay;
+        const titlebar = this._el.keyboardTitlebar;
+        const resizeHandle = this._el.keyboardResize;
+        
+        // Close button
+        this._el.keyboardClose.addEventListener('click', () => this.hideKeyboard());
+        
+        // Key press handlers
+        overlay.querySelectorAll('.rdp-key').forEach(key => {
+            key.addEventListener('mousedown', (e) => this._handleVirtualKeyDown(e, key));
+            key.addEventListener('mouseup', (e) => this._handleVirtualKeyUp(e, key));
+            key.addEventListener('mouseleave', (e) => this._handleVirtualKeyUp(e, key));
+            // Touch support
+            key.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                this._handleVirtualKeyDown(e, key);
+            });
+            key.addEventListener('touchend', (e) => {
+                e.preventDefault();
+                this._handleVirtualKeyUp(e, key);
+            });
+        });
+        
+        // Dragging
+        titlebar.addEventListener('mousedown', (e) => this._startKeyboardDrag(e));
+        titlebar.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            this._startKeyboardDrag(e.touches[0]);
+        });
+        
+        // Resizing
+        resizeHandle.addEventListener('mousedown', (e) => this._startKeyboardResize(e));
+        resizeHandle.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            this._startKeyboardResize(e.touches[0]);
+        });
+        
+        // Global mouse/touch move and up handlers
+        this._shadow.addEventListener('mousemove', (e) => {
+            if (this._keyboardDragging) this._handleKeyboardDrag(e);
+            if (this._keyboardResizing) this._handleKeyboardResize(e);
+        });
+        this._shadow.addEventListener('mouseup', () => {
+            this._keyboardDragging = false;
+            this._keyboardResizing = false;
+        });
+        this._shadow.addEventListener('touchmove', (e) => {
+            if (this._keyboardDragging || this._keyboardResizing) {
+                e.preventDefault();
+                const touch = e.touches[0];
+                if (this._keyboardDragging) this._handleKeyboardDrag(touch);
+                if (this._keyboardResizing) this._handleKeyboardResize(touch);
+            }
+        });
+        this._shadow.addEventListener('touchend', () => {
+            this._keyboardDragging = false;
+            this._keyboardResizing = false;
+        });
+    }
+    
+    /**
+     * Toggle virtual keyboard visibility
+     */
+    _toggleKeyboard() {
+        if (this._keyboardVisible) {
+            this.hideKeyboard();
+        } else {
+            this.showKeyboard();
+        }
+    }
+    
+    /**
+     * Show the virtual keyboard
+     * @public
+     */
+    showKeyboard() {
+        if (!this._isConnected) return;
+        
+        const overlay = this._el.keyboardOverlay;
+        const content = this._el.keyboardContent;
+        const screenRect = this._el.screen.getBoundingClientRect();
+        
+        // Reset scale to measure natural size
+        content.style.transform = 'scale(1)';
+        overlay.classList.add('visible');
+        
+        // Measure natural keyboard size (only once)
+        if (this._keyboardBaseWidth === 0) {
+            const contentRect = content.getBoundingClientRect();
+            const titlebarRect = this._el.keyboardTitlebar.getBoundingClientRect();
+            this._keyboardBaseWidth = contentRect.width;
+            this._keyboardBaseHeight = contentRect.height;  // Content only (rows)
+            this._keyboardTitlebarHeight = titlebarRect.height + 8; // +8 for margin
+        }
+        
+        // Scale limits - adjusted for better usability
+        const minScale = 0.5;
+        const maxScale = 1.2;
+        
+        // Calculate initial scale (try to fit 80% of screen width, but clamp to limits)
+        let scale = Math.min((screenRect.width * 0.8 - 16) / this._keyboardBaseWidth, maxScale);
+        scale = Math.max(scale, minScale);
+        
+        // Calculate dimensions: width and content are scaled, titlebar is not
+        const calcWidth = (s) => (this._keyboardBaseWidth * s) + 16;
+        const calcHeight = (s) => (this._keyboardBaseHeight * s) + this._keyboardTitlebarHeight + 16;
+        
+        // Check if max scale still fits in canvas
+        const maxWidth = screenRect.width - 20;  // Leave some margin
+        const maxHeight = screenRect.height - 40;  // Leave some margin
+        
+        if (calcWidth(scale) > maxWidth) {
+            scale = Math.max(minScale, (maxWidth - 16) / this._keyboardBaseWidth);
+        }
+        if (calcHeight(scale) > maxHeight) {
+            const heightScale = (maxHeight - this._keyboardTitlebarHeight - 16) / this._keyboardBaseHeight;
+            scale = Math.max(minScale, Math.min(scale, heightScale));
+        }
+        
+        const width = calcWidth(scale);
+        const height = calcHeight(scale);
+        
+        // Apply scale
+        content.style.transform = `scale(${scale})`;
+        
+        // Center horizontally, position at bottom
+        const left = (screenRect.width - width) / 2;
+        const top = Math.max(0, screenRect.height - height - 20);
+        
+        overlay.style.width = `${width}px`;
+        overlay.style.height = `${height}px`;
+        overlay.style.left = `${Math.max(0, left)}px`;
+        overlay.style.top = `${top}px`;
+        
+        this._keyboardVisible = true;
+        this._emit('keyboardShow');
+    }
+    
+    /**
+     * Hide the virtual keyboard
+     * @public
+     */
+    hideKeyboard() {
+        this._el.keyboardOverlay.classList.remove('visible');
+        this._keyboardVisible = false;
+        this._resetKeyboardModifiers();
+        this._emit('keyboardHide');
+    }
+    
+    /**
+     * Check if virtual keyboard is visible
+     * @public
+     * @returns {boolean}
+     */
+    isKeyboardVisible() {
+        return this._keyboardVisible;
+    }
+    
+    /**
+     * Reset all keyboard modifiers
+     */
+    _resetKeyboardModifiers() {
+        this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false };
+        this._el.keyboardOverlay.querySelectorAll('.rdp-key-modifier').forEach(key => {
+            key.classList.remove('pressed');
+        });
+    }
+    
+    /**
+     * Handle virtual key press
+     */
+    _handleVirtualKeyDown(e, key) {
+        if (!this._isConnected) return;
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const code = key.dataset.code;
+        const combo = key.dataset.combo;
+        const modifier = key.dataset.modifier;
+        
+        // Handle special combos (no tracking needed, instant action)
+        if (combo) {
+            key.classList.add('pressed');
+            this._sendVirtualKeyCombo(combo);
+            // Remove pressed state after a short delay for visual feedback
+            setTimeout(() => key.classList.remove('pressed'), 150);
+            return;
+        }
+        
+        // Handle modifier keys (toggle mode, no tracking)
+        if (modifier) {
+            this._keyboardModifiers[modifier] = !this._keyboardModifiers[modifier];
+            if (this._keyboardModifiers[modifier]) {
+                key.classList.add('pressed');
+            } else {
+                key.classList.remove('pressed');
+            }
+            return;
+        }
+        
+        // Track this as the active key
+        this._keyboardActiveKey = key;
+        key.classList.add('pressed');
+        
+        // Get key name based on shift state
+        const keyName = this._keyboardModifiers.shift ? 
+            (key.dataset.shift || key.textContent) : 
+            (key.dataset.key || key.textContent);
+        
+        // Send modifier key down events first
+        this._sendActiveModifierDownEvents();
+        
+        // Send main key down with modifier flags
+        this._sendMessage({
+            type: 'key', action: 'down',
+            key: keyName, code: code, keyCode: 0,
+            ctrlKey: this._keyboardModifiers.ctrl,
+            shiftKey: this._keyboardModifiers.shift,
+            altKey: this._keyboardModifiers.alt,
+            metaKey: this._keyboardModifiers.meta
+        });
+    }
+    
+    /**
+     * Send key down events for all active modifiers
+     */
+    _sendActiveModifierDownEvents() {
+        if (this._keyboardModifiers.ctrl) {
+            this._sendMessage({
+                type: 'key', action: 'down',
+                key: 'Control', code: 'ControlLeft', keyCode: 0,
+                ctrlKey: true, shiftKey: false, altKey: false, metaKey: false
+            });
+        }
+        if (this._keyboardModifiers.alt) {
+            this._sendMessage({
+                type: 'key', action: 'down',
+                key: 'Alt', code: 'AltLeft', keyCode: 0,
+                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: true, metaKey: false
+            });
+        }
+        if (this._keyboardModifiers.shift) {
+            this._sendMessage({
+                type: 'key', action: 'down',
+                key: 'Shift', code: 'ShiftLeft', keyCode: 0,
+                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: true, altKey: this._keyboardModifiers.alt, metaKey: false
+            });
+        }
+        if (this._keyboardModifiers.meta) {
+            this._sendMessage({
+                type: 'key', action: 'down',
+                key: 'Meta', code: 'MetaLeft', keyCode: 0,
+                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: this._keyboardModifiers.shift, altKey: this._keyboardModifiers.alt, metaKey: true
+            });
+        }
+    }
+    
+    /**
+     * Send key up events for all active modifiers
+     */
+    _sendActiveModifierUpEvents() {
+        if (this._keyboardModifiers.meta) {
+            this._sendMessage({
+                type: 'key', action: 'up',
+                key: 'Meta', code: 'MetaLeft', keyCode: 0,
+                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: this._keyboardModifiers.shift, altKey: this._keyboardModifiers.alt, metaKey: false
+            });
+        }
+        if (this._keyboardModifiers.shift) {
+            this._sendMessage({
+                type: 'key', action: 'up',
+                key: 'Shift', code: 'ShiftLeft', keyCode: 0,
+                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: this._keyboardModifiers.alt, metaKey: false
+            });
+        }
+        if (this._keyboardModifiers.alt) {
+            this._sendMessage({
+                type: 'key', action: 'up',
+                key: 'Alt', code: 'AltLeft', keyCode: 0,
+                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: false, metaKey: false
+            });
+        }
+        if (this._keyboardModifiers.ctrl) {
+            this._sendMessage({
+                type: 'key', action: 'up',
+                key: 'Control', code: 'ControlLeft', keyCode: 0,
+                ctrlKey: false, shiftKey: false, altKey: false, metaKey: false
+            });
+        }
+    }
+    
+    /**
+     * Handle virtual key release
+     */
+    _handleVirtualKeyUp(e, key) {
+        if (!this._isConnected) return;
+        
+        const modifier = key.dataset.modifier;
+        const combo = key.dataset.combo;
+        
+        // Don't process modifier keys or combos on mouseup (they toggle/instant)
+        if (modifier || combo) return;
+        
+        // Only send key up if this is the actively pressed key
+        if (this._keyboardActiveKey !== key) return;
+        
+        this._keyboardActiveKey = null;
+        key.classList.remove('pressed');
+        
+        const code = key.dataset.code;
+        const keyName = this._keyboardModifiers.shift ? 
+            (key.dataset.shift || key.textContent) : 
+            (key.dataset.key || key.textContent);
+        
+        // Send main key up
+        this._sendMessage({
+            type: 'key', action: 'up',
+            key: keyName, code: code, keyCode: 0,
+            ctrlKey: this._keyboardModifiers.ctrl,
+            shiftKey: this._keyboardModifiers.shift,
+            altKey: this._keyboardModifiers.alt,
+            metaKey: this._keyboardModifiers.meta
+        });
+        
+        // Send modifier key up events
+        this._sendActiveModifierUpEvents();
+        
+        // Reset modifiers after non-modifier key press
+        this._resetKeyboardModifiers();
+    }
+    
+    /**
+     * Send a key combination (properly simulates modifier key presses)
+     */
+    _sendVirtualKeyCombo(combo) {
+        const keys = combo.toLowerCase().split('+');
+        const modifierKeys = [];
+        let mainKey = null;
+        let mainCode = null;
+        
+        keys.forEach(k => {
+            switch (k) {
+                case 'ctrl': 
+                    modifierKeys.push({ key: 'Control', code: 'ControlLeft' });
+                    break;
+                case 'alt': 
+                    modifierKeys.push({ key: 'Alt', code: 'AltLeft' });
+                    break;
+                case 'shift': 
+                    modifierKeys.push({ key: 'Shift', code: 'ShiftLeft' });
+                    break;
+                case 'meta': case 'win': 
+                    modifierKeys.push({ key: 'Meta', code: 'MetaLeft' });
+                    break;
+                case 'tab': 
+                    mainKey = 'Tab'; 
+                    mainCode = 'Tab'; 
+                    break;
+                case 'delete': 
+                    mainKey = 'Delete'; 
+                    mainCode = 'Delete'; 
+                    break;
+                default: 
+                    mainKey = k; 
+                    mainCode = k;
+            }
+        });
+        
+        if (!mainKey) return;
+        
+        // Build modifier state
+        const modifiers = {
+            ctrl: modifierKeys.some(m => m.key === 'Control'),
+            alt: modifierKeys.some(m => m.key === 'Alt'),
+            shift: modifierKeys.some(m => m.key === 'Shift'),
+            meta: modifierKeys.some(m => m.key === 'Meta')
+        };
+        
+        // Press modifier keys down first
+        modifierKeys.forEach(mod => {
+            this._sendMessage({
+                type: 'key', action: 'down',
+                key: mod.key, code: mod.code, keyCode: 0,
+                ctrlKey: false, shiftKey: false, altKey: false, metaKey: false
+            });
+        });
+        
+        // Small delay then press main key
+        setTimeout(() => {
+            // Press main key down
+            this._sendMessage({
+                type: 'key', action: 'down',
+                key: mainKey, code: mainCode, keyCode: 0,
+                ctrlKey: modifiers.ctrl, shiftKey: modifiers.shift,
+                altKey: modifiers.alt, metaKey: modifiers.meta
+            });
+            
+            // Release main key
+            setTimeout(() => {
+                this._sendMessage({
+                    type: 'key', action: 'up',
+                    key: mainKey, code: mainCode, keyCode: 0,
+                    ctrlKey: modifiers.ctrl, shiftKey: modifiers.shift,
+                    altKey: modifiers.alt, metaKey: modifiers.meta
+                });
+                
+                // Release modifier keys in reverse order
+                setTimeout(() => {
+                    [...modifierKeys].reverse().forEach(mod => {
+                        this._sendMessage({
+                            type: 'key', action: 'up',
+                            key: mod.key, code: mod.code, keyCode: 0,
+                            ctrlKey: false, shiftKey: false, altKey: false, metaKey: false
+                        });
+                    });
+                }, 20);
+            }, 30);
+        }, 20);
+    }
+    
+    /**
+     * Start dragging the keyboard
+     */
+    _startKeyboardDrag(e) {
+        this._keyboardDragging = true;
+        const overlay = this._el.keyboardOverlay;
+        const rect = overlay.getBoundingClientRect();
+        const screenRect = this._el.screen.getBoundingClientRect();
+        
+        this._keyboardDragOffset = {
+            x: e.clientX - (rect.left - screenRect.left),
+            y: e.clientY - (rect.top - screenRect.top)
+        };
+    }
+    
+    /**
+     * Handle keyboard dragging
+     */
+    _handleKeyboardDrag(e) {
+        if (!this._keyboardDragging) return;
+        
+        const overlay = this._el.keyboardOverlay;
+        const screenRect = this._el.screen.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+        
+        let newLeft = e.clientX - this._keyboardDragOffset.x;
+        let newTop = e.clientY - this._keyboardDragOffset.y;
+        
+        // Constrain to screen bounds
+        newLeft = Math.max(0, Math.min(newLeft, screenRect.width - overlayRect.width));
+        newTop = Math.max(0, Math.min(newTop, screenRect.height - overlayRect.height));
+        
+        overlay.style.left = `${newLeft}px`;
+        overlay.style.top = `${newTop}px`;
+    }
+    
+    /**
+     * Start resizing the keyboard
+     */
+    _startKeyboardResize(e) {
+        this._keyboardResizing = true;
+        e.stopPropagation();
+    }
+    
+    /**
+     * Handle keyboard resizing with content scaling
+     */
+    _handleKeyboardResize(e) {
+        if (!this._keyboardResizing) return;
+        if (this._keyboardBaseWidth === 0) return;  // Not initialized
+        
+        const overlay = this._el.keyboardOverlay;
+        const content = this._el.keyboardContent;
+        const screenRect = this._el.screen.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+        
+        // Scale limits
+        const minScale = 0.5;
+        const maxScale = 1.2;
+        
+        // Helper functions for calculating dimensions
+        const calcWidth = (s) => (this._keyboardBaseWidth * s) + 16;
+        const calcHeight = (s) => (this._keyboardBaseHeight * s) + this._keyboardTitlebarHeight + 16;
+        
+        // Calculate new width based on mouse position
+        let newWidth = e.clientX - overlayRect.left + 10;
+        
+        // Calculate desired scale
+        let scale = (newWidth - 16) / this._keyboardBaseWidth;
+        
+        // Clamp scale between min and max
+        scale = Math.max(minScale, Math.min(maxScale, scale));
+        
+        // Check canvas boundaries and adjust if needed
+        const maxWidth = screenRect.width - (overlayRect.left - screenRect.left);
+        const maxHeight = screenRect.height - (overlayRect.top - screenRect.top);
+        
+        if (calcWidth(scale) > maxWidth) {
+            scale = Math.max(minScale, (maxWidth - 16) / this._keyboardBaseWidth);
+        }
+        
+        if (calcHeight(scale) > maxHeight) {
+            const heightScale = (maxHeight - this._keyboardTitlebarHeight - 16) / this._keyboardBaseHeight;
+            scale = Math.max(minScale, Math.min(scale, heightScale));
+        }
+        
+        // Ensure we're still within scale limits after boundary checks
+        scale = Math.max(minScale, Math.min(maxScale, scale));
+        
+        newWidth = calcWidth(scale);
+        const newHeight = calcHeight(scale);
+        
+        content.style.transform = `scale(${scale})`;
+        overlay.style.width = `${newWidth}px`;
+        overlay.style.height = `${newHeight}px`;
     }
 
     // --------------------------------------------------
