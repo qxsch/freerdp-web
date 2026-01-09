@@ -33,7 +33,6 @@
 #include <freerdp/client/rdpgfx.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/event.h>
-#include <freerdp/codec/clear.h>
 #include <freerdp/codec/planar.h>
 #include <freerdp/codec/progressive.h>
 #include <freerdp/codec/color.h>
@@ -149,10 +148,9 @@ typedef struct {
     AVPacket* encode_pkt;
     bool transcoder_initialized;
     
-    /* Codec decoders for non-H.264 GFX codecs (thread-safe, no GDI dependency) */
-    CLEAR_CONTEXT* clear_decoder;
+    /* Planar codec decoder (thread-safe, no GDI dependency)
+     * Note: ClearCodec and Progressive are passed through to browser for WASM decoding */
     BITMAP_PLANAR_CONTEXT* planar_decoder;
-    PROGRESSIVE_CONTEXT* progressive_decoder;
     
     /* GFX event queue for wire format streaming (Python consumption) */
     RdpGfxEvent gfx_events[RDP_MAX_GFX_EVENTS];
@@ -483,11 +481,9 @@ RdpSession* rdp_create(
     ctx->gfx_event_read_idx = 0;
     ctx->gfx_event_count = 0;
     
-    /* Initialize codec decoders for non-H.264 GFX codecs
-     * Note: Progressive codec is passed through to browser for WASM decoding */
-    ctx->clear_decoder = clear_context_new(FALSE);  /* FALSE = decompressor */
+    /* Initialize planar codec decoder
+     * Note: ClearCodec and Progressive are passed through to browser for WASM decoding */
     ctx->planar_decoder = freerdp_bitmap_planar_context_new(0, 64, 64);  /* Will resize as needed */
-    ctx->progressive_decoder = NULL;  /* Progressive decoded in browser via WASM */
     
     /* Initialize Opus buffer for native audio streaming.
      * 256KB allows ~4 seconds of Opus audio at 64kbps, which provides
@@ -1148,17 +1144,11 @@ static void bridge_post_disconnect(freerdp* instance)
     ctx->state = RDP_STATE_DISCONNECTED;
     ctx->frame_buffer = NULL;
     
-    /* Free codec decoders */
-    if (ctx->clear_decoder) {
-        clear_context_free(ctx->clear_decoder);
-        ctx->clear_decoder = NULL;
-    }
+    /* Free codec decoder */
     if (ctx->planar_decoder) {
         freerdp_bitmap_planar_context_free(ctx->planar_decoder);
         ctx->planar_decoder = NULL;
     }
-    /* Progressive decoder is NULL - decoded in browser via WASM */
-    ctx->progressive_decoder = NULL;
     
     gdi_free(instance);
 }
@@ -2304,7 +2294,7 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
             break;
         }
         
-        /* UNCOMPRESSED: Raw BGRA pixels - encode to WebP tile */
+        /* UNCOMPRESSED: Raw BGRA pixels - convert to RGBA and encode to WebP tile */
         case RDPGFX_CODECID_UNCOMPRESSED: {
             if (!cmd->data) {
                 break;
@@ -2330,9 +2320,33 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 break;
             }
             
-            /* cmd->data is already BGRA with stride = nWidth * 4 */
+            /* Allocate buffer for RGBA conversion */
+            size_t rgba_size = (size_t)nWidth * nHeight * 4;
+            uint8_t* rgba_buf = (uint8_t*)malloc(rgba_size);
+            if (!rgba_buf) {
+                break;
+            }
+            
+            /* Convert BGRX → RGBA
+             * cmd->data is BGRX32 (not BGRA32) - the X byte is unused padding.
+             * Per MS-RDPEGFX, UNCOMPRESSED uses the surface pixel format which
+             * is typically GFX_PIXEL_FORMAT_XRGB_8888 (no alpha channel).
+             * We set alpha to 0xFF (fully opaque) for WebP encoding. */
+            const uint8_t* src = cmd->data;
+            uint8_t* dst = rgba_buf;
+            size_t pixel_count = (size_t)nWidth * nHeight;
+            for (size_t i = 0; i < pixel_count; i++) {
+                dst[0] = src[2];  /* R (from offset 2 in BGRX) */
+                dst[1] = src[1];  /* G (from offset 1 in BGRX) */
+                dst[2] = src[0];  /* B (from offset 0 in BGRX) */
+                dst[3] = 0xFF;    /* A = opaque (X byte is padding, not alpha) */
+                src += 4;
+                dst += 4;
+            }
+            
             queue_webp_tile(bctx, surfId, surfX, surfY, nWidth, nHeight,
-                           cmd->data, nWidth * 4);
+                           rgba_buf, nWidth * 4);
+            free(rgba_buf);
             break;
         }
         
@@ -2351,7 +2365,7 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
             break;
         }
         
-        /* Planar codec - decode and encode to WebP tile */
+        /* Planar codec - decode to RGBA and encode to WebP tile */
         case RDPGFX_CODECID_PLANAR: {
             if (!bctx->planar_decoder) {
                 break;
@@ -2384,11 +2398,11 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 break;
             }
             
-            /* Decode Planar to temp buffer */
+            /* Decode Planar directly to RGBA */
             if (freerdp_bitmap_decompress_planar(bctx->planar_decoder,
                     cmd->data, cmd->length,
                     nWidth, nHeight,
-                    temp_buf, PIXEL_FORMAT_BGRA32,
+                    temp_buf, PIXEL_FORMAT_RGBA32,
                     nWidth * 4,  /* stride */
                     0, 0,        /* decode at origin of temp buffer */
                     nWidth, nHeight, FALSE)) {
@@ -2616,79 +2630,39 @@ int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t tota
  * WebP Tile Encoding Helper
  * ============================================================================ */
 
-/* WebP encoding quality (0-100, higher = better quality, more data)
- * NOTE: This is only used if WEBP_USE_LOSSLESS is 0.
- * For bitmap cache correctness, we now use LOSSLESS mode to preserve
- * bit-exact pixels for SurfaceToCache/CacheToSurface operations. */
-#define WEBP_QUALITY 75.0f
-
-/* Use lossless WebP to preserve exact pixels for cache operations.
- * Lossy WebP would cause cache mismatches because:
- * - SurfaceToCache captures lossy-decoded pixels
- * - CacheToSurface would blit degraded pixels
- * - Each cache reuse further degrades quality */
-#define WEBP_USE_LOSSLESS 1
-
 /**
- * Encode BGRA pixels to WebP and queue as WEBP_TILE event.
+ * Encode RGBA pixels to WebP and queue as WEBP_TILE event.
  * 
  * @param ctx Bridge context
  * @param surface_id Target surface
  * @param x, y Destination coordinates on surface
  * @param width, height Tile dimensions
- * @param bgra_data BGRA32 pixel data (width * height * 4 bytes)
- * @param stride Bytes per row in bgra_data
+ * @param rgba_data RGBA32 pixel data (width * height * 4 bytes)
+ * @param stride Bytes per row in rgba_data
  * 
  * This function:
- * 1. Encodes BGRA to WebP (lossy)
+ * 1. Encodes RGBA to WebP (lossless)
  * 2. Queues a WEBP_TILE event with the compressed data
  * 3. The event's bitmap_data is allocated here and freed by Python after reading
+ * 
+ * NOTE: Callers must convert to RGBA before calling this function.
+ * PLANAR codec uses PIXEL_FORMAT_RGBA32 in freerdp_bitmap_decompress_planar.
+ * UNCOMPRESSED codec converts BGRA→RGBA before calling.
  */
 static void queue_webp_tile(BridgeContext* ctx, uint16_t surface_id,
                             int32_t x, int32_t y, uint32_t width, uint32_t height,
-                            const uint8_t* bgra_data, int stride)
+                            const uint8_t* rgba_data, int stride)
 {
-    if (!ctx || !bgra_data || width == 0 || height == 0) return;
+    if (!ctx || !rgba_data || width == 0 || height == 0) return;
     
-    /* Convert BGRA to RGBA and encode to WebP.
-     * 
-     * CRITICAL: VP8L (WebP lossless) internally uses RGBA byte order.
-     * ClearCodec/Planar/Uncompressed tiles come in BGRA format.
-     * We MUST explicitly swap B↔R channels before encoding.
-     * 
-     * BGRA layout (FreeRDP): [B, G, R, A] at bytes 0,1,2,3
-     * RGBA layout (WebP):    [R, G, B, A] at bytes 0,1,2,3
-     */
     uint8_t* webp_out = NULL;
     size_t webp_size = 0;
-    
-    /* Allocate buffer for RGBA conversion */
-    size_t pixel_count = (size_t)width * height;
-    size_t rgba_size = pixel_count * 4;
-    uint8_t* rgba_buf = (uint8_t*)malloc(rgba_size);
-    if (!rgba_buf) {
-        fprintf(stderr, "[GFX] Failed to allocate RGBA buffer for %ux%u tile\n", width, height);
-        return;
-    }
-    
-    /* Convert BGRA → RGBA with proper stride handling */
-    for (uint32_t row = 0; row < height; row++) {
-        const uint8_t* src_row = bgra_data + row * stride;
-        uint8_t* dst_row = rgba_buf + row * width * 4;
-        
-        for (uint32_t col = 0; col < width; col++) {
-            const uint8_t* src = src_row + col * 4;
-            uint8_t* dst = dst_row + col * 4;
-            
-            /* BGRA → RGBA: swap B and R, keep G and A */
-            dst[0] = src[2];  /* R = src.R (was at offset 2 in BGRA) */
-            dst[1] = src[1];  /* G = src.G */
-            dst[2] = src[0];  /* B = src.B (was at offset 0 in BGRA) */
-            dst[3] = src[3];  /* A = src.A */
-        }
-    }
-    
-#if WEBP_USE_LOSSLESS
+
+    /* We always use lossless WebP to preserve exact pixels for cache operations.
+     * Lossy WebP would cause cache mismatches because:
+     *  - SurfaceToCache captures lossy-decoded pixels
+     *  - CacheToSurface would blit degraded pixels
+     *  - Each cache reuse further degrades quality */
     /* Use advanced API with exact=1 to preserve RGB values in transparent areas */
     {
         WebPConfig config;
@@ -2697,7 +2671,6 @@ static void queue_webp_tile(BridgeContext* ctx, uint16_t surface_id,
         
         if (!WebPConfigPreset(&config, WEBP_PRESET_DEFAULT, 100.0f)) {
             fprintf(stderr, "[GFX] WebP config init failed\n");
-            free(rgba_buf);
             return;
         }
         
@@ -2708,13 +2681,11 @@ static void queue_webp_tile(BridgeContext* ctx, uint16_t surface_id,
         
         if (!WebPValidateConfig(&config)) {
             fprintf(stderr, "[GFX] WebP config validation failed\n");
-            free(rgba_buf);
             return;
         }
         
         if (!WebPPictureInit(&pic)) {
             fprintf(stderr, "[GFX] WebP picture init failed\n");
-            free(rgba_buf);
             return;
         }
         
@@ -2722,17 +2693,12 @@ static void queue_webp_tile(BridgeContext* ctx, uint16_t surface_id,
         pic.height = height;
         pic.use_argb = 1;  /* Use ARGB mode for lossless */
         
-        /* Import RGBA data - now in correct byte order for WebP */
-        if (!WebPPictureImportRGBA(&pic, rgba_buf, width * 4)) {
+        /* Import RGBA data directly */
+        if (!WebPPictureImportRGBA(&pic, rgba_data, stride)) {
             fprintf(stderr, "[GFX] WebP RGBA import failed\n");
             WebPPictureFree(&pic);
-            free(rgba_buf);
             return;
         }
-        
-        /* Done with RGBA buffer */
-        free(rgba_buf);
-        rgba_buf = NULL;
         
         /* Set up memory writer */
         WebPMemoryWriterInit(&writer);
@@ -2753,15 +2719,6 @@ static void queue_webp_tile(BridgeContext* ctx, uint16_t surface_id,
         webp_out = writer.mem;
         webp_size = writer.size;
     }
-#else
-    /* Lossy mode: smaller files but causes cache pixel mismatch.
-     * Only use this if cache operations are disabled.
-     * NOTE: Still need to use RGBA since we already converted above. */
-    webp_size = WebPEncodeRGBA(rgba_buf, width, height, width * 4, 
-                               WEBP_QUALITY, &webp_out);
-    free(rgba_buf);
-    rgba_buf = NULL;
-#endif
     
     if (webp_size == 0 || !webp_out) {
         fprintf(stderr, "[GFX] WebP encoding failed for %ux%u tile\n", width, height);
