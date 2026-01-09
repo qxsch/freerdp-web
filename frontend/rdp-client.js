@@ -177,7 +177,7 @@ const STYLES = `
     background: rgba(0, 0, 0, 0.7);
     justify-content: center;
     align-items: center;
-    z-index: 1000;
+    z-index: 10;
 }
 
 .rdp-modal.active { display: flex; }
