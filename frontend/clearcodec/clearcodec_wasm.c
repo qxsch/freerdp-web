@@ -7,15 +7,13 @@
  * Copyright 2014 Marc-Andre Moreau <marcandre.moreau@gmail.com>
  * Copyright 2016 Armin Novak <armin.novak@thincast.com>
  * Copyright 2016 Thincast Technologies GmbH
+ * Adption by Marco Weber <https://github.com/qxsch>
  * 
  */
-
-#define BUILD_VERSION "__BUILD_TIME__"
 
 #include <emscripten.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -189,7 +187,6 @@ static bool resize_vbar_entry(ClearVBarEntry* entry) {
         
         uint8_t* tmp = (uint8_t*)realloc(entry->pixels, newBytes);
         if (!tmp) {
-            fprintf(stderr, "[CLEAR] Failed to resize vBarEntry to %u bytes\n", newBytes);
             return false;
         }
         
@@ -200,7 +197,6 @@ static bool resize_vbar_entry(ClearVBarEntry* entry) {
     }
     
     if (!entry->pixels && entry->size > 0) {
-        fprintf(stderr, "[CLEAR] vBarEntry pixels is NULL but size=%u\n", entry->size);
         return false;
     }
     
@@ -213,7 +209,6 @@ static bool resize_temp_buffer(ClearContext* ctx, uint32_t width, uint32_t heigh
     if (size > ctx->tempSize) {
         uint8_t* tmp = (uint8_t*)realloc(ctx->tempBuffer, size);
         if (!tmp) {
-            fprintf(stderr, "[CLEAR] Failed to resize temp buffer to %u bytes\n", size);
             return false;
         }
         memset(tmp, 0, size);
@@ -249,7 +244,6 @@ static bool clear_decompress_subcode_rlex(
     bitmapDataOffset = 1 + (paletteCount * 3);
     
     if (paletteCount > 127 || paletteCount < 1) {
-        fprintf(stderr, "[CLEAR] Invalid paletteCount: %u\n", paletteCount);
         return false;
     }
     
@@ -294,27 +288,22 @@ static bool clear_decompress_subcode_rlex(
         }
         
         if (startIndex >= paletteCount) {
-            fprintf(stderr, "[CLEAR] RLEX startIndex %u >= paletteCount %u\n", startIndex, paletteCount);
             return false;
         }
         
         if (stopIndex >= paletteCount) {
-            fprintf(stderr, "[CLEAR] RLEX stopIndex %u >= paletteCount %u\n", stopIndex, paletteCount);
             return false;
         }
         
         suiteIndex = startIndex;
         
         if (suiteIndex > 127) {
-            fprintf(stderr, "[CLEAR] RLEX suiteIndex %u > 127\n", suiteIndex);
             return false;
         }
         
         color = palette[suiteIndex];
         
         if (pixelIndex + runLengthFactor > pixelCount) {
-            fprintf(stderr, "[CLEAR] RLEX pixel overflow: %u + %u > %u\n", 
-                    pixelIndex, runLengthFactor, pixelCount);
             return false;
         }
         
@@ -335,15 +324,12 @@ static bool clear_decompress_subcode_rlex(
         pixelIndex += runLengthFactor;
         
         if (pixelIndex + (suiteDepth + 1) > pixelCount) {
-            fprintf(stderr, "[CLEAR] RLEX suite overflow: %u + %u > %u\n",
-                    pixelIndex, suiteDepth + 1, pixelCount);
             return false;
         }
         
         /* Write suite pixels */
         for (uint32_t i = 0; i <= suiteDepth; i++) {
             if (suiteIndex > 127) {
-                fprintf(stderr, "[CLEAR] RLEX suiteIndex %u > 127 in loop\n", suiteIndex);
                 return false;
             }
             
@@ -366,7 +352,6 @@ static bool clear_decompress_subcode_rlex(
     }
     
     if (pixelIndex != pixelCount) {
-        fprintf(stderr, "[CLEAR] RLEX pixel mismatch: %u != %u\n", pixelIndex, pixelCount);
         return false;
     }
     
@@ -423,8 +408,6 @@ static bool clear_decompress_residual_data(
         }
         
         if (pixelIndex >= pixelCount || runLengthFactor > (pixelCount - pixelIndex)) {
-            fprintf(stderr, "[CLEAR] Residual pixel overflow: %u + %u > %u\n",
-                    pixelIndex, runLengthFactor, pixelCount);
             return false;
         }
         
@@ -437,7 +420,6 @@ static bool clear_decompress_residual_data(
     }
     
     if (pixelIndex != pixelCount) {
-        fprintf(stderr, "[CLEAR] Residual pixel mismatch: %u != %u\n", pixelIndex, pixelCount);
         return false;
     }
     
@@ -550,7 +532,6 @@ static bool clear_decompress_nscodec(
     
     /* Read NSCodec header */
     if (dataByteCount < 20) {
-        fprintf(stderr, "[NSC] Data too small for header: %u\n", dataByteCount);
         return false;
     }
     
@@ -567,7 +548,6 @@ static bool clear_decompress_nscodec(
     stream_read_u16(s);  /* Reserved */
     
     if (colorLossLevel < 1 || colorLossLevel > 7) {
-        fprintf(stderr, "[NSC] Invalid ColorLossLevel: %u\n", colorLossLevel);
         return false;
     }
     
@@ -580,7 +560,6 @@ static bool clear_decompress_nscodec(
     }
     
     if (totalPlaneBytes > dataByteCount - 20) {
-        fprintf(stderr, "[NSC] Plane data exceeds available bytes\n");
         return false;
     }
     
@@ -617,7 +596,6 @@ static bool clear_decompress_nscodec(
     for (int i = 0; i < 4; i++) {
         planeBuffers[i] = (uint8_t*)malloc(maxPlaneSize);
         if (!planeBuffers[i]) {
-            fprintf(stderr, "[NSC] Failed to allocate plane buffer %d\n", i);
             for (int j = 0; j < i; j++) free(planeBuffers[j]);
             return false;
         }
@@ -637,14 +615,12 @@ static bool clear_decompress_nscodec(
         } else if (compSize < origSize) {
             /* RLE compressed */
             if (!nsc_rle_decode(rle, rleSize, planeBuffers[i], maxPlaneSize, origSize)) {
-                fprintf(stderr, "[NSC] RLE decode failed for plane %d\n", i);
                 for (int j = 0; j < 4; j++) free(planeBuffers[j]);
                 return false;
             }
         } else {
             /* Uncompressed - copy directly */
             if (rleSize < origSize) {
-                fprintf(stderr, "[NSC] Not enough data for plane %d\n", i);
                 for (int j = 0; j < 4; j++) free(planeBuffers[j]);
                 return false;
             }
@@ -656,7 +632,7 @@ static bool clear_decompress_nscodec(
     }
     
     /* YCoCg to RGB conversion and write to destination */
-    uint32_t rw = chromaSubsamplingLevel ? tempWidth : width;
+    /* Match FreeRDP exactly: Y plane uses tempWidth stride with chroma subsampling */
     
     for (uint32_t y = 0; y < height; y++) {
         if (nYDstRel + y >= nDstHeight) break;
@@ -667,9 +643,10 @@ static bool clear_decompress_nscodec(
         const uint8_t* aplane = planeBuffers[3] + y * width;
         
         if (chromaSubsamplingLevel) {
-            yplane = planeBuffers[0] + y * rw;
-            coplane = planeBuffers[1] + (y >> 1) * (rw >> 1);
-            cgplane = planeBuffers[2] + (y >> 1) * (rw >> 1);
+            /* With chroma subsampling: Y uses tempWidth stride, Co/Cg are subsampled */
+            yplane = planeBuffers[0] + y * tempWidth;
+            coplane = planeBuffers[1] + (y >> 1) * (tempWidth >> 1);
+            cgplane = planeBuffers[2] + (y >> 1) * (tempWidth >> 1);
         } else {
             yplane = planeBuffers[0] + y * width;
             coplane = planeBuffers[1] + y * width;
@@ -679,9 +656,15 @@ static bool clear_decompress_nscodec(
         for (uint32_t x = 0; x < width; x++) {
             if (nXDstRel + x >= nDstWidth) break;
             
+            /* Read Y value directly */
             int16_t y_val = (int16_t)yplane[x];
-            int16_t co_val = (int16_t)(int8_t)(((int16_t)coplane[chromaSubsamplingLevel ? x >> 1 : x]) << shift);
-            int16_t cg_val = (int16_t)(int8_t)(((int16_t)cgplane[chromaSubsamplingLevel ? x >> 1 : x]) << shift);
+            
+            /* For Co/Cg with chroma subsampling, use x >> 1 to get subsampled index */
+            uint32_t chromaX = chromaSubsamplingLevel ? (x >> 1) : x;
+            
+            /* Apply shift for color loss recovery - cast to int8_t for sign extension */
+            int16_t co_val = (int16_t)(int8_t)(((int16_t)coplane[chromaX]) << shift);
+            int16_t cg_val = (int16_t)(int8_t)(((int16_t)cgplane[chromaX]) << shift);
             
             /* YCoCg to RGB conversion */
             int16_t r_val = y_val + co_val - cg_val;
@@ -746,14 +729,10 @@ static bool clear_decompress_subcodecs_data(
         uint32_t nYDstRel = nYDst + yStart;
         
         if ((uint32_t)xStart + width > nWidth) {
-            fprintf(stderr, "[CLEAR] Subcodec xStart %u + width %u > nWidth %u\n",
-                    xStart, width, nWidth);
             return false;
         }
         
         if ((uint32_t)yStart + height > nHeight) {
-            fprintf(stderr, "[CLEAR] Subcodec yStart %u + height %u > nHeight %u\n",
-                    yStart, height, nHeight);
             return false;
         }
         
@@ -766,8 +745,6 @@ static bool clear_decompress_subcodecs_data(
                 size_t nSrcSize = (size_t)nSrcStep * height;
                 
                 if (bitmapDataByteCount != nSrcSize) {
-                    fprintf(stderr, "[CLEAR] Subcodec uncompressed size mismatch: %u != %zu\n",
-                            bitmapDataByteCount, nSrcSize);
                     return false;
                 }
                 
@@ -794,7 +771,6 @@ static bool clear_decompress_subcodecs_data(
                 /* NSCodec */
                 if (!clear_decompress_nscodec(s, bitmapDataByteCount, width, height,
                         pDstData, nDstStep, nXDstRel, nYDstRel, nDstWidth, nDstHeight)) {
-                    fprintf(stderr, "[CLEAR] NSCodec decode failed\n");
                     return false;
                 }
                 break;
@@ -808,7 +784,6 @@ static bool clear_decompress_subcodecs_data(
                 break;
             
             default:
-                fprintf(stderr, "[CLEAR] Unknown subcodec ID: %u\n", subcodecId);
                 return false;
         }
         
@@ -858,12 +833,10 @@ static bool clear_decompress_bands_data(
         colorBkg = make_rgba(cr, cg, cb, 0xFF);
         
         if (xEnd < xStart) {
-            fprintf(stderr, "[CLEAR] Bands xEnd %u < xStart %u\n", xEnd, xStart);
             return false;
         }
         
         if (yEnd < yStart) {
-            fprintf(stderr, "[CLEAR] Bands yEnd %u < yStart %u\n", yEnd, yStart);
             return false;
         }
         
@@ -883,7 +856,6 @@ static bool clear_decompress_bands_data(
             uint32_t vBarHeight = (yEnd - yStart + 1);
             
             if (vBarHeight > 52) {
-                fprintf(stderr, "[CLEAR] vBarHeight %u > 52\n", vBarHeight);
                 return false;
             }
             
@@ -892,7 +864,6 @@ static bool clear_decompress_bands_data(
                 uint16_t vBarIndex = vBarHeader & 0x3FFF;
                 
                 if (vBarIndex >= CLEARCODEC_VBAR_SHORT_SIZE) {
-                    fprintf(stderr, "[CLEAR] ShortVBar index %u out of range\n", vBarIndex);
                     return false;
                 }
                 
@@ -911,21 +882,18 @@ static bool clear_decompress_bands_data(
                 vBarYOff = (vBarHeader >> 8) & 0x3F;
                 
                 if (vBarYOff < vBarYOn) {
-                    fprintf(stderr, "[CLEAR] vBarYOff %u < vBarYOn %u\n", vBarYOff, vBarYOn);
                     return false;
                 }
                 
                 vBarShortPixelCount = vBarYOff - vBarYOn;
                 
                 if (vBarShortPixelCount > 52) {
-                    fprintf(stderr, "[CLEAR] vBarShortPixelCount %u > 52\n", vBarShortPixelCount);
                     return false;
                 }
                 
                 if (!stream_check(s, vBarShortPixelCount * 3)) return false;
                 
                 if (ctx->shortVBarStorageCursor >= CLEARCODEC_VBAR_SHORT_SIZE) {
-                    fprintf(stderr, "[CLEAR] ShortVBar storage overflow\n");
                     return false;
                 }
                 
@@ -953,7 +921,6 @@ static bool clear_decompress_bands_data(
                 uint16_t vBarIndex = vBarHeader & 0x7FFF;
                 
                 if (vBarIndex >= CLEARCODEC_VBAR_SIZE) {
-                    fprintf(stderr, "[CLEAR] VBar index %u out of range\n", vBarIndex);
                     return false;
                 }
                 
@@ -961,19 +928,16 @@ static bool clear_decompress_bands_data(
                 
                 /* If cache was reset, fill with dummy data */
                 if (vBarEntry->size == 0) {
-                    fprintf(stderr, "[CLEAR] Empty VBar cache index %u, filling dummy\n", vBarIndex);
                     vBarEntry->count = vBarHeight;
                     if (!resize_vbar_entry(vBarEntry)) return false;
                 }
             }
             else {
-                fprintf(stderr, "[CLEAR] Invalid vBarHeader 0x%04X\n", vBarHeader);
                 return false;
             }
             
             if (vBarUpdate) {
                 if (ctx->vBarStorageCursor >= CLEARCODEC_VBAR_SIZE) {
-                    fprintf(stderr, "[CLEAR] VBar storage overflow\n");
                     return false;
                 }
                 
@@ -1031,8 +995,6 @@ static bool clear_decompress_bands_data(
             }
             
             if (vBarEntry->count != vBarHeight) {
-                fprintf(stderr, "[CLEAR] vBarEntry count %u != vBarHeight %u\n",
-                        vBarEntry->count, vBarHeight);
                 vBarEntry->count = vBarHeight;
                 if (!resize_vbar_entry(vBarEntry)) return false;
             }
@@ -1085,7 +1047,6 @@ static bool clear_decompress_glyph_data(
     
     if ((glyphFlags & CLEARCODEC_FLAG_GLYPH_HIT) && 
         !(glyphFlags & CLEARCODEC_FLAG_GLYPH_INDEX)) {
-        fprintf(stderr, "[CLEAR] Invalid glyph flags: 0x%02X\n", glyphFlags);
         return false;
     }
     
@@ -1094,7 +1055,6 @@ static bool clear_decompress_glyph_data(
     }
     
     if ((nWidth * nHeight) > (1024 * 1024)) {
-        fprintf(stderr, "[CLEAR] Glyph too large: %ux%u\n", nWidth, nHeight);
         return false;
     }
     
@@ -1103,7 +1063,6 @@ static bool clear_decompress_glyph_data(
     glyphIndex = stream_read_u16(s);
     
     if (glyphIndex >= CLEARCODEC_GLYPH_CACHE_SIZE) {
-        fprintf(stderr, "[CLEAR] Invalid glyphIndex: %u\n", glyphIndex);
         return false;
     }
     
@@ -1112,13 +1071,10 @@ static bool clear_decompress_glyph_data(
         ClearGlyphEntry* glyphEntry = &ctx->glyphCache[glyphIndex];
         
         if (!glyphEntry->pixels) {
-            fprintf(stderr, "[CLEAR] Glyph cache miss at index %u\n", glyphIndex);
             return false;
         }
         
         if ((nWidth * nHeight) > glyphEntry->count) {
-            fprintf(stderr, "[CLEAR] Glyph size mismatch: %u > %u\n",
-                    nWidth * nHeight, glyphEntry->count);
             return false;
         }
         
@@ -1151,7 +1107,6 @@ static bool clear_decompress_glyph_data(
             uint32_t* tmp = (uint32_t*)realloc(glyphEntry->pixels, 
                                                 glyphEntry->count * BYTES_PER_PIXEL);
             if (!tmp) {
-                fprintf(stderr, "[CLEAR] Failed to allocate glyph cache\n");
                 return false;
             }
             
@@ -1160,7 +1115,6 @@ static bool clear_decompress_glyph_data(
         }
         
         if (!glyphEntry->pixels) {
-            fprintf(stderr, "[CLEAR] Glyph pixels is NULL\n");
             return false;
         }
         
@@ -1207,8 +1161,6 @@ static int32_t clear_decompress_internal(
     }
     
     if (seqNumber != ctx->seqNumber) {
-        fprintf(stderr, "[CLEAR] Sequence mismatch: got %u, expected %u\n",
-                seqNumber, ctx->seqNumber);
         return -1;
     }
     
@@ -1222,7 +1174,6 @@ static int32_t clear_decompress_internal(
     /* Decompress glyph data */
     if (!clear_decompress_glyph_data(ctx, s, glyphFlags, nWidth, nHeight,
             pDstData, nDstStep, nXDst, nYDst, nDstWidth, nDstHeight, &glyphData)) {
-        fprintf(stderr, "[CLEAR] Glyph decompress failed\n");
         return -1;
     }
     
@@ -1233,7 +1184,6 @@ static int32_t clear_decompress_internal(
             /* Glyph hit with no payload - success */
             return 0;
         }
-        fprintf(stderr, "[CLEAR] Invalid glyph flags, missing data\n");
         return -1;
     }
     
@@ -1246,7 +1196,6 @@ static int32_t clear_decompress_internal(
         if (!clear_decompress_residual_data(ctx, s, residualByteCount,
                 nWidth, nHeight, pDstData, nDstStep,
                 nXDst, nYDst, nDstWidth, nDstHeight)) {
-            fprintf(stderr, "[CLEAR] Residual decompress failed\n");
             return -1;
         }
     }
@@ -1256,7 +1205,6 @@ static int32_t clear_decompress_internal(
         if (!clear_decompress_bands_data(ctx, s, bandsByteCount,
                 nWidth, nHeight, pDstData, nDstStep,
                 nXDst, nYDst, nDstWidth, nDstHeight)) {
-            fprintf(stderr, "[CLEAR] Bands decompress failed\n");
             return -1;
         }
     }
@@ -1266,7 +1214,6 @@ static int32_t clear_decompress_internal(
         if (!clear_decompress_subcodecs_data(ctx, s, subcodecByteCount,
                 nWidth, nHeight, pDstData, nDstStep,
                 nXDst, nYDst, nDstWidth, nDstHeight)) {
-            fprintf(stderr, "[CLEAR] Subcodecs decompress failed\n");
             return -1;
         }
     }
@@ -1294,8 +1241,6 @@ static int32_t clear_decompress_internal(
  */
 EMSCRIPTEN_KEEPALIVE
 ClearContext* clear_create(void) {
-    printf("[CLEAR-WASM] ===== BUILD %s =====\n", BUILD_VERSION);
-    
     ClearContext* ctx = (ClearContext*)calloc(1, sizeof(ClearContext));
     if (!ctx) return NULL;
     

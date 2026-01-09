@@ -6,8 +6,6 @@
  * Optimized for browser execution via Emscripten with pthread support
  */
 
-#define BUILD_VERSION "__BUILD_TIME__"
-
 /* DEBUG: Force extrapolate mode for testing
  * 0 = use server's flag (normal operation)
  * 1 = force extrapolate=true  (use extrapolated DWT path)
@@ -18,7 +16,6 @@
 #include "rfx_types.h"
 #include <emscripten.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 
 /* External functions from other modules */
@@ -122,8 +119,6 @@ static ThreadLocalBuffers* get_thread_buffers(void) {
  */
 EMSCRIPTEN_KEEPALIVE
 ProgressiveContext* prog_create(void) {
-    printf("[PROG-WASM] ===== BUILD %s =====\n", BUILD_VERSION);
-    
     ProgressiveContext* ctx = (ProgressiveContext*)calloc(1, sizeof(ProgressiveContext));
     if (!ctx) return NULL;
     
@@ -808,14 +803,6 @@ static int decode_tile_upgrade(ProgressiveContext* ctx, RfxSurface* surface,
      * If tile was reset by SYNC/CONTEXT, valid=false and we must skip
      * to avoid refining garbage coefficients. */
     if (!tile || tile->pass == 0 || !tile->valid) {
-        /* Track skip count and log periodically */
-        static int skipCount = 0;
-        skipCount++;
-        if (skipCount <= 5 || (skipCount % 100 == 0)) {
-            printf("[UPGRADE] SKIP tile (%u,%u): tile=%p pass=%d valid=%d (total skipped=%d)\n", 
-                   xIdx, yIdx, (void*)tile, tile ? tile->pass : -1, 
-                   tile ? tile->valid : 0, skipCount);
-        }
         return -1;
     }
     
@@ -948,7 +935,6 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
     uint8_t numProgQuant = data[4];
     uint8_t flags = data[5];
     uint16_t numTiles = read_u16_le(data + 6);
-    uint32_t tileDataSize = read_u32_le(data + 8);
     
     /* Store extrapolate flag in context for use by tile decoders
      * Bit 0 (0x01) = RFX_DWT_REDUCE_EXTRAPOLATE:
@@ -956,10 +942,8 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
      * If extrapolate=0: LL3@4032 (64 coefficients, 8x8) - DIFFERENT LAYOUT! */
 #if FORCE_EXTRAPOLATE_MODE == 1
     ctx->extrapolate = true;  /* FORCED: extrapolated path */
-    printf("[PROG] FORCE_EXTRAPOLATE_MODE=1: Using extrapolated DWT (server sent flags=0x%02x)\n", flags);
 #elif FORCE_EXTRAPOLATE_MODE == 2
     ctx->extrapolate = false;  /* FORCED: non-extrapolated path */
-    printf("[PROG] FORCE_EXTRAPOLATE_MODE=2: Using non-extrapolated DWT (server sent flags=0x%02x)\n", flags);
 #else
     ctx->extrapolate = (flags & 0x01) ? true : false;
 #endif
@@ -1010,29 +994,13 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
                 countUpgrade++;
                 break;
             default:
-                /* Log unexpected block types (once) */
-                {
-                    static int unknownCount = 0;
-                    if (unknownCount++ < 3) {
-                        printf("[PROG] Unknown blockType=0x%04X len=%u\n", blockType, blockLen);
-                    }
-                }
+                /* Unknown block type - skip */
                 break;
         }
         
         offset += blockLen;
     }
     
-    /* Validate tile count like FreeRDP does */
-    uint16_t totalTiles = countSimple + countFirst + countUpgrade;
-    if (totalTiles != numTiles) {
-        printf("[PROG] WARNING: tile count mismatch: parsed=%u expected=%u (simple=%u first=%u upgrade=%u)\n",
-               totalTiles, numTiles, countSimple, countFirst, countUpgrade);
-    }
-    
-    (void)tileDataSize;
-    (void)countFirst;
-    (void)countUpgrade;
     return 0;
 }
 
@@ -1091,11 +1059,9 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
                     uint32_t magic = read_u32_le(blockData);
                     uint16_t version = read_u16_le(blockData + 4);
                     if (magic != 0xCACCACCA) {
-                        printf("[PROG] SYNC: bad magic 0x%08X\n", magic);
                         return -1;
                     }
                     if (version != 0x0100) {
-                        printf("[PROG] SYNC: bad version 0x%04X\n", version);
                         return -1;
                     }
                     
@@ -1106,7 +1072,6 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
                      * must also be invalidated since old pixels were decoded with
                      * old codec parameters. */
                     if (surface) {
-                        uint32_t resetCount = 0;
                         for (uint32_t i = 0; i < surface->gridSize; i++) {
                             if (surface->tiles[i]) {
                                 surface->tiles[i]->pass = 0;
@@ -1118,11 +1083,8 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
                                 memset(surface->tiles[i]->cbData, 0, TILE_PIXELS * sizeof(int16_t));
                                 memset(surface->tiles[i]->crData, 0, TILE_PIXELS * sizeof(int16_t));
                                 memset(surface->tiles[i]->sign, 0, TILE_PIXELS * 3);
-                                resetCount++;
                             }
                         }
-                        printf("[PROG] SYNC: Reset %u tiles (coefficients + pixels + valid) for surface %u (frame %u)\n", 
-                               resetCount, surfaceId, frameId);
                     }
                     
                     ctx->state |= FLAG_WBT_SYNC;
@@ -1152,7 +1114,6 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
                     ctx->tileSize = read_u16_le(blockData + 1);
                     ctx->ctxFlags = blockData[3];
                     if (ctx->tileSize != 64) {
-                        printf("[PROG] CONTEXT: bad tileSize %u\n", ctx->tileSize);
                         return -1;
                     }
                     ctx->state |= FLAG_WBT_CONTEXT;
@@ -1509,23 +1470,15 @@ static int decode_region_parallel(ProgressiveContext* ctx, RfxSurface* surface,
     uint8_t numProgQuant = data[4];
     uint8_t flags = data[5];
     uint16_t numTiles = read_u16_le(data + 6);
-    uint32_t tileDataSize = read_u32_le(data + 8);
     
     /* Store extrapolate flag in context for use by tile decoders
      * Bit 0 (0x01) = RFX_DWT_REDUCE_EXTRAPOLATE */
 #if FORCE_EXTRAPOLATE_MODE == 1
     ctx->extrapolate = true;  /* FORCED: extrapolated path */
-    printf("[PROG-PAR] FORCE_EXTRAPOLATE_MODE=1: Using extrapolated DWT (server sent flags=0x%02x)\n", flags);
 #elif FORCE_EXTRAPOLATE_MODE == 2
     ctx->extrapolate = false;  /* FORCED: non-extrapolated path */
-    printf("[PROG-PAR] FORCE_EXTRAPOLATE_MODE=2: Using non-extrapolated DWT (server sent flags=0x%02x)\n", flags);
 #else
     ctx->extrapolate = (flags & 0x01) ? true : false;
-    
-    /* IMPORTANT: Non-extrapolated tiles require different subband layout! */
-    if (!ctx->extrapolate) {
-        printf("[PROG] WARNING: Non-extrapolated tiles detected (flags=0x%02x) - may cause artifacts!\n", flags);
-    }
 #endif
     
     size_t offset = 12;
@@ -1548,7 +1501,6 @@ static int decode_region_parallel(ProgressiveContext* ctx, RfxSurface* surface,
     ctx->numProgQuant = numProgQuant;
     
     /* Submit tiles to worker threads */
-    uint16_t tilesSubmitted = 0;
     for (uint16_t i = 0; i < numTiles; i++) {
         if (offset + 6 > size) break;
         
@@ -1564,19 +1516,11 @@ static int decode_region_parallel(ProgressiveContext* ctx, RfxSurface* surface,
             blockType == PROGRESSIVE_WBT_TILE_FIRST ||
             blockType == PROGRESSIVE_WBT_TILE_UPGRADE) {
             submit_tile_job(ctx, surface, tileData, tileSize, blockType);
-            tilesSubmitted++;
         }
         
         offset += blockLen;
     }
     
-    /* Validate tile count like FreeRDP does */
-    if (tilesSubmitted != numTiles) {
-        printf("[PROG-PARALLEL] WARNING: tile count mismatch: submitted=%u expected=%u\n",
-               tilesSubmitted, numTiles);
-    }
-    
-    (void)tileDataSize;
     return 0;
 }
 
@@ -1634,16 +1578,13 @@ int prog_decompress_parallel(ProgressiveContext* ctx, const uint8_t* srcData,
                     uint32_t magic = read_u32_le(blockData);
                     uint16_t version = read_u16_le(blockData + 4);
                     if (magic != 0xCACCACCA) {
-                        printf("[PROG-PARALLEL] SYNC: bad magic 0x%08X\n", magic);
                         return -1;
                     }
                     if (version != 0x0100) {
-                        printf("[PROG-PARALLEL] SYNC: bad version 0x%04X\n", version);
                         return -1;
                     }
                     
                     /* Reset all tiles - matching serial prog_decompress behavior exactly */
-                    uint32_t resetCount = 0;
                     for (uint32_t i = 0; i < surface->gridSize; i++) {
                         if (surface->tiles[i]) {
                             surface->tiles[i]->pass = 0;
@@ -1655,11 +1596,8 @@ int prog_decompress_parallel(ProgressiveContext* ctx, const uint8_t* srcData,
                             memset(surface->tiles[i]->cbData, 0, TILE_PIXELS * sizeof(int16_t));
                             memset(surface->tiles[i]->crData, 0, TILE_PIXELS * sizeof(int16_t));
                             memset(surface->tiles[i]->sign, 0, TILE_PIXELS * 3);
-                            resetCount++;
                         }
                     }
-                    printf("[PROG-PARALLEL] SYNC: Reset %u tiles (coefficients + pixels + valid) for surface %u (frame %u)\n", 
-                           resetCount, surfaceId, frameId);
                     
                     ctx->state |= FLAG_WBT_SYNC;
                 }
@@ -1688,7 +1626,6 @@ int prog_decompress_parallel(ProgressiveContext* ctx, const uint8_t* srcData,
                     ctx->tileSize = read_u16_le(blockData + 1);
                     ctx->ctxFlags = blockData[3];
                     if (ctx->tileSize != 64) {
-                        printf("[PROG-PARALLEL] CONTEXT: bad tileSize %u\n", ctx->tileSize);
                         return -1;
                     }
                     ctx->state |= FLAG_WBT_CONTEXT;

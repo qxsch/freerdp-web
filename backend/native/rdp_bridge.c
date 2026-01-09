@@ -295,7 +295,6 @@ int rdp_set_max_sessions(int limit)
     }
     
     g_registry_initialized = 1;
-    fprintf(stderr, "[rdp_bridge] Session registry initialized: max_sessions=%d\n", g_max_sessions);
     
     pthread_mutex_unlock(&g_registry_mutex);
     return 0;
@@ -322,7 +321,6 @@ static int session_registry_add(rdpContext* rdp_ctx, BridgeContext* bridge_ctx)
             return -1;
         }
         g_registry_initialized = 1;
-        fprintf(stderr, "[rdp_bridge] Session registry initialized on first use: max_sessions=%d\n", g_max_sessions);
     }
     
     /* Check if we're at capacity */
@@ -339,8 +337,6 @@ static int session_registry_add(rdpContext* rdp_ctx, BridgeContext* bridge_ctx)
             g_session_registry[i].rdp_ctx = rdp_ctx;
             g_session_registry[i].bridge_ctx = bridge_ctx;
             g_session_count++;
-            fprintf(stderr, "[rdp_bridge] Session registered: %d/%d active\n", 
-                    g_session_count, g_max_sessions);
             pthread_mutex_unlock(&g_registry_mutex);
             return 0;
         }
@@ -366,8 +362,6 @@ static void session_registry_remove(rdpContext* rdp_ctx)
             g_session_registry[i].rdp_ctx = NULL;
             g_session_registry[i].bridge_ctx = NULL;
             g_session_count--;
-            fprintf(stderr, "[rdp_bridge] Session unregistered: %d/%d active\n",
-                    g_session_count, g_max_sessions);
             break;
         }
     }
@@ -593,8 +587,6 @@ RdpSession* rdp_create(
             if (!freerdp_static_channel_collection_add(settings, args)) {
                 fprintf(stderr, "[rdp_bridge] Warning: Could not add rdpsnd static channel\n");
                 freerdp_addin_argv_free(args);
-            } else {
-                fprintf(stderr, "[rdp_bridge] Added rdpsnd static channel with sys:bridge\n");
             }
         }
     }
@@ -606,8 +598,6 @@ RdpSession* rdp_create(
             if (!freerdp_dynamic_channel_collection_add(settings, args)) {
                 fprintf(stderr, "[rdp_bridge] Warning: Could not add rdpsnd dynamic channel\n");
                 freerdp_addin_argv_free(args);
-            } else {
-                fprintf(stderr, "[rdp_bridge] Added rdpsnd dynamic channel with sys:bridge\n");
             }
         }
     }
@@ -693,11 +683,9 @@ void rdp_set_progressive_enabled(RdpSession* session, int enabled)
     
     /* Update FreeRDP settings to announce progressive codec to server */
     if (ctx->progressive_enabled) {
-        fprintf(stderr, "[rdp_bridge] Progressive codec ENABLED by client\n");
         freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE);
         freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, TRUE);
     } else {
-        fprintf(stderr, "[rdp_bridge] Progressive codec DISABLED by client\n");
         freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE);
         freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE);
     }
@@ -880,17 +868,6 @@ int rdp_poll(RdpSession* session, int timeout_ms)
         return -1;
     }
     
-    /* Periodic status logging for debugging */
-    static int poll_count = 0;
-    poll_count++;
-    if (poll_count == 50 || poll_count == 100 || poll_count == 200 || poll_count == 500) {
-        pthread_mutex_lock(&ctx->gfx_mutex);
-        fprintf(stderr, "[rdp_bridge] Poll #%d: gfx_active=%d gfx=%p pipeline_ready=%d events=%d\n",
-                poll_count, ctx->gfx_active, (void*)ctx->gfx, ctx->gfx_pipeline_ready, 
-                ctx->gfx_event_count);
-        pthread_mutex_unlock(&ctx->gfx_mutex);
-    }
-    
     /* WIRE-THROUGH MODE: Check GFX event queue for pending data. */
     pthread_mutex_lock(&ctx->gfx_event_mutex);
     int gfx_pending = ctx->gfx_event_count;
@@ -914,7 +891,7 @@ int rdp_poll(RdpSession* session, int timeout_ms)
         
         /* Skip if dimensions haven't actually changed */
         if (ctx->frame_width == (int)new_width && ctx->frame_height == (int)new_height) {
-            fprintf(stderr, "[rdp_bridge] Skipping redundant resize in poll\n");
+            /* No-op - dimensions unchanged */
         }
         /* Try to use Display Control channel for dynamic resize */
         else if (ctx->disp && ctx->disp->SendMonitorLayout) {
@@ -930,7 +907,6 @@ int rdp_poll(RdpSession* session, int timeout_ms)
             layout.DesktopScaleFactor = 100;
             layout.DeviceScaleFactor = 100;
             
-            fprintf(stderr, "[rdp_bridge] Sending MonitorLayout resize to %ux%u\n", new_width, new_height);
             ctx->disp->SendMonitorLayout(ctx->disp, 1, &layout);
             
             /* WIRE-THROUGH MODE: Server will send ResetGraphics and fresh surfaces.
@@ -952,14 +928,6 @@ int rdp_poll(RdpSession* session, int timeout_ms)
     
     /* Wait for events */
     DWORD waitStatus = WaitForMultipleObjects(nCount, handles, FALSE, (DWORD)timeout_ms);
-    
-    /* Log wait result periodically */
-    static int wait_log = 0;
-    if (wait_log < 3 && waitStatus != WAIT_TIMEOUT) {
-        fprintf(stderr, "[rdp_bridge] WaitForMultipleObjects: status=0x%lX nCount=%lu\n", 
-                (unsigned long)waitStatus, (unsigned long)nCount);
-        wait_log++;
-    }
     
     if (waitStatus == WAIT_FAILED) {
         return 0; /* No events, not an error */
@@ -1087,12 +1055,8 @@ int rdp_resize(RdpSession* session, uint32_t width, uint32_t height)
     /* Skip redundant resize requests - these can cause race conditions
      * with GFX pipeline initialization during early connection */
     if (ctx->frame_width == (int)width && ctx->frame_height == (int)height) {
-        fprintf(stderr, "[rdp_bridge] Skipping redundant resize to %ux%u\n", width, height);
         return 0;
     }
-    
-    fprintf(stderr, "[rdp_bridge] Queuing resize from %dx%d to %ux%u\n",
-            ctx->frame_width, ctx->frame_height, width, height);
     
     /* Queue resize for next poll. In wire-through mode, the server will
      * send ResetGraphics and fresh surfaces after the resize. */
@@ -1119,23 +1083,12 @@ static BOOL bridge_pre_connect(freerdp* instance)
         return FALSE;
     }
     
-    /* Debug: Print channel counts before loading */
-    UINT32 staticCount = freerdp_settings_get_uint32(settings, FreeRDP_StaticChannelCount);
-    UINT32 dynCount = freerdp_settings_get_uint32(settings, FreeRDP_DynamicChannelCount);
-    BOOL gfxEnabled = freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline);
-    BOOL dynSupported = freerdp_settings_get_bool(settings, FreeRDP_SupportDynamicChannels);
-    
-    fprintf(stderr, "[rdp_bridge] PreConnect: staticChannels=%u dynChannels=%u gfxEnabled=%d dynSupported=%d\n",
-            staticCount, dynCount, gfxEnabled, dynSupported);
-    
     /* Load required channels using FreeRDP3 API.
      * This loads rdpgfx, disp, rdpsnd based on settings. */
     if (!freerdp_client_load_channels(instance)) {
         fprintf(stderr, "[rdp_bridge] WARNING: freerdp_client_load_channels failed\n");
         /* Continue anyway - some channels may still work */
     }
-    
-    fprintf(stderr, "[rdp_bridge] PreConnect: channels loaded\n");
     
     return TRUE;
 }
@@ -1146,12 +1099,8 @@ static BOOL bridge_post_connect(freerdp* instance)
     rdpContext* context = instance->context;
     rdpSettings* settings = context->settings;
     
-    fprintf(stderr, "[rdp_bridge] PostConnect: connection established\n");
-    
-    /* Debug: Check if channels object exists and has loaded clients */
-    if (context->channels) {
-        fprintf(stderr, "[rdp_bridge] Channels object exists\n");
-    } else {
+    /* Check if channels object exists */
+    if (!context->channels) {
         fprintf(stderr, "[rdp_bridge] WARNING: Channels object is NULL!\n");
     }
     
@@ -1162,23 +1111,14 @@ static BOOL bridge_post_connect(freerdp* instance)
     }
     
     rdpGdi* gdi = context->gdi;
-    fprintf(stderr, "[rdp_bridge] GDI initialized: %dx%d\n", gdi->width, gdi->height);
     
-    /* Debug: Check negotiation flags and server capabilities */
+    /* Check if server supports GFX */
     {
         rdpSettings* s = context->settings;
         UINT32 negFlags = freerdp_settings_get_uint32(s, FreeRDP_NegotiationFlags);
-        BOOL gfxSupported = freerdp_settings_get_bool(s, FreeRDP_SupportGraphicsPipeline);
-        BOOL dynSupported = freerdp_settings_get_bool(s, FreeRDP_SupportDynamicChannels);
-        UINT32 dynCount = freerdp_settings_get_uint32(s, FreeRDP_DynamicChannelCount);
         
-        fprintf(stderr, "[rdp_bridge] PostConnect Negotiation: flags=0x%08X gfx=%d dyn=%d dynChannels=%u\n",
-                negFlags, gfxSupported, dynSupported, dynCount);
-        
-        /* Check if server supports GFX (DYNVC_GFX_PROTOCOL_SUPPORTED = 0x02) */
-        if (negFlags & 0x02) {
-            fprintf(stderr, "[rdp_bridge] Server supports DYNVC_GFX_PROTOCOL\n");
-        } else {
+        /* Warn if server doesn't support GFX (DYNVC_GFX_PROTOCOL_SUPPORTED = 0x02) */
+        if (!(negFlags & 0x02)) {
             fprintf(stderr, "[rdp_bridge] WARNING: Server does NOT advertise DYNVC_GFX_PROTOCOL support (flag 0x02 not set)\n");
         }
     }
@@ -1187,8 +1127,6 @@ static BOOL bridge_post_connect(freerdp* instance)
      * This must be done in PostConnect - the working version had it here. */
     PubSub_SubscribeChannelConnected(context->pubSub, bridge_on_channel_connected);
     PubSub_SubscribeChannelDisconnected(context->pubSub, bridge_on_channel_disconnected);
-    
-    fprintf(stderr, "[rdp_bridge] PostConnect: subscribed to channel events\n");
     
     /* Note: GFX pipeline initialization is handled via channel connection callback.
      * The gdi_graphics_pipeline_init() requires RdpgfxClientContext which is
@@ -1210,8 +1148,6 @@ static BOOL bridge_post_connect(freerdp* instance)
     /* Note: Channel event subscription happens in pre_connect (required for static channels).
      * DVCs (like RDPGFX) connect later when drdynvc capability exchange completes.
      * GFX pipeline is enabled for H.264/progressive codec support. */
-    
-    fprintf(stderr, "[rdp_bridge] PostConnect complete, waiting for GFX DVC...\n");
     
     /* WIRE-THROUGH MODE: No need to set needs_full_frame - GFX events will flow
      * after the GFX DVC connects and sends CreateSurface/StartFrame etc. */
@@ -1255,16 +1191,7 @@ static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventAr
     rdpContext* context = (rdpContext*)ctx;
     BridgeContext* bctx = (BridgeContext*)context;
     
-    /* Log ALL channel connections for debugging */
-    fprintf(stderr, "[rdp_bridge] Channel connected: '%s' (pInterface=%p)\n", 
-            e->name ? e->name : "(null)", e->pInterface);
-    
-    /* Log drdynvc specifically since it's crucial for DVCs */
-    if (strcmp(e->name, DRDYNVC_SVC_CHANNEL_NAME) == 0) {
-        fprintf(stderr, "[rdp_bridge] DRDYNVC static channel connected - DVCs will open after capability exchange\n");
-        /* Note: DVCs like rdpgfx will connect later when server sends CREATE_REQUEST */
-    }
-    else if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0) {
+    if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0) {
         bctx->disp = (DispClientContext*)e->pInterface;
     }
     else if (strcmp(e->name, RDPSND_CHANNEL_NAME) == 0) {
@@ -1299,8 +1226,6 @@ static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventAr
         RdpgfxClientContext* gfx = (RdpgfxClientContext*)e->pInterface;
         bctx->gfx = gfx;
         
-        fprintf(stderr, "[GFX] Channel connected: %s (gfx=%p)\n", e->name, (void*)gfx);
-        
         if (gfx) {
             /* Store our context for callbacks */
             gfx->custom = bctx;
@@ -1320,8 +1245,6 @@ static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventAr
             bctx->gfx_active = true;
             bctx->gfx_pipeline_needs_init = true;  /* Deferred init in main thread */
             pthread_mutex_unlock(&bctx->gfx_mutex);
-            
-            fprintf(stderr, "[GFX] Pipeline activated, callbacks being registered\n");
             
             /* Set up ALL GFX callbacks for proper protocol handling.
              * Missing callbacks can cause the server to abort the connection.
@@ -1415,18 +1338,8 @@ static BOOL bridge_end_paint(rdpContext* context)
         return TRUE; /* No invalid region */
     }
     
-    /* Log first few GDI updates for debugging.
-     * Note: In wire-through mode, GDI updates are not used - GFX events
-     * are streamed directly to the frontend. This callback is kept for
-     * debugging and potential fallback mode. */
-    static int gdi_log_count = 0;
-    if (gdi_log_count < 5) {
-        fprintf(stderr, "[GDI] EndPaint: invalid=(%d,%d %dx%d) gfx_active=%d (wire-through mode - GDI updates ignored)\n",
-                hwnd->invalid->x, hwnd->invalid->y, 
-                hwnd->invalid->w, hwnd->invalid->h,
-                ctx->gfx_active);
-        gdi_log_count++;
-    }
+    /* Wire-through mode: GDI updates are not used - GFX events
+     * are streamed directly to the frontend. */
     
     return TRUE;
 }
@@ -1449,8 +1362,6 @@ static BOOL bridge_desktop_resize(rdpContext* context)
         fprintf(stderr, "[rdp_bridge] DesktopResize: GDI not available\n");
         return FALSE;
     }
-    
-    fprintf(stderr, "[rdp_bridge] DesktopResize: %dx%d\n", gdi->width, gdi->height);
     
     /* Update stored dimensions from current GDI state */
     ctx->frame_width = gdi->width;
@@ -1862,9 +1773,6 @@ static UINT gfx_on_reset_graphics(RdpgfxClientContext* context, const RDPGFX_RES
     event.height = reset->height;
     gfx_queue_event(bctx, &event);
     
-    fprintf(stderr, "[GFX] ResetGraphics: new size=%ux%u (forwarding to frontend)\n",
-            reset->width, reset->height);
-    
     return CHANNEL_RC_OK;
 }
 
@@ -1873,9 +1781,6 @@ static UINT gfx_on_create_surface(RdpgfxClientContext* context, const RDPGFX_CRE
     /* PURE GFX MODE: Track surfaces ourselves, no GDI chaining */
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
-    
-    fprintf(stderr, "[GFX] CreateSurface: id=%u size=%ux%u format=0x%02X\n",
-            create->surfaceId, create->width, create->height, create->pixelFormat);
     
     pthread_mutex_lock(&bctx->gfx_mutex);
     
@@ -1909,8 +1814,6 @@ static UINT gfx_on_create_surface(RdpgfxClientContext* context, const RDPGFX_CRE
      * If this is surface 0 and matches the desktop size, auto-map it as primary.
      * This ensures the frontend knows which surface to composite to the output. */
     if (create->surfaceId == 0) {
-        fprintf(stderr, "[GFX] Auto-mapping surface 0 as primary output (workaround for missing MapSurfaceToOutput)\n");
-        
         pthread_mutex_lock(&bctx->gfx_mutex);
         bctx->surfaces[0].mapped_to_output = true;
         bctx->primary_surface_id = 0;
@@ -1962,9 +1865,6 @@ static UINT gfx_on_map_surface(RdpgfxClientContext* context, const RDPGFX_MAP_SU
     /* PURE GFX MODE: Track surface mapping ourselves, no GDI chaining */
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
-    
-    fprintf(stderr, "[GFX] MapSurfaceToOutput: surface=%u pos=(%u,%u)\n",
-            map->surfaceId, map->outputOriginX, map->outputOriginY);
     
     pthread_mutex_lock(&bctx->gfx_mutex);
     
@@ -2223,8 +2123,6 @@ static UINT gfx_on_cache_import_reply(RdpgfxClientContext* context,
  * We use this to disable automatic frame ACKs - the browser controls flow! */
 static UINT gfx_on_open(RdpgfxClientContext* context, BOOL* do_caps_advertise, BOOL* do_frame_acks)
 {
-    fprintf(stderr, "[GFX] OnOpen callback - disabling automatic frame ACKs (browser controls flow)\n");
-    
     /* Let FreeRDP handle capability negotiation automatically */
     if (do_caps_advertise) {
         *do_caps_advertise = TRUE;
@@ -2235,7 +2133,6 @@ static UINT gfx_on_open(RdpgfxClientContext* context, BOOL* do_caps_advertise, B
      * This enables proper backpressure from browser to RDP server. */
     if (do_frame_acks) {
         *do_frame_acks = FALSE;
-        fprintf(stderr, "[GFX] Automatic frame ACKs DISABLED - browser will send ACKs via rdp_gfx_send_frame_ack()\n");
     }
     
     return CHANNEL_RC_OK;
@@ -2333,18 +2230,6 @@ static bool queue_video_frame_event(BridgeContext* bctx, uint32_t frame_id, uint
     /* Queue the event */
     gfx_queue_event(bctx, &event);
     
-    /* Log first few queued frames for debugging */
-    static int vf_log_count = 0;
-    if (vf_log_count < 10) {
-        const char* codec_str = (codec_id == RDP_GFX_CODEC_PROGRESSIVE) ? "Progressive" :
-                                (codec_id == RDP_GFX_CODEC_PROGRESSIVE_V2) ? "ProgressiveV2" :
-                                (codec_id == RDP_GFX_CODEC_AVC420) ? "AVC420" :
-                                (codec_id == RDP_GFX_CODEC_AVC444) ? "AVC444" : "Unknown";
-        fprintf(stderr, "[GFX] Queued VIDEO_FRAME event: codec=%s surface=%u size=%u\n",
-                codec_str, surface_id, output_nal_size);
-        vf_log_count++;
-    }
-    
     /* Track negotiated codec */
     bctx->gfx_codec = codec_id;
     
@@ -2433,15 +2318,6 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
                 break;
             }
             
-            /* Log ClearCodec arrival */
-            static int clear_log_count = 0;
-            if (clear_log_count < 20) {
-                fprintf(stderr, "[GFX] ClearCodec wire-through: surface=%u rect=(%d,%d,%d,%d) size=%u frame=%u\n",
-                        cmd->surfaceId, cmd->left, cmd->top, cmd->right, cmd->bottom, 
-                        cmd->length, bctx->current_frame_id);
-                clear_log_count++;
-            }
-            
             bctx->gfx_codec = RDP_GFX_CODEC_CLEARCODEC;
             
             /* Queue raw ClearCodec data for browser WASM decoding */
@@ -2486,17 +2362,6 @@ static UINT gfx_on_surface_command(RdpgfxClientContext* context, const RDPGFX_SU
         /* Progressive codec - pass raw wire data to browser for WASM decoding */
         case RDPGFX_CODECID_CAPROGRESSIVE:
         case RDPGFX_CODECID_CAPROGRESSIVE_V2: {
-            /* Log progressive codec arrival with specific codec ID */
-            static int prog_log_count = 0;
-            if (prog_log_count < 20) {
-                const char* prog_type = (cmd->codecId == RDPGFX_CODECID_CAPROGRESSIVE) 
-                    ? "CAPROGRESSIVE (0x0009)" : "CAPROGRESSIVE_V2 (0x000D)";
-                fprintf(stderr, "[GFX] Progressive codec received: %s surface=%u rect=(%d,%d,%d,%d) size=%u frame=%u\n",
-                        prog_type, cmd->surfaceId, cmd->left, cmd->top, cmd->right, cmd->bottom, 
-                        cmd->length, bctx->current_frame_id);
-                prog_log_count++;
-            }
-            
             /* Track that progressive codec is being used */
             RdpGfxCodecId prog_codec = (cmd->codecId == RDPGFX_CODECID_CAPROGRESSIVE_V2) 
                 ? RDP_GFX_CODEC_PROGRESSIVE_V2 : RDP_GFX_CODEC_PROGRESSIVE;
@@ -2767,14 +2632,6 @@ int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t tota
         return -1;
     }
     
-    /* Log occasionally for debugging */
-    static uint32_t ack_log_count = 0;
-    ack_log_count++;
-    if (ack_log_count <= 5 || (ack_log_count % 100) == 0) {
-        fprintf(stderr, "[GFX] Sent browser ACK for frame %u (totalDecoded: %u)\n", 
-                frame_id, total_frames_decoded);
-    }
-    
     return 0;
 }
 
@@ -2815,14 +2672,6 @@ static void queue_webp_tile(BridgeContext* ctx, uint16_t surface_id,
                             const uint8_t* bgra_data, int stride)
 {
     if (!ctx || !bgra_data || width == 0 || height == 0) return;
-    
-    /* Log first few tiles for debugging */
-    static int tile_log_count = 0;
-    if (tile_log_count < 5) {
-        fprintf(stderr, "[GFX] queue_webp_tile: surface=%u pos=(%d,%d) size=%ux%u\n",
-                surface_id, x, y, width, height);
-        tile_log_count++;
-    }
     
     /* Convert BGRA to RGBA and encode to WebP.
      * 
@@ -3211,9 +3060,6 @@ void rdp_set_audio_context(RdpSession* session)
     set_context_fn set_ctx = (set_context_fn)dlsym(RTLD_DEFAULT, "rdpsnd_bridge_set_context");
     if (set_ctx) {
         set_ctx(&g_audio_ctx);
-        fprintf(stderr, "[rdp_bridge] Audio context passed to rdpsnd plugin\n");
-    } else {
-        fprintf(stderr, "[rdp_bridge] rdpsnd_bridge_set_context not found (plugin not loaded yet)\n");
     }
 }
 

@@ -16,12 +16,6 @@ COPY progressive/ ./progressive/
 # Copy ClearCodec codec sources
 COPY clearcodec/ ./clearcodec/
 
-# Inject build timestamp into source files
-RUN BUILD_TIME=$(date +%H:%M:%S) && \
-    sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" ./progressive/progressive_wasm.c && \
-    sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" ./clearcodec/clearcodec_wasm.c && \
-    echo "Build time: $BUILD_TIME"
-
 # Build Progressive WASM with optimizations, SIMD, and pthreads for parallel tile decoding
 WORKDIR /build/progressive
 RUN mkdir -p build && \

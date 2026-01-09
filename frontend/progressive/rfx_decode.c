@@ -1,6 +1,7 @@
 /**
- * RFX Decode - YCbCr to BGRA conversion
+ * RFX Decode - YCbCr to BGRA conversion for WebAssembly execution in browsers.
  * Based on FreeRDP's prim_colors.c (Apache 2.0 License)
+ * Adption by Marco Weber <https://github.com/qxsch>
  * 
  * IMPORTANT: DWT output is in 11.5 fixed-point format!
  * Values are scaled by << 5 (32x), so Y=128 becomes Y=4096.

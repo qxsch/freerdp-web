@@ -150,201 +150,6 @@ let h264DecoderError = false;
 let h264NeedsKeyframe = true;
 
 // ============================================================================
-// Debugging toggles
-// ============================================================================
-
-/** 
- * CACHE_BYPASS: Skip SurfaceToCache/CacheToSurface entirely.
- * If artifacts vanish with this enabled, the cache path is implicated.
- */
-const CACHE_BYPASS = false;  // Confirmed cache is not the issue
-
-/**
- * FORCE_SINGLE_THREADED: Disable parallel WASM decode to rule out threading issues.
- * If artifacts vanish with this enabled, there's a race condition in parallel decode.
- */
-const FORCE_SINGLE_THREADED = true;  // Confirmed threading is not the issue
-
-/**
- * FORCE_ALPHA_255: Force all WebP decoded pixels to have alpha=255.
- * If stripes disappear with this enabled, the issue is alpha corruption in WebP pipeline.
- */
-const FORCE_ALPHA_255 = false;  // DISABLED - was making stripes worse (black instead of transparent)
-
-/**
- * FRAME_ORDER_DIAG: Log every operation within a frame to diagnose ordering issues.
- * Shows exact sequence of tile draws vs cache operations.
- */
-const FRAME_ORDER_DIAG = true;
-
-/** @type {number} Frame order log limit */
-let frameOrderLogCount = 0;
-const FRAME_ORDER_LOG_LIMIT = 200;
-
-/** @type {Array} Operations in current frame for order diagnosis */
-let frameOrderOps = [];
-
-// ============================================================================
-// Stripe Detection Diagnostics (for debugging horizontal stripe artifacts)
-// ============================================================================
-
-/** @type {boolean} Enable stripe detection logging */
-const STRIPE_DIAG_ENABLED = true;
-
-/** @type {number} Number of tiles to check - SEPARATE counters for WebP vs Progressive */
-let stripeDiagCountProg = 0;
-let stripeDiagCountWebP = 0;
-const STRIPE_DIAG_MAX = 10;  // Per source type
-
-/** @type {boolean} Dump raw pixel values for first stripe tile */
-const STRIPE_PIXEL_DUMP = true;
-let stripePixelDumpDone = false;
-
-/**
- * ALPHA DIAGNOSTIC: Check for alpha channel corruption in tile
- * Logs ALL tiles, not just stripe-detected ones, to catch alpha issues
- * Returns object with alpha statistics if issues found
- */
-let alphaDiagCount = 0;
-const ALPHA_DIAG_MAX = 20;
-
-function checkAlphaCorruption(pixelData, tileX, tileY, source) {
-    if (!STRIPE_DIAG_ENABLED || alphaDiagCount >= ALPHA_DIAG_MAX) return null;
-    
-    const pixelCount = pixelData.length / 4;
-    let zeroAlphaCount = 0;
-    let partialAlphaCount = 0;
-    let fullAlphaCount = 0;
-    let alphaRowIssues = [];
-    
-    // Check alpha values
-    for (let i = 0; i < pixelData.length; i += 4) {
-        const alpha = pixelData[i + 3];
-        if (alpha === 0) zeroAlphaCount++;
-        else if (alpha === 255) fullAlphaCount++;
-        else partialAlphaCount++;
-    }
-    
-    // Check for rows with mostly zero alpha (corrupted rows)
-    const width = Math.sqrt(pixelCount);
-    if (Number.isInteger(width)) {
-        for (let y = 0; y < width; y++) {
-            let rowZeroAlpha = 0;
-            for (let x = 0; x < width; x++) {
-                const idx = (y * width + x) * 4;
-                if (pixelData[idx + 3] === 0) rowZeroAlpha++;
-            }
-            if (rowZeroAlpha > width * 0.5) {
-                alphaRowIssues.push({ row: y, zeroCount: rowZeroAlpha });
-            }
-        }
-    }
-    
-    // For WebP tiles, ALWAYS log alpha stats for first few tiles (even if no issue)
-    if (source === 'WebP' && alphaDiagCount < 5) {
-        alphaDiagCount++;
-        console.warn(`[ALPHA DIAG] ${source} tile (${tileX},${tileY}) ${Math.sqrt(pixelCount)}x${Math.sqrt(pixelCount)}: ` +
-            `alpha=0: ${zeroAlphaCount} (${(zeroAlphaCount/pixelCount*100).toFixed(1)}%), ` +
-            `alpha=255: ${fullAlphaCount} (${(fullAlphaCount/pixelCount*100).toFixed(1)}%), ` +
-            `partial: ${partialAlphaCount}`);
-        return { zeroAlphaCount, partialAlphaCount, fullAlphaCount, alphaRowIssues };
-    }
-    
-    // Report if there's suspicious alpha corruption
-    const hasIssue = zeroAlphaCount > pixelCount * 0.1 || alphaRowIssues.length > 0;
-    if (hasIssue) {
-        alphaDiagCount++;
-        console.warn(`[ALPHA DIAG] ${source} tile (${tileX},${tileY}): ` +
-            `alpha=0: ${zeroAlphaCount}/${pixelCount} (${(zeroAlphaCount/pixelCount*100).toFixed(1)}%), ` +
-            `alpha=255: ${fullAlphaCount}, partial: ${partialAlphaCount}, ` +
-            `rowIssues: ${alphaRowIssues.length}`);
-        if (alphaRowIssues.length > 0 && alphaRowIssues.length <= 10) {
-            console.warn(`[ALPHA DIAG] Rows with >50% zero alpha:`, alphaRowIssues);
-        }
-        return { zeroAlphaCount, partialAlphaCount, fullAlphaCount, alphaRowIssues };
-    }
-    
-    return null;
-}
-
-/**
- * Detect horizontal stripe patterns in a tile's pixel data.
- * Now takes a 'source' parameter to track WebP vs Progressive separately.
- * 
- * @param {Uint8ClampedArray} pixelData - RGBA pixel data
- * @param {number} tileX - X coordinate for logging
- * @param {number} tileY - Y coordinate for logging
- * @param {string} source - 'WebP' or 'PROG' to track separately
- * @returns {Object|null} Stripe info if detected, null otherwise
- */
-function detectStripes(pixelData, tileX, tileY, source = 'PROG') {
-    // Use separate counters for WebP vs Progressive
-    const isWebP = source === 'WebP';
-    const currentCount = isWebP ? stripeDiagCountWebP : stripeDiagCountProg;
-    if (!STRIPE_DIAG_ENABLED || currentCount >= STRIPE_DIAG_MAX) return null;
-    
-    const width = 64;
-    const height = 64;
-    const rowBrightness = new Float32Array(height);
-    
-    // Calculate average brightness per row
-    for (let y = 0; y < height; y++) {
-        let sum = 0;
-        for (let x = 0; x < width; x++) {
-            const idx = (y * width + x) * 4;
-            // Luminance: 0.299R + 0.587G + 0.114B
-            sum += pixelData[idx] * 0.299 + pixelData[idx+1] * 0.587 + pixelData[idx+2] * 0.114;
-        }
-        rowBrightness[y] = sum / width;
-    }
-    
-    // Detect sudden brightness changes (potential stripes)
-    const stripeRows = [];
-    const threshold = 30; // Brightness difference threshold
-    
-    for (let y = 1; y < height; y++) {
-        const diff = Math.abs(rowBrightness[y] - rowBrightness[y-1]);
-        if (diff > threshold) {
-            stripeRows.push({ row: y, diff: diff.toFixed(1), 
-                prev: rowBrightness[y-1].toFixed(1), 
-                curr: rowBrightness[y].toFixed(1) });
-        }
-    }
-    
-    // Check for repeating pattern (e.g., every 8 or 16 rows)
-    if (stripeRows.length >= 3) {
-        if (isWebP) stripeDiagCountWebP++; else stripeDiagCountProg++;
-        
-        const pattern = stripeRows.map(s => s.row);
-        const gaps = [];
-        for (let i = 1; i < pattern.length; i++) {
-            gaps.push(pattern[i] - pattern[i-1]);
-        }
-        
-        console.warn(`[STRIPE DIAG ${source}] Tile (${tileX},${tileY}): ${stripeRows.length} potential stripe rows:`, 
-            stripeRows, `gaps:`, gaps);
-        
-        // For the FIRST stripe tile of each type, dump first 8 pixel values per row
-        const dumpCount = isWebP ? stripeDiagCountWebP : stripeDiagCountProg;
-        if (dumpCount === 1) {
-            console.warn(`[STRIPE DIAG ${source}] === Pixel dump for first ${source} stripe tile (R,G,B,A) ===`);
-            for (let y = 0; y < 16; y++) {
-                const rowPixels = [];
-                for (let x = 0; x < 8; x++) {
-                    const idx = (y * 64 + x) * 4;
-                    rowPixels.push(`(${pixelData[idx]},${pixelData[idx+1]},${pixelData[idx+2]},${pixelData[idx+3]})`);
-                }
-                console.warn(`  Row ${y}: ${rowPixels.join(' ')}`);
-            }
-        }
-        
-        return { rows: stripeRows, pattern: gaps };
-    }
-    
-    return null;
-}
-
-// ============================================================================
 // Surface management
 // ============================================================================
 
@@ -512,8 +317,7 @@ async function initWasm() {
         }
         
         wasmReady = true;
-        const effectiveParallel = parallelDecompressAvailable && !FORCE_SINGLE_THREADED;
-        console.log(`[GFX Worker] Progressive WASM decoder initialized (parallel: ${parallelDecompressAvailable}, FORCE_SINGLE_THREADED: ${FORCE_SINGLE_THREADED}, effective: ${effectiveParallel})`);
+        console.log(`[GFX Worker] Progressive WASM decoder initialized (parallel: ${parallelDecompressAvailable})`);
         
     } catch (err) {
         console.warn('[GFX Worker] Progressive WASM not available:', err.message);
@@ -600,11 +404,9 @@ function decodeProgressiveTile(msg) {
     const inputPtr = wasmModule._malloc(payload.byteLength);
     wasmModule.HEAPU8.set(payload, inputPtr);
     
-    // Use parallel decompress when available for better performance with many tiles
-    // FORCE_SINGLE_THREADED overrides to test for race conditions
+    // Use parallel decompress when available for better performance
     let result;
-    const useParallel = parallelDecompressAvailable && !FORCE_SINGLE_THREADED;
-    if (useParallel) {
+    if (parallelDecompressAvailable) {
         result = wasmModule._prog_decompress_parallel(
             progCtx, inputPtr, payload.byteLength, 
             actualSurfaceId, msg.frameId
@@ -626,22 +428,12 @@ function decodeProgressiveTile(msg) {
     // Check frame state - only render when frame is complete
     const frameComplete = wasmModule._prog_is_frame_complete(progCtx);
     
-    // Debug: get extrapolate flag for analysis
-    const extrapolate = wasmModule._prog_get_extrapolate ? wasmModule._prog_get_extrapolate(progCtx) : -1;
-    
     // Use new batch tile tracking API for efficient iteration
     const updatedCount = wasmModule._prog_get_updated_tile_count(progCtx);
     
     // Skip rendering if no tiles updated
     if (updatedCount === 0) {
         return;
-    }
-    
-    // Log extrapolate flag to diagnose which decode path is used
-    // extrapolate=0: non-extrapolated (LL3@4032, 64 coeffs)
-    // extrapolate=1: extrapolated (LL3@4015, 81 coeffs)
-    if (updatedCount > 0 && stripeDiagCountProg === 0) {
-        console.warn(`[PROG DIAG] Frame ${msg.frameId}: extrapolate=${extrapolate}, tiles=${updatedCount}`);
     }
     
     let tilesDrawn = 0;
@@ -690,9 +482,6 @@ function decodeProgressiveTile(msg) {
             const copiedData = new Uint8ClampedArray(tileSize);
             copiedData.set(pixelData);
             
-            // Stripe detection diagnostic
-            detectStripes(copiedData, tileX, tileY);
-            
             const imageData = new ImageData(copiedData, 64, 64);
             
             // Draw tile to surface
@@ -702,11 +491,6 @@ function decodeProgressiveTile(msg) {
         
         if (updatedCount > 0 && tilesDrawn === 0) {
             console.warn(`[GFX Worker] Progressive: 0/${updatedCount} tiles drawn to surface ${msg.surfaceId}`);
-        }
-        
-        // Frame order diagnosis for Progressive
-        if (FRAME_ORDER_DIAG && tilesDrawn > 0 && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-            frameOrderOps.push(`PROG:surf=${msg.surfaceId},tiles=${tilesDrawn}`);
         }
     } catch (e) {
         console.error(`[GFX Worker] Progressive tile loop error at tile ${tilesDrawn}:`, e);
@@ -798,11 +582,6 @@ async function decodeWebPTile(msg) {
         return;
     }
     
-    // Frame order diagnosis
-    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-        frameOrderOps.push(`WEBP:surf=${msg.surfaceId},rect=(${msg.x},${msg.y},${msg.w},${msg.h})`);
-    }
-    
     // Track that this surface was updated in the current frame
     frameUpdatedSurfaces.add(msg.surfaceId);
     
@@ -812,53 +591,8 @@ async function decodeWebPTile(msg) {
         const blob = new Blob([msg.payload], { type: 'image/webp' });
         const bitmap = await createImageBitmap(blob);
         
-        // FORCE_ALPHA_255: Test if alpha corruption is the cause of stripes
-        // We need to draw to temp canvas, fix alpha, then draw to surface
-        if (FORCE_ALPHA_255) {
-            const tempCanvas = new OffscreenCanvas(msg.w, msg.h);
-            const tempCtx = tempCanvas.getContext('2d');
-            tempCtx.drawImage(bitmap, 0, 0);
-            const imageData = tempCtx.getImageData(0, 0, msg.w, msg.h);
-            
-            // Force all alpha values to 255
-            for (let i = 3; i < imageData.data.length; i += 4) {
-                imageData.data[i] = 255;
-            }
-            
-            // Check for alpha corruption and stripes BEFORE forcing alpha
-            if (STRIPE_DIAG_ENABLED && stripeDiagCountWebP < STRIPE_DIAG_MAX && msg.w >= 64 && msg.h >= 64) {
-                // Get original pixel data for analysis
-                tempCtx.drawImage(bitmap, 0, 0);
-                const origData = tempCtx.getImageData(0, 0, Math.min(64, msg.w), Math.min(64, msg.h));
-                checkAlphaCorruption(origData.data, msg.x, msg.y, 'WebP');
-                detectStripes(origData.data, msg.x, msg.y, 'WebP');
-            }
-            
-            // Draw fixed imageData to surface
-            surface.ctx.putImageData(imageData, msg.x, msg.y);
-            bitmap.close();
-        } else {
-            // Normal path - WebP alpha and stripe detection
-            if (STRIPE_DIAG_ENABLED && stripeDiagCountWebP < STRIPE_DIAG_MAX && msg.w >= 64 && msg.h >= 64) {
-                // Draw to a temporary canvas to get pixel data
-                const tempCanvas = new OffscreenCanvas(msg.w, msg.h);
-                const tempCtx = tempCanvas.getContext('2d');
-                tempCtx.drawImage(bitmap, 0, 0);
-                const imageData = tempCtx.getImageData(0, 0, Math.min(64, msg.w), Math.min(64, msg.h));
-                
-                // Check for alpha corruption FIRST
-                checkAlphaCorruption(imageData.data, msg.x, msg.y, 'WebP');
-                
-                // Then check for stripe patterns
-                const stripeResult = detectStripes(imageData.data, msg.x, msg.y, 'WebP');
-                if (stripeResult) {
-                    console.warn(`[STRIPE DIAG WebP] WebP tile (${msg.x},${msg.y}) size ${msg.w}x${msg.h} has stripes!`);
-                }
-            }
-            
-            surface.ctx.drawImage(bitmap, msg.x, msg.y, msg.w, msg.h);
-            bitmap.close();
-        }
+        surface.ctx.drawImage(bitmap, msg.x, msg.y, msg.w, msg.h);
+        bitmap.close();
         
     } catch (err) {
         console.warn('[GFX Worker] WebP decode failed:', err);
@@ -948,6 +682,8 @@ async function initH264(width, height) {
                     primaryCtx.drawImage(frame, 
                         meta.destX, meta.destY, meta.destW, meta.destH,
                         meta.destX, meta.destY, meta.destW, meta.destH);
+                    // Resolve the promise to signal decode complete
+                    if (meta.resolve) meta.resolve();
                 }
                 frame.close();
                 h264DecoderError = false;
@@ -955,10 +691,15 @@ async function initH264(width, height) {
                 checkBackpressure();
             },
             error: (e) => {
-                console.error('[GFX Worker] H.264 decode error:', e);
+                console.error('[GFX Worker] H.264 decoder error callback:', e);
                 h264DecoderError = true;
-                h264DecodeQueue = [];
-                pendingOps--;
+                h264NeedsKeyframe = true;  // Need keyframe after error
+                // Reject all pending decodes
+                while (h264DecodeQueue.length > 0) {
+                    const meta = h264DecodeQueue.shift();
+                    if (meta.reject) meta.reject(e);
+                    pendingOps--;
+                }
             }
         });
         
@@ -979,7 +720,6 @@ async function initH264(width, height) {
  * Decode H.264 video frame
  */
 async function decodeH264Frame(msg) {
-    console.log(`[GFX Worker] H264: frame=${msg.frameId} surface=${msg.surfaceId} type=${msg.frameType === 0 ? 'key' : 'delta'} dest=(${msg.destX},${msg.destY},${msg.destW},${msg.destH}) nalSize=${msg.nalSize}`);
     if (!primaryCtx) {
         console.warn('[GFX Worker] No primary context for H.264');
         return;
@@ -1034,12 +774,16 @@ async function decodeH264Frame(msg) {
     
     pendingOps++;
     
-    // Queue metadata for output callback
-    h264DecodeQueue.push({
-        destX: msg.destX,
-        destY: msg.destY,
-        destW: msg.destW,
-        destH: msg.destH,
+    // Create a promise that resolves when this specific frame is decoded
+    const decodePromise = new Promise((resolve, reject) => {
+        h264DecodeQueue.push({
+            destX: msg.destX,
+            destY: msg.destY,
+            destW: msg.destW,
+            destH: msg.destH,
+            resolve,
+            reject,
+        });
     });
     
     try {
@@ -1051,13 +795,14 @@ async function decodeH264Frame(msg) {
         
         videoDecoder.decode(chunk);
         
-        // CRITICAL: Flush to ensure frame is rendered before processing next message.
-        // Without this, SurfaceToCache/CacheToSurface could capture stale pixels
-        // because VideoDecoder.decode() is asynchronous.
-        await videoDecoder.flush();
+        // Wait for the output callback to fire for this frame.
+        // Unlike flush(), this preserves decoder state for delta frames.
+        await decodePromise;
     } catch (e) {
         console.error('[GFX Worker] H.264 decode error:', e);
-        h264DecodeQueue.pop();
+        // Remove our entry from the queue if decode failed
+        const idx = h264DecodeQueue.findIndex(m => m.resolve);
+        if (idx !== -1) h264DecodeQueue.splice(idx, 1);
         pendingOps--;
     }
 }
@@ -1105,73 +850,31 @@ function applySurfaceToSurface(msg) {
 
 /**
  * Surface-to-cache: extract region from surface and store in local cache
- * Enhanced with source tracking and content checksum for debugging
  */
-/** @type {number} Counter for S2C logging */
-let s2cLogCount = 0;
-const S2C_LOG_LIMIT = 30;
-
 function applySurfaceToCache(msg) {
-    // CACHE_BYPASS: Skip cache entirely to test if cache is the problem
-    if (CACHE_BYPASS) {
-        if (frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-            frameOrderOps.push(`S2C-SKIP:slot=${msg.cacheSlot}`);
-        }
-        return;
-    }
-    
     const surface = surfaces.get(msg.surfaceId);
     if (!surface) {
         console.warn(`[CACHE] SurfaceToCache: unknown surface ${msg.surfaceId}`);
         return;
     }
     
-    // Frame order diagnosis
-    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-        frameOrderOps.push(`S2C:slot=${msg.cacheSlot},surf=${msg.surfaceId},rect=(${msg.x},${msg.y},${msg.w},${msg.h})`);
-    }
-    
-    // Log first few S2C operations to verify they are arriving
-    if (s2cLogCount < S2C_LOG_LIMIT) {
-        console.log(`[CACHE] S2C: slot=${msg.cacheSlot} <- surface=${msg.surfaceId}(${msg.x},${msg.y},${msg.w},${msg.h}) frame=${currentFrameId}`);
-        s2cLogCount++;
-    }
-    
     // Extract pixel data from surface
     const imageData = surface.ctx.getImageData(msg.x, msg.y, msg.w, msg.h);
     
-    // Compute simple checksum for debugging (sum of first 100 pixels)
-    let checksum = 0;
-    const data = imageData.data;
-    const len = Math.min(data.length, 400);  // First 100 pixels (RGBA)
-    for (let i = 0; i < len; i++) {
-        checksum = (checksum + data[i]) >>> 0;
-    }
-    
-    // Store in cache with metadata
+    // Store in cache
     const entry = {
         imageData: imageData,
         sourceSurface: msg.surfaceId,
         sourceRect: { x: msg.x, y: msg.y, w: msg.w, h: msg.h },
-        frameId: currentFrameId,
-        checksum: checksum
+        frameId: currentFrameId
     };
     bitmapCache.set(msg.cacheSlot, entry);
 }
 
 /**
  * Cache-to-surface blit: retrieve cached bitmap and draw to surface
- * Enhanced with cross-surface detection for debugging
  */
 function applyCacheToSurface(msg) {
-    // CACHE_BYPASS: Skip cache entirely to test if cache is the problem
-    if (CACHE_BYPASS) {
-        if (frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-            frameOrderOps.push(`C2S-SKIP:slot=${msg.cacheSlot}`);
-        }
-        return;
-    }
-    
     const surface = surfaces.get(msg.surfaceId);
     if (!surface) {
         console.warn(`[CACHE] CacheToSurface: unknown surface ${msg.surfaceId}`);
@@ -1180,63 +883,24 @@ function applyCacheToSurface(msg) {
     
     const entry = bitmapCache.get(msg.cacheSlot);
     if (!entry) {
-        console.error(`[CACHE] C2S: MISS slot=${msg.cacheSlot} -> surface=${msg.surfaceId}(${msg.dstX},${msg.dstY}) frame=${currentFrameId} (cache size: ${bitmapCache.size})`);
+        console.error(`[CACHE] C2S: MISS slot=${msg.cacheSlot} -> surface=${msg.surfaceId}(${msg.dstX},${msg.dstY}) frame=${currentFrameId}`);
         return;
-    }
-    
-    // Frame order diagnosis - verify checksum matches what was cached
-    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-        frameOrderOps.push(`C2S:slot=${msg.cacheSlot},surf=${msg.surfaceId},dst=(${msg.dstX},${msg.dstY}),cksum=${entry.checksum},srcFrame=${entry.frameId}`);
     }
     
     // Track that this surface was updated in the current frame
     frameUpdatedSurfaces.add(msg.surfaceId);
     
-    // Get the actual ImageData from the entry
-    const cachedData = entry.imageData;
-    
-    // Stripe detection for cached tiles - use WebP counter since cached tiles come from WebP pipeline
-    if (STRIPE_DIAG_ENABLED && stripeDiagCountWebP < STRIPE_DIAG_MAX && 
-        cachedData.width >= 64 && cachedData.height >= 64) {
-        const stripeResult = detectStripes(cachedData.data, msg.dstX, msg.dstY, 'WebP-Cache');
-        if (stripeResult) {
-            console.warn(`[STRIPE DIAG] C2S cached tile slot=${msg.cacheSlot} at (${msg.dstX},${msg.dstY}) has stripes! srcFrame=${entry.frameId}`);
-        }
-    }
-    
     // Draw cached bitmap to surface at destination position
-    surface.ctx.putImageData(cachedData, msg.dstX, msg.dstY);
+    surface.ctx.putImageData(entry.imageData, msg.dstX, msg.dstY);
 }
 
 /**
  * Evict a cache slot (server tells us it's no longer valid)
  * Per RDPGFX protocol, the server sends EvictCacheEntry PDU when it
- * wants to invalidate a cache slot. This is the ONLY way cache entries
- * should be deleted (not on surface delete!).
+ * wants to invalidate a cache slot.
  */
-/** @type {number} Counter for EVCT logging */
-let evctLogCount = 0;
-const EVCT_LOG_LIMIT = 20;
-
 function applyEvictCache(msg) {
-    const existed = bitmapCache.has(msg.cacheSlot);
-    if (existed) {
-        const entry = bitmapCache.get(msg.cacheSlot);
-        bitmapCache.delete(msg.cacheSlot);
-        
-        // Log first few evictions for debugging
-        if (evctLogCount < EVCT_LOG_LIMIT) {
-            console.log(`[CACHE] EVICT: slot=${msg.cacheSlot} (was from surface=${entry.sourceSurface}) frame=${currentFrameId} cacheSize=${bitmapCache.size}`);
-            evctLogCount++;
-        }
-    } else {
-        // Evicting non-existent slot is not an error per protocol,
-        // but log it for debugging if it happens frequently
-        if (evctLogCount < EVCT_LOG_LIMIT) {
-            console.log(`[CACHE] EVICT: slot=${msg.cacheSlot} (not in cache) frame=${currentFrameId}`);
-            evctLogCount++;
-        }
-    }
+    bitmapCache.delete(msg.cacheSlot);
 }
 
 /**
@@ -1293,14 +957,9 @@ function applyResetGraphics(msg) {
     if (primaryCanvas && (primaryCanvas.width !== msg.width || primaryCanvas.height !== msg.height)) {
         primaryCanvas.width = msg.width;
         primaryCanvas.height = msg.height;
-        console.log(`[GFX Worker] ResetGraphics: resized canvas to ${msg.width}x${msg.height}`);
     }
     
-    // Reset log counters for fresh debugging
-    s2cLogCount = 0;
-    evctLogCount = 0;
-    
-    console.log(`[GFX Worker] ResetGraphics: cleared ${surfaceCount} surfaces, cache preserved (${bitmapCache.size} entries), new size ${msg.width}x${msg.height}`);
+    console.log(`[GFX Worker] ResetGraphics: cleared ${surfaceCount} surfaces, new size ${msg.width}x${msg.height}`);
 }
 
 // ============================================================================
@@ -1325,39 +984,17 @@ function compositeSurfaceToPrimary(surfaceId) {
  * Start a new frame
  */
 function startFrame(frameId) {
-    // Log previous frame's operations if FRAME_ORDER_DIAG enabled
-    if (FRAME_ORDER_DIAG && frameOrderOps.length > 0 && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-        console.log(`[FRAME-ORDER] Frame ${currentFrameId}: ${frameOrderOps.join(' → ')}`);
-        frameOrderLogCount++;
-    }
-    
     currentFrameId = frameId;
     frameUpdatedSurfaces.clear();
-    frameOrderOps = [];  // Reset for new frame
-    
-    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-        frameOrderOps.push(`START(${frameId})`);
-    }
 }
 
 /**
  * End frame and send acknowledgment
  */
 function endFrame(frameId) {
-    // Log frame operations before ending
-    if (FRAME_ORDER_DIAG && frameOrderOps.length > 0 && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
-        frameOrderOps.push(`END(${frameId})`);
-        console.log(`[FRAME-ORDER] Frame ${frameId}: ${frameOrderOps.join(' → ')}`);
-        frameOrderLogCount++;
-        frameOrderOps = [];
-    }
-    
     if (currentFrameId !== frameId) {
         console.warn(`[GFX Worker] Frame mismatch: expected ${currentFrameId}, got ${frameId}`);
     }
-    
-    // Get updated surfaces for compositing
-    const updatedList = Array.from(frameUpdatedSurfaces);
     
     // Composite all surfaces that were updated in this frame to primary canvas
     if (primaryCanvas && primaryCtx) {

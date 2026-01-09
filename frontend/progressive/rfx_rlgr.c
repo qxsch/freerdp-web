@@ -1,9 +1,9 @@
 /**
- * FreeRDP: A Remote Desktop Protocol Implementation
+ * FreeRDP: A Remote Desktop Protocol Implementation for WebAssembly execution in browsers.
  * RemoteFX Codec Library - RLGR
  *
  * Copyright 2011 Vic Lee
- * Adapted for WASM
+ * Adption by Marco Weber <https://github.com/qxsch>
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.

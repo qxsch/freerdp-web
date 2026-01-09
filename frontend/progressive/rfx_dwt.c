@@ -1,6 +1,7 @@
 /**
- * DWT (Discrete Wavelet Transform) Inverse Transform for Progressive Codec
+ * DWT (Discrete Wavelet Transform) Inverse Transform for Progressive Codec for WebAssembly execution in browsers.
  * Based on FreeRDP's progressive.c (Apache 2.0 License)
+ * Adption by Marco Weber <https://github.com/qxsch>
  * 
  * Performs 2D inverse DWT on extrapolated tiles (65x65) to reconstruct 64x64 image data.
  * 
@@ -23,7 +24,6 @@
  */
 
 #include "rfx_types.h"
-#include <stdio.h>
 #include <string.h>
 
 /* NOTE: We no longer use a static temp buffer because Web Workers may share
@@ -298,7 +298,6 @@ void rfx_dwt_decode(int16_t* buffer, int size)
     int16_t* idwt_temp = (int16_t*)calloc(65 * 65, sizeof(int16_t));
     if (!idwt_temp) {
         /* CRITICAL: If this fails, the output will be corrupted (coefficients instead of pixels) */
-        printf("[DWT] CRITICAL ERROR: Failed to allocate temp buffer! Output will be garbage.\n");
         return;
     }
     
