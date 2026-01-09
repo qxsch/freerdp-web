@@ -5,14 +5,14 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ## Architecture
 
 ```
-┌─────────────────────────────────┐                                         
-│           Browser               │                                         
-│  ┌───────────┐  ┌────────────┐  │     WebSocket       ┌─────────────────┐     RDP/GFX    ┌──────────────┐
-│  │ Main      │  │ GFX Worker │  │ ◄─────────────────► │  Python Proxy   │ ◄────────────► │  Windows VM  │
-│  │ Thread    │  │ (Offscreen │  │  Wire Format Proto  │ (Native FreeRDP)│  AVC444/AVC420 │              │
-│  │ (Audio)   │  │  Canvas)   │  │  H264+SURF+TILE+... │                 │                │              │
-│  └───────────┘  └────────────┘  │                     └─────────────────┘                └──────────────┘
-└─────────────────────────────────┘                                         
+┌───────────────────────────────┐                                         
+│           Browser             │                                         
+│  ┌─────────┐  ┌────────────┐  │     WebSocket       ┌─────────────────┐     RDP/GFX    ┌─────────┐
+│  │ Main    │  │ GFX Worker │  │ ◄─────────────────► │  Python Proxy   │ ◄────────────► │ Windows │
+│  │ Thread  │  │ (Offscreen │  │  Wire Format Proto  │ (Native FreeRDP)│  AVC444/AVC420 │   OS    │
+│  │ (Audio) │  │  Canvas)   │  │  H264+SURF+TILE+... │                 │                │         │
+│  └─────────┘  └────────────┘  │                     └─────────────────┘                └─────────┘
+└───────────────────────────────┘                                         
 ```
 
 ### Components
