@@ -170,6 +170,7 @@ await client.connect({
 | `reconnectDelay` | number | `3000` | Reconnection delay in milliseconds |
 | `mouseThrottleMs` | number | `16` | Mouse move event throttle (~60fps) |
 | `resizeDebounceMs` | number | `2000` | Resize debounce delay |
+| `keepConnectionModalOpen` | boolean | `false` | Keep connection modal open when not connected |
 
 ### Public API
 
