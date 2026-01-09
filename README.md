@@ -33,8 +33,8 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 🎨 **ClearCodec WASM decoder** - Clear codec tiles decoded in WebAssembly
 - 🔊 Native audio streaming with Opus encoding (per-session isolation)
 - ⌨️ Full keyboard support with scan code translation
-- � **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
-- �🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
+- 🖥️ **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
+- 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
 - 📺 Fullscreen mode with dynamic resolution
 - 📊 Latency monitoring (ping/pong)
 - 🩺 Health check endpoint (`/health`)
