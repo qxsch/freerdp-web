@@ -2,11 +2,9 @@
 RDP Bridge Module - Native FreeRDP3 Integration
 
 Uses a native C library (librdp_bridge.so) for direct RDP connection with:
-- Zero-copy frame capture via GDI surface
-- Dirty rectangle tracking for delta updates
 - Direct input injection (no X11/xdotool)
-- WebP encoding for efficient bandwidth usage
 - GFX event streaming with wire format binary protocol
+- WebP encoding performed in C for optimal performance
 """
 
 import asyncio
@@ -23,13 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
-
 # Import wire format for new binary protocol
 from wire_format import (
     Magic, build_create_surface, build_delete_surface, build_start_frame,
-    build_end_frame, build_webp_tile, build_h264_frame, parse_frame_ack,
-    parse_backpressure, get_message_type
+    build_end_frame, build_solid_fill, build_surface_to_surface,
+    build_surface_to_cache, build_cache_to_surface, build_evict_cache,
+    build_map_surface_to_output, build_webp_tile, build_h264_frame,
+    build_reset_graphics, parse_frame_ack, parse_backpressure, get_message_type,
+    build_clearcodec_tile
 )
 
 logger = logging.getLogger('rdp-bridge')
@@ -70,9 +69,6 @@ RDP_STATE_CONNECTING = 1
 RDP_STATE_CONNECTED = 2
 RDP_STATE_ERROR = 3
 
-# Delta frame magic header
-DELTA_FRAME_MAGIC = b'DELT'
-
 # Audio frame magic header (PCM - legacy)
 AUDIO_FRAME_MAGIC = b'AUDI'
 
@@ -81,115 +77,29 @@ OPUS_AUDIO_MAGIC = b'OPUS'
 
 # H.264 frame magic header (GFX pipeline)
 H264_FRAME_MAGIC = b'H264'
-
-# GFX codec identifiers - These are loaded from the native library at runtime
-# to avoid value drift from FreeRDP's rdpgfx.h header.
-# Default fallback values (will be overwritten when library loads):
-RDP_GFX_CODEC_UNCOMPRESSED = 0x0000
-RDP_GFX_CODEC_CAVIDEO = 0x0003
-RDP_GFX_CODEC_CLEARCODEC = 0x0008
-RDP_GFX_CODEC_PROGRESSIVE = 0x0009
-RDP_GFX_CODEC_PLANAR = 0x000A
-RDP_GFX_CODEC_AVC420 = 0x000B
-RDP_GFX_CODEC_ALPHA = 0x000C
-RDP_GFX_CODEC_PROGRESSIVE_V2 = 0x000D
-RDP_GFX_CODEC_AVC444 = 0x000E
-RDP_GFX_CODEC_AVC444v2 = 0x000F
-
-def _load_codec_constants_from_lib(lib) -> dict:
-    """Load GFX codec constants from native library to avoid drift from C headers."""
-    global RDP_GFX_CODEC_UNCOMPRESSED, RDP_GFX_CODEC_CAVIDEO, RDP_GFX_CODEC_CLEARCODEC
-    global RDP_GFX_CODEC_PROGRESSIVE, RDP_GFX_CODEC_PLANAR, RDP_GFX_CODEC_AVC420
-    global RDP_GFX_CODEC_ALPHA, RDP_GFX_CODEC_PROGRESSIVE_V2, RDP_GFX_CODEC_AVC444
-    global RDP_GFX_CODEC_AVC444v2
-    
-    try:
-        # Set up function bindings for codec getters
-        lib.rdp_gfx_codec_uncompressed.argtypes = []
-        lib.rdp_gfx_codec_uncompressed.restype = c_uint16
-        lib.rdp_gfx_codec_cavideo.argtypes = []
-        lib.rdp_gfx_codec_cavideo.restype = c_uint16
-        lib.rdp_gfx_codec_clearcodec.argtypes = []
-        lib.rdp_gfx_codec_clearcodec.restype = c_uint16
-        lib.rdp_gfx_codec_planar.argtypes = []
-        lib.rdp_gfx_codec_planar.restype = c_uint16
-        lib.rdp_gfx_codec_avc420.argtypes = []
-        lib.rdp_gfx_codec_avc420.restype = c_uint16
-        lib.rdp_gfx_codec_alpha.argtypes = []
-        lib.rdp_gfx_codec_alpha.restype = c_uint16
-        lib.rdp_gfx_codec_avc444.argtypes = []
-        lib.rdp_gfx_codec_avc444.restype = c_uint16
-        lib.rdp_gfx_codec_avc444v2.argtypes = []
-        lib.rdp_gfx_codec_avc444v2.restype = c_uint16
-        lib.rdp_gfx_codec_progressive.argtypes = []
-        lib.rdp_gfx_codec_progressive.restype = c_uint16
-        lib.rdp_gfx_codec_progressive_v2.argtypes = []
-        lib.rdp_gfx_codec_progressive_v2.restype = c_uint16
-        
-        # Load the actual values from FreeRDP headers via the native library
-        RDP_GFX_CODEC_UNCOMPRESSED = lib.rdp_gfx_codec_uncompressed()
-        RDP_GFX_CODEC_CAVIDEO = lib.rdp_gfx_codec_cavideo()
-        RDP_GFX_CODEC_CLEARCODEC = lib.rdp_gfx_codec_clearcodec()
-        RDP_GFX_CODEC_PLANAR = lib.rdp_gfx_codec_planar()
-        RDP_GFX_CODEC_AVC420 = lib.rdp_gfx_codec_avc420()
-        RDP_GFX_CODEC_ALPHA = lib.rdp_gfx_codec_alpha()
-        RDP_GFX_CODEC_AVC444 = lib.rdp_gfx_codec_avc444()
-        RDP_GFX_CODEC_AVC444v2 = lib.rdp_gfx_codec_avc444v2()
-        RDP_GFX_CODEC_PROGRESSIVE = lib.rdp_gfx_codec_progressive()
-        RDP_GFX_CODEC_PROGRESSIVE_V2 = lib.rdp_gfx_codec_progressive_v2()
-        
-        logger.debug(
-            f"Loaded GFX codec constants from native lib: "
-            f"AVC420=0x{RDP_GFX_CODEC_AVC420:04X}, AVC444=0x{RDP_GFX_CODEC_AVC444:04X}, "
-            f"ClearCodec=0x{RDP_GFX_CODEC_CLEARCODEC:04X}"
-        )
-        
-        return {
-            'UNCOMPRESSED': RDP_GFX_CODEC_UNCOMPRESSED,
-            'CAVIDEO': RDP_GFX_CODEC_CAVIDEO,
-            'CLEARCODEC': RDP_GFX_CODEC_CLEARCODEC,
-            'PLANAR': RDP_GFX_CODEC_PLANAR,
-            'AVC420': RDP_GFX_CODEC_AVC420,
-            'ALPHA': RDP_GFX_CODEC_ALPHA,
-            'AVC444': RDP_GFX_CODEC_AVC444,
-            'AVC444v2': RDP_GFX_CODEC_AVC444v2,
-            'PROGRESSIVE': RDP_GFX_CODEC_PROGRESSIVE,
-            'PROGRESSIVE_V2': RDP_GFX_CODEC_PROGRESSIVE_V2,
-        }
-    except Exception as e:
-        logger.warning(f"Failed to load codec constants from native lib: {e}, using fallback values")
-        return {}
+CLRC_FRAME_MAGIC = b'CLRC'
 
 # H.264 frame types
 RDP_H264_FRAME_TYPE_IDR = 0  # Keyframe
 RDP_H264_FRAME_TYPE_P = 1    # Predictive
 RDP_H264_FRAME_TYPE_B = 2    # Bi-predictive
 
+# GFX codec IDs (from FreeRDP's rdpgfx.h) - for logging only
+RDP_GFX_CODEC_CLEARCODEC = 0x0003
+RDP_GFX_CODEC_AVC420 = 0x0009
+RDP_GFX_CODEC_AVC444 = 0x000B
+RDP_GFX_CODEC_AVC444v2 = 0x000E
+RDP_GFX_CODEC_PROGRESSIVE = 0x000C
+RDP_GFX_CODEC_PROGRESSIVE_V2 = 0x000D
+
 
 class RdpRect(Structure):
-    """Dirty rectangle structure (matches C struct)"""
+    """Rectangle structure for GFX frame positioning (matches C struct)"""
     _fields_ = [
         ('x', c_int32),
         ('y', c_int32),
         ('width', c_int32),
         ('height', c_int32),
-    ]
-
-
-class RdpH264Frame(Structure):
-    """H.264 frame from GFX pipeline (matches C struct)"""
-    _fields_ = [
-        ('frame_id', c_uint32),
-        ('surface_id', c_uint16),
-        ('codec_id', c_int),           # RdpGfxCodecId enum
-        ('frame_type', c_int),         # RdpH264FrameType enum
-        ('dest_rect', RdpRect),
-        ('nal_size', c_uint32),
-        ('nal_data', POINTER(c_uint8)),
-        ('chroma_nal_size', c_uint32),
-        ('chroma_nal_data', POINTER(c_uint8)),
-        ('timestamp', ctypes.c_uint64),
-        ('needs_ack', c_bool),
     ]
 
 
@@ -211,10 +121,17 @@ class RdpGfxSurface(Structure):
 RDP_GFX_EVENT_NONE = 0
 RDP_GFX_EVENT_CREATE_SURFACE = 1
 RDP_GFX_EVENT_DELETE_SURFACE = 2
-RDP_GFX_EVENT_START_FRAME = 3
-RDP_GFX_EVENT_END_FRAME = 4
-RDP_GFX_EVENT_SOLID_FILL = 5
-RDP_GFX_EVENT_SURFACE_TO_SURFACE = 6
+RDP_GFX_EVENT_MAP_SURFACE = 3
+RDP_GFX_EVENT_START_FRAME = 4
+RDP_GFX_EVENT_END_FRAME = 5
+RDP_GFX_EVENT_SOLID_FILL = 6
+RDP_GFX_EVENT_SURFACE_TO_SURFACE = 7
+RDP_GFX_EVENT_CACHE_TO_SURFACE = 8
+RDP_GFX_EVENT_SURFACE_TO_CACHE = 9
+RDP_GFX_EVENT_WEBP_TILE = 10
+RDP_GFX_EVENT_VIDEO_FRAME = 11
+RDP_GFX_EVENT_EVICT_CACHE = 12
+RDP_GFX_EVENT_RESET_GRAPHICS = 13
 
 
 class RdpGfxEvent(Structure):
@@ -232,6 +149,16 @@ class RdpGfxEvent(Structure):
         ('src_x', c_int32),
         ('src_y', c_int32),
         ('color', c_uint32),
+        ('cache_slot', c_uint16),
+        ('bitmap_data', c_void_p),  # Pointer to bitmap data (for S2C)
+        ('bitmap_size', c_uint32),  # Size of bitmap data
+        # Video frame data (for VIDEO_FRAME - H.264/Progressive)
+        ('codec_id', c_int),        # RdpGfxCodecId
+        ('video_frame_type', c_int), # RdpH264FrameType
+        ('nal_data', c_void_p),     # NAL/Progressive data pointer
+        ('nal_size', c_uint32),     # Size of NAL data
+        ('chroma_nal_data', c_void_p), # Chroma NAL for AVC444
+        ('chroma_nal_size', c_uint32), # Size of chroma NAL
     ]
 
 
@@ -348,34 +275,6 @@ class NativeLibrary:
         lib.rdp_poll.argtypes = [c_void_p, c_int]
         lib.rdp_poll.restype = c_int
         
-        # rdp_lock_frame_buffer / rdp_unlock_frame_buffer
-        lib.rdp_lock_frame_buffer.argtypes = [c_void_p]
-        lib.rdp_lock_frame_buffer.restype = None
-        lib.rdp_unlock_frame_buffer.argtypes = [c_void_p]
-        lib.rdp_unlock_frame_buffer.restype = None
-        
-        # rdp_get_frame_buffer
-        lib.rdp_get_frame_buffer.argtypes = [
-            c_void_p, POINTER(c_int), POINTER(c_int), POINTER(c_int)
-        ]
-        lib.rdp_get_frame_buffer.restype = POINTER(c_uint8)
-        
-        # rdp_get_dirty_rects
-        lib.rdp_get_dirty_rects.argtypes = [c_void_p, POINTER(RdpRect), c_int]
-        lib.rdp_get_dirty_rects.restype = c_int
-        
-        # rdp_clear_dirty_rects
-        lib.rdp_clear_dirty_rects.argtypes = [c_void_p]
-        lib.rdp_clear_dirty_rects.restype = None
-        
-        # rdp_peek_dirty_rect_count
-        lib.rdp_peek_dirty_rect_count.argtypes = [c_void_p]
-        lib.rdp_peek_dirty_rect_count.restype = c_int
-        
-        # rdp_needs_full_frame
-        lib.rdp_needs_full_frame.argtypes = [c_void_p]
-        lib.rdp_needs_full_frame.restype = c_bool
-        
         # rdp_gfx_frame_in_progress
         lib.rdp_gfx_frame_in_progress.argtypes = [c_void_p]
         lib.rdp_gfx_frame_in_progress.restype = c_bool
@@ -457,18 +356,6 @@ class NativeLibrary:
         lib.rdp_gfx_get_codec.argtypes = [c_void_p]
         lib.rdp_gfx_get_codec.restype = c_int
         
-        # rdp_has_h264_frames
-        lib.rdp_has_h264_frames.argtypes = [c_void_p]
-        lib.rdp_has_h264_frames.restype = c_int
-        
-        # rdp_get_h264_frame
-        lib.rdp_get_h264_frame.argtypes = [c_void_p, POINTER(RdpH264Frame)]
-        lib.rdp_get_h264_frame.restype = c_int
-        
-        # rdp_ack_h264_frame
-        lib.rdp_ack_h264_frame.argtypes = [c_void_p, c_uint32]
-        lib.rdp_ack_h264_frame.restype = c_int
-        
         # rdp_gfx_get_surface
         lib.rdp_gfx_get_surface.argtypes = [c_void_p, c_uint16, POINTER(RdpGfxSurface)]
         lib.rdp_gfx_get_surface.restype = c_int
@@ -476,6 +363,10 @@ class NativeLibrary:
         # rdp_gfx_get_primary_surface
         lib.rdp_gfx_get_primary_surface.argtypes = [c_void_p]
         lib.rdp_gfx_get_primary_surface.restype = c_uint16
+        
+        # rdp_gfx_send_frame_ack - send browser frame acknowledgment to server
+        lib.rdp_gfx_send_frame_ack.argtypes = [c_void_p, c_uint32, c_uint32]
+        lib.rdp_gfx_send_frame_ack.restype = c_int
         
         # GFX event queue API (for wire format streaming)
         # rdp_gfx_has_events
@@ -490,6 +381,10 @@ class NativeLibrary:
         lib.rdp_gfx_clear_events.argtypes = [c_void_p]
         lib.rdp_gfx_clear_events.restype = None
         
+        # rdp_free_gfx_event_data
+        lib.rdp_free_gfx_event_data.argtypes = [c_void_p]
+        lib.rdp_free_gfx_event_data.restype = None
+        
         # rdp_gfx_is_progressive_enabled
         lib.rdp_gfx_is_progressive_enabled.argtypes = [c_void_p]
         lib.rdp_gfx_is_progressive_enabled.restype = c_int
@@ -502,9 +397,6 @@ class NativeLibrary:
         # rdp_get_max_sessions
         lib.rdp_get_max_sessions.argtypes = []
         lib.rdp_get_max_sessions.restype = c_int
-        
-        # Load GFX codec constants from native library (avoid value drift from C headers)
-        _load_codec_constants_from_lib(lib)
         
         # Initialize session registry with configurable limit
         self._init_session_registry()
@@ -559,9 +451,8 @@ class RDPBridge:
     Bridge between WebSocket client and RDP session using native FreeRDP3.
     
     Features:
-    - Direct frame capture from GDI surface (no Xvfb/screenshots)
-    - Dirty rectangle tracking for efficient delta updates
-    - WebP encoding for optimal compression
+    - GFX event streaming with wire format binary protocol
+    - WebP encoding in C for optimal performance
     - Direct input injection (no xdotool)
     """
     
@@ -578,10 +469,6 @@ class RDPBridge:
         # Frame rate control
         self._target_fps = 60
         self._frame_interval = 1.0 / self._target_fps
-        
-        # WebP encoding settings
-        self._webp_quality = 80  # 0-100, higher = better quality
-        self._webp_method = 0   # 0-6, 0 = fastest
         
         # Audio settings
         self._audio_enabled = True
@@ -689,6 +576,31 @@ class RDPBridge:
             logger.error(f"Resize error: {e}")
             return False
     
+    def send_frame_ack(self, frame_id: int, total_frames_decoded: int) -> bool:
+        """Send a frame acknowledgment to the RDP server.
+        
+        This forwards the browser's FACK message to FreeRDP, providing proper
+        backpressure. The server uses these ACKs to control its frame rate -
+        if ACKs are delayed (browser is slow to decode), the server slows down.
+        
+        Args:
+            frame_id: Frame ID to acknowledge (from END_FRAME event / browser FACK)
+            total_frames_decoded: Running count of frames decoded by browser
+            
+        Returns:
+            True on success, False on error
+        """
+        if not self._session or not self._lib:
+            logger.warning("Cannot send frame ACK: session not active")
+            return False
+        
+        try:
+            result = self._lib.rdp_gfx_send_frame_ack(self._session, frame_id, total_frames_decoded)
+            return result == 0
+        except Exception as e:
+            logger.error(f"Frame ACK error: {e}")
+            return False
+    
     def _build_gfx_event_message(self, event: RdpGfxEvent) -> Optional[bytes]:
         """Build binary wire format message for a GFX event.
         
@@ -707,61 +619,123 @@ class RDPBridge:
             )
         elif event.type == RDP_GFX_EVENT_DELETE_SURFACE:
             return build_delete_surface(event.surface_id)
+        elif event.type == RDP_GFX_EVENT_MAP_SURFACE:
+            return build_map_surface_to_output(
+                event.surface_id,
+                event.x,
+                event.y
+            )
         elif event.type == RDP_GFX_EVENT_START_FRAME:
             return build_start_frame(event.frame_id)
         elif event.type == RDP_GFX_EVENT_END_FRAME:
             return build_end_frame(event.frame_id)
+        elif event.type == RDP_GFX_EVENT_SOLID_FILL:
+            return build_solid_fill(
+                event.frame_id,
+                event.surface_id,
+                event.x, event.y,
+                event.width, event.height,
+                event.color
+            )
+        elif event.type == RDP_GFX_EVENT_SURFACE_TO_SURFACE:
+            return build_surface_to_surface(
+                event.frame_id,
+                event.surface_id,       # src surface
+                event.dst_surface_id,   # dst surface
+                event.src_x, event.src_y,
+                event.width, event.height,
+                event.x, event.y        # dst x, y
+            )
+        elif event.type == RDP_GFX_EVENT_SURFACE_TO_CACHE:
+            return build_surface_to_cache(
+                event.frame_id,
+                event.surface_id,
+                event.cache_slot,
+                event.x, event.y,
+                event.width, event.height
+            )
+        elif event.type == RDP_GFX_EVENT_CACHE_TO_SURFACE:
+            return build_cache_to_surface(
+                event.frame_id,
+                event.surface_id,
+                event.cache_slot,
+                event.x, event.y
+            )
+        elif event.type == RDP_GFX_EVENT_EVICT_CACHE:
+            return build_evict_cache(
+                event.frame_id,
+                event.cache_slot
+            )
+        elif event.type == RDP_GFX_EVENT_RESET_GRAPHICS:
+            return build_reset_graphics(
+                event.width,
+                event.height
+            )
+        elif event.type == RDP_GFX_EVENT_WEBP_TILE:
+            # WebP tile with pre-encoded data from C
+            if event.bitmap_data and event.bitmap_size > 0:
+                webp_data = ctypes.string_at(event.bitmap_data, event.bitmap_size)
+                # Free the C-allocated buffer now that we've copied it
+                self._lib.rdp_free_gfx_event_data(event.bitmap_data)
+                return build_webp_tile(
+                    event.frame_id,
+                    event.surface_id,
+                    event.x, event.y,
+                    event.width, event.height,
+                    webp_data
+                )
+            return None
+        elif event.type == RDP_GFX_EVENT_VIDEO_FRAME:
+            # Video frame (H.264/Progressive/ClearCodec) - route by codec ID
+            if event.nal_data and event.nal_size > 0:
+                nal_data = ctypes.string_at(event.nal_data, event.nal_size)
+                # Free the C-allocated buffer
+                self._lib.rdp_free_gfx_event_data(event.nal_data)
+                
+                # Check codec type for wire format routing
+                if event.codec_id == RDP_GFX_CODEC_CLEARCODEC:
+                    # ClearCodec: Use CLRC wire format for WASM decoding
+                    return build_clearcodec_tile(
+                        event.frame_id,
+                        event.surface_id,
+                        event.x, event.y,
+                        event.width, event.height,
+                        nal_data
+                    )
+                
+                # Chroma data for AVC444 (if present)
+                chroma_data = b''
+                if event.chroma_nal_data and event.chroma_nal_size > 0:
+                    chroma_data = ctypes.string_at(event.chroma_nal_data, event.chroma_nal_size)
+                    self._lib.rdp_free_gfx_event_data(event.chroma_nal_data)
+                
+                # Build H264 wire format message (for H.264 and Progressive)
+                message = io.BytesIO()
+                message.write(H264_FRAME_MAGIC)  # 4 bytes
+                message.write(struct.pack('<I', event.frame_id))  # 4 bytes
+                message.write(struct.pack('<H', event.surface_id))  # 2 bytes
+                message.write(struct.pack('<H', event.codec_id))  # 2 bytes
+                message.write(struct.pack('<B', event.video_frame_type))  # 1 byte
+                message.write(struct.pack('<h', event.x))  # 2 bytes
+                message.write(struct.pack('<h', event.y))  # 2 bytes
+                message.write(struct.pack('<H', event.width))  # 2 bytes
+                message.write(struct.pack('<H', event.height))  # 2 bytes
+                message.write(struct.pack('<I', event.nal_size))  # 4 bytes
+                message.write(struct.pack('<I', len(chroma_data)))  # 4 bytes
+                message.write(nal_data)
+                if chroma_data:
+                    message.write(chroma_data)
+                return message.getvalue()
+            return None
         else:
             # Unhandled event type
             return None
     
-    def _read_frame_buffer_safe(self) -> tuple:
-        """Read frame buffer with lock protection against resize races.
-        
-        Returns (pixel_data, width, height, stride) or (None, 0, 0, 0) on error.
-        The pixel_data is a copy, safe to use after this function returns.
-        """
-        if not self._session or not self._lib:
-            return (None, 0, 0, 0)
-        
-        # Lock to prevent buffer reallocation during read
-        self._lib.rdp_lock_frame_buffer(self._session)
-        try:
-            width = c_int()
-            height = c_int()
-            stride = c_int()
-            buffer_ptr = self._lib.rdp_get_frame_buffer(
-                self._session,
-                ctypes.byref(width),
-                ctypes.byref(height),
-                ctypes.byref(stride)
-            )
-            
-            if not buffer_ptr:
-                return (None, 0, 0, 0)
-            
-            w, h, s = width.value, height.value, stride.value
-            if w <= 0 or h <= 0 or s <= 0:
-                return (None, 0, 0, 0)
-            
-            # Copy buffer while holding lock - this is the critical section
-            buffer_size = h * s
-            pixel_data = ctypes.string_at(buffer_ptr, buffer_size)
-            
-            return (pixel_data, w, h, s)
-        finally:
-            # Always unlock
-            self._lib.rdp_unlock_frame_buffer(self._session)
-    
     async def _stream_frames(self):
-        """Stream frames from native library - prioritizes H.264/GFX when available"""
+        """Stream frames from native library - GFX event streaming with wire format"""
         logger.info("Starting frame streaming")
         
-        # Allocate dirty rect buffer - must match RDP_MAX_DIRTY_RECTS in C (512)
-        max_rects = 512
-        rects = (RdpRect * max_rects)()
         poll_count = 0
-        h264_frame = RdpH264Frame()
         gfx_event = RdpGfxEvent()
         gfx_mode_logged = False
         
@@ -782,7 +756,7 @@ class RDPBridge:
                     logger.error(f"RDP poll error: {error.decode('utf-8') if error else 'Unknown'}")
                     break
                 
-                # Check if GFX/H.264 pipeline is active
+                # Check if GFX/H.264 pipeline is active (for logging only)
                 gfx_active = self._lib.rdp_gfx_is_active(self._session)
                 
                 if gfx_active and not gfx_mode_logged:
@@ -796,133 +770,45 @@ class RDPBridge:
                     logger.info(f"GFX pipeline active with codec: {codec_name}")
                     gfx_mode_logged = True
                 
-                # Priority 0: Send GFX lifecycle events (surface create/delete, frame start/end)
-                if gfx_active:
-                    events_sent = 0
-                    while self._lib.rdp_gfx_has_events(self._session) > 0:
-                        ret = self._lib.rdp_gfx_get_event(
-                            self._session, ctypes.byref(gfx_event)
-                        )
-                        if ret == 0:
-                            msg = self._build_gfx_event_message(gfx_event)
-                            if msg:
-                                await self.websocket.send(msg)
-                                events_sent += 1
-                                # Track frame ID for tile messages
-                                if gfx_event.type == RDP_GFX_EVENT_START_FRAME:
-                                    current_frame_id = gfx_event.frame_id
-                        else:
-                            break
-                    
-                    if events_sent > 0 and events_sent % 10 == 0:
-                        await asyncio.sleep(0)  # Yield periodically
+                # WIRE-THROUGH MODE: Consume GFX events from queue.
+                # VIDEO_FRAME events (H.264/Progressive) are now in the GFX queue
+                # for strict ordering with other GFX commands.
+                events_sent = 0
+                frame_completed = False  # Stop after completing one frame
                 
-                # Priority 1: Stream H.264 frames from GFX pipeline
-                if gfx_active:
-                    h264_count = self._lib.rdp_has_h264_frames(self._session)
-                    h264_sent = 0
-                    while h264_count > 0:
-                        ret = self._lib.rdp_get_h264_frame(
-                            self._session, ctypes.byref(h264_frame)
-                        )
-                        if ret == 0:
-                            await self._send_h264_frame(h264_frame)
-                            h264_count -= 1
-                            h264_sent += 1
-                            # Yield periodically during burst to allow audio loop to run
-                            if h264_sent % 5 == 0:
-                                await asyncio.sleep(0)
-                        else:
-                            break
-                    
-                    # If we sent H.264 frames, consume full frame flag but still check dirty rects
-                    # (SolidFill, SurfaceToSurface, CacheToSurface operations add dirty rects
-                    # that need to be sent as WebP delta - these are used for scrolling!)
-                    if h264_sent > 0:
-                        # Consume the full frame flag to prevent full WebP
-                        self._lib.rdp_needs_full_frame(self._session)
-                        # But DON'T clear dirty rects - fall through to process them!
-                        # Yield after H.264 burst to give audio loop a chance
-                        await asyncio.sleep(0)
-                    
-                    # First check if we need a full frame (e.g., dirty rect overflow)
-                    needs_full = self._lib.rdp_needs_full_frame(self._session)
-                    
-                    if needs_full:
-                        # Dirty rect overflow - send full frame instead of deltas
-                        # Use safe buffer read with lock protection
-                        pixel_data, w, h, s = self._read_frame_buffer_safe()
-                        
-                        if pixel_data:
-                            await self._send_full_frame(pixel_data, w, h, s)
-                        
-                        # Clear dirty rects - for full frame this is intentional
-                        # (we're sending the entire buffer, so all rects are covered)
-                        self._lib.rdp_clear_dirty_rects(self._session)
-                        continue
-                    
-                    # Issue 12m: With atomic read-clear in rdp_get_dirty_rects, we no longer
-                    # need the frame_in_progress guard. The atomic operation prevents races
-                    # between reading and clearing. Sending rects from completed frames while
-                    # a new frame is building is fine - those rects are valid.
-                    rect_count = self._lib.rdp_get_dirty_rects(
-                        self._session, rects, max_rects
+                while self._lib.rdp_gfx_has_events(self._session) > 0 and not frame_completed:
+                    ret = self._lib.rdp_gfx_get_event(
+                        self._session, ctypes.byref(gfx_event)
                     )
+                    if ret != 0:
+                        break
                     
-                    if rect_count > 0:
-                        # Send delta frame for non-H.264 operations
-                        # Use safe buffer read with lock protection
-                        pixel_data, w, h, s = self._read_frame_buffer_safe()
-                        
-                        if pixel_data:
-                            await self._send_delta_frame(pixel_data, w, h, s, rects, rect_count)
-                        
-                        # Note: rdp_get_dirty_rects now clears atomically, no need to call clear
-                        # Yield after delta frame to allow audio loop to run
-                        await asyncio.sleep(0)
+                    # Send event (all types including VIDEO_FRAME are handled by _build_gfx_event_message)
+                    msg = self._build_gfx_event_message(gfx_event)
+                    if msg:
+                        await self.websocket.send(msg)
+                        events_sent += 1
                     
-                    # If we sent H.264 or deltas, continue to next poll
-                    if h264_sent > 0 or rect_count > 0:
-                        continue
-                    
-                    # GFX active but no updates - wait for more
-                    if result == 0:
-                        await asyncio.sleep(0)
-                        continue
+                    # Track frame boundaries
+                    if gfx_event.type == RDP_GFX_EVENT_START_FRAME:
+                        current_frame_id = gfx_event.frame_id
+                    elif gfx_event.type == RDP_GFX_EVENT_END_FRAME:
+                        # Mark frame as completed - stop processing until next poll
+                        # This ensures we don't send StartFrame(N+1) before all data is ready
+                        frame_completed = True
                 
-                # Fallback: GDI mode (legacy WebP encoding)
-                if result == 0:
-                    # No frame update, but still connected
-                    await asyncio.sleep(0)
+                # Note: H264/Progressive frames are now in GFX queue as VIDEO_FRAME events,
+                # so no separate H264 queue draining is needed.
+                
+                if events_sent > 0:
+                    await asyncio.sleep(0)  # Yield after processing
+                
+                # Continue to next poll - rdp_poll will drive FreeRDP and queue more events
+                if events_sent > 0:
                     continue
                 
-                # Check if we need a full frame
-                needs_full = self._lib.rdp_needs_full_frame(self._session)
-                if poll_count <= 10:
-                    logger.debug(f"Frame update available: needs_full={needs_full}")
-                
-                # Get frame buffer with lock protection
-                pixel_data, w, h, s = self._read_frame_buffer_safe()
-                
-                if not pixel_data:
-                    logger.warning("Frame buffer not available")
-                    continue
-                
-                if needs_full:
-                    # Send full frame
-                    await self._send_full_frame(pixel_data, w, h, s)
-                else:
-                    # Get dirty rects and send delta
-                    rect_count = self._lib.rdp_get_dirty_rects(
-                        self._session, rects, max_rects
-                    )
-                    
-                    if rect_count > 0:
-                        await self._send_delta_frame(pixel_data, w, h, s, rects, rect_count)
-                
-                # Clear dirty rects after processing
-                self._lib.rdp_clear_dirty_rects(self._session)
-                self._frame_count += 1
+                # No events this cycle - just wait for more
+                await asyncio.sleep(0)
                 
             except asyncio.CancelledError:
                 break
@@ -931,202 +817,6 @@ class RDPBridge:
                 await asyncio.sleep(0)
         
         logger.info(f"Frame streaming ended after {self._frame_count} frames")
-    
-    async def _send_full_frame(self, pixel_data: bytes, width: int, height: int, stride: int):
-        """Encode and send a full frame as WebP.
-        
-        Args:
-            pixel_data: Copied pixel data (safe to use, not a pointer)
-            width: Frame width
-            height: Frame height
-            stride: Bytes per row
-        """
-        try:
-            # Validate dimensions
-            if width <= 0 or height <= 0 or stride <= 0 or not pixel_data:
-                return
-            
-            # Create PIL image from BGRA data
-            img = Image.frombytes('RGBA', (width, height), pixel_data, 'raw', 'BGRA', stride)
-            
-            # Convert to RGB and encode as WebP
-            img_rgb = img.convert('RGB')
-            buffer = io.BytesIO()
-            img_rgb.save(
-                buffer,
-                format='WEBP',
-                quality=self._webp_quality,
-                method=self._webp_method
-            )
-            
-            # Send as binary (full frame = raw WebP)
-            await self.websocket.send(buffer.getvalue())
-            
-        except Exception as e:
-            logger.error(f"Full frame encoding error: {e}")
-    
-    async def _send_delta_frame(
-        self, pixel_data: bytes, width: int, height: int, stride: int,
-        rects: 'ctypes.Array[RdpRect]', rect_count: int
-    ):
-        """Encode and send delta frame with dirty rectangles.
-        
-        Args:
-            pixel_data: Copied pixel data (safe to use, not a pointer)
-            width: Frame width
-            height: Frame height
-            stride: Bytes per row
-            rects: Array of dirty rectangles
-            rect_count: Number of dirty rectangles
-        """
-        try:
-            # Validate dimensions
-            if width <= 0 or height <= 0 or stride <= 0 or not pixel_data:
-                return
-            
-            buffer_size = len(pixel_data)
-            
-            # Build delta message
-            rect_list = []
-            tile_data = io.BytesIO()
-            
-            for i in range(rect_count):
-                rect = rects[i]
-                rx, ry, rw, rh = rect.x, rect.y, rect.width, rect.height
-                
-                # Clamp to frame bounds
-                if rx < 0: rx = 0
-                if ry < 0: ry = 0
-                if rx + rw > width: rw = width - rx
-                if ry + rh > height: rh = height - ry
-                if rw <= 0 or rh <= 0:
-                    continue
-                
-                # Validate buffer access bounds
-                max_offset = (ry + rh - 1) * stride + (rx + rw) * 4
-                if max_offset > buffer_size:
-                    logger.warning(f"Skipping out-of-bounds rect ({rx},{ry} {rw}x{rh}) for buffer {width}x{height}")
-                    continue
-                
-                rect_list.append({
-                    'x': rx, 'y': ry, 'w': rw, 'h': rh
-                })
-                
-                # Extract tile from full buffer
-                # BGRA, 4 bytes per pixel
-                tile_bytes = bytearray(rw * rh * 4)
-                for row in range(rh):
-                    src_offset = (ry + row) * stride + rx * 4
-                    dst_offset = row * rw * 4
-                    tile_bytes[dst_offset:dst_offset + rw * 4] = \
-                        pixel_data[src_offset:src_offset + rw * 4]
-                
-                # Create tile image and encode to WebP
-                tile_img = Image.frombytes('RGBA', (rw, rh), bytes(tile_bytes), 'raw', 'BGRA')
-                tile_rgb = tile_img.convert('RGB')
-                tile_buffer = io.BytesIO()
-                tile_rgb.save(
-                    tile_buffer,
-                    format='WEBP',
-                    quality=self._webp_quality,
-                    method=self._webp_method
-                )
-                
-                # Store size and data
-                tile_webp = tile_buffer.getvalue()
-                rect_list[-1]['size'] = len(tile_webp)
-                tile_data.write(tile_webp)
-            
-            if not rect_list:
-                return
-            
-            # Build delta message:
-            # [DELT magic (4)] [JSON length (4)] [JSON] [tile data...]
-            import json
-            rect_json = json.dumps({'rects': rect_list}).encode('utf-8')
-            
-            message = io.BytesIO()
-            message.write(DELTA_FRAME_MAGIC)
-            message.write(struct.pack('<I', len(rect_json)))
-            message.write(rect_json)
-            message.write(tile_data.getvalue())
-            
-            await self.websocket.send(message.getvalue())
-            
-        except Exception as e:
-            logger.error(f"Delta frame encoding error: {e}")
-    
-    async def _send_h264_frame(self, frame: RdpH264Frame):
-        """Send H.264 frame from GFX pipeline to browser
-        
-        Binary format:
-        [H264 magic (4)] [frame_id (4)] [surface_id (2)] [codec_id (2)]
-        [frame_type (1)] [x (2)] [y (2)] [w (2)] [h (2)]
-        [nal_size (4)] [chroma_nal_size (4)]
-        [nal_data...] [chroma_nal_data...]
-        """
-        try:
-            if not frame.nal_data or frame.nal_size == 0:
-                return
-            
-            # Read NAL data from native buffer
-            nal_data = ctypes.string_at(frame.nal_data, frame.nal_size)
-            
-            # Read chroma NAL data for AVC444
-            chroma_data = b''
-            if frame.chroma_nal_data and frame.chroma_nal_size > 0:
-                chroma_data = ctypes.string_at(frame.chroma_nal_data, frame.chroma_nal_size)
-            
-            # Build binary message
-            message = io.BytesIO()
-            message.write(H264_FRAME_MAGIC)  # 4 bytes
-            message.write(struct.pack('<I', frame.frame_id))  # 4 bytes
-            message.write(struct.pack('<H', frame.surface_id))  # 2 bytes
-            message.write(struct.pack('<H', frame.codec_id))  # 2 bytes
-            message.write(struct.pack('<B', frame.frame_type))  # 1 byte
-            message.write(struct.pack('<h', frame.dest_rect.x))  # 2 bytes
-            message.write(struct.pack('<h', frame.dest_rect.y))  # 2 bytes
-            message.write(struct.pack('<H', frame.dest_rect.width))  # 2 bytes
-            message.write(struct.pack('<H', frame.dest_rect.height))  # 2 bytes
-            message.write(struct.pack('<I', frame.nal_size))  # 4 bytes
-            message.write(struct.pack('<I', len(chroma_data)))  # 4 bytes
-            message.write(nal_data)
-            if chroma_data:
-                message.write(chroma_data)
-            
-            await self.websocket.send(message.getvalue())
-            self._frame_count += 1
-            
-            # Log first H.264 frame only
-            if self._frame_count == 1:
-                codec_name = {
-                    RDP_GFX_CODEC_AVC420: "AVC420",
-                    RDP_GFX_CODEC_AVC444: "AVC444",
-                    RDP_GFX_CODEC_AVC444v2: "AVC444v2",
-                }.get(frame.codec_id, f"0x{frame.codec_id:X}")
-                logger.info(f"H.264 stream started: {codec_name} {frame.dest_rect.width}x{frame.dest_rect.height}")
-                
-        except Exception as e:
-            logger.error(f"H.264 frame send error: {e}")
-    
-    async def ack_h264_frame(self, frame_id: int):
-        """Acknowledge an H.264 frame to prevent server back-pressure
-        
-        NOTE: Currently disabled because FreeRDP's GFX channel automatically
-        sends frame acknowledgments in its EndFrame handler. Sending additional
-        acks from the browser causes protocol errors (duplicate acks).
-        
-        To enable browser-controlled acks, we would need to:
-        1. Set OnOpen callback with *do_frame_acks = FALSE
-        2. Manually track which frames need acking
-        3. Send acks only after browser confirms decode
-        """
-        # Disabled: FreeRDP handles acks automatically in EndFrame
-        # if self._session and self._lib:
-        #     await asyncio.get_event_loop().run_in_executor(
-        #         None, self._lib.rdp_ack_h264_frame, self._session, frame_id
-        #     )
-        pass
     
     async def _stream_audio(self):
         """Stream Opus audio from native FreeRDP buffer (no PulseAudio required)"""

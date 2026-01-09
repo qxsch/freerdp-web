@@ -175,15 +175,27 @@ static inline void BitStream_Shift32(BITSTREAM* bs)
 
 /**
  * Update parameter and clamp to [0, KPMAX], return parameter >> LSGR
+ * Matches FreeRDP's UpdateParam exactly with unsigned parameter
  */
-static inline uint32_t UpdateParam(int32_t* param, int32_t deltaP)
+static inline uint32_t UpdateParam(uint32_t* param, int32_t deltaP)
 {
-    *param += deltaP;
-    if (*param < 0)
-        *param = 0;
+    if (deltaP < 0)
+    {
+        const uint32_t udeltaP = (uint32_t)(-deltaP);
+        if (udeltaP > *param)
+            *param = 0;
+        else
+            *param -= udeltaP;
+    }
+    else
+    {
+        *param += (uint32_t)deltaP;
+    }
+    
     if (*param > KPMAX)
         *param = KPMAX;
-    return (uint32_t)(*param >> LSGR);
+    
+    return (*param) >> LSGR;
 }
 
 /**
@@ -200,7 +212,7 @@ int rfx_rlgr_decode(const uint8_t* input, size_t inputSize,
 {
     BITSTREAM bs;
     uint32_t vk, cnt;
-    int32_t k, kp, kr, krp;
+    uint32_t k, kp, kr, krp;  /* FreeRDP uses UINT32 for these */
     uint16_t code;
     int16_t mag;
     size_t run, offset, size;
@@ -338,7 +350,7 @@ int rfx_rlgr_decode(const uint8_t* input, size_t inputSize,
             }
             else if (vk != 1)
             {
-                krp += (int32_t)vk;
+                krp += vk;
                 if (krp > KPMAX)
                     krp = KPMAX;
                 kr = krp >> LSGR;
@@ -434,7 +446,7 @@ int rfx_rlgr_decode(const uint8_t* input, size_t inputSize,
             }
             else if (vk != 1)
             {
-                krp += (int32_t)vk;
+                krp += vk;
                 if (krp > KPMAX)
                     krp = KPMAX;
                 kr = krp >> LSGR;
@@ -590,31 +602,229 @@ static int16_t srl_read_value(SRL_STATE* state, uint32_t numBits)
     return sign ? -(int16_t)mag : (int16_t)mag;
 }
 
+/* Subband offsets and sizes for extrapolated tiles (from FreeRDP progressive.c) */
+static const struct {
+    size_t offset;
+    size_t length;
+} SUBBAND_EXTRAPOLATED[10] = {
+    { 0,    1023 },  /* HL1 */
+    { 1023, 1023 },  /* LH1 */
+    { 2046, 961  },  /* HH1 */
+    { 3007, 272  },  /* HL2 */
+    { 3279, 272  },  /* LH2 */
+    { 3551, 256  },  /* HH2 */
+    { 3807, 72   },  /* HL3 */
+    { 3879, 72   },  /* LH3 */
+    { 3951, 64   },  /* HH3 */
+    { 4015, 81   },  /* LL3 */
+};
+
+/* Subband offsets and sizes for non-extrapolated tiles */
+static const struct {
+    size_t offset;
+    size_t length;
+} SUBBAND_NORMAL[10] = {
+    { 0,    1024 },  /* HL1 */
+    { 1024, 1024 },  /* LH1 */
+    { 2048, 1024 },  /* HH1 */
+    { 3072, 256  },  /* HL2 */
+    { 3328, 256  },  /* LH2 */
+    { 3584, 256  },  /* HH2 */
+    { 3840, 64   },  /* HL3 */
+    { 3904, 64   },  /* LH3 */
+    { 3968, 64   },  /* HH3 */
+    { 4032, 64   },  /* LL3 */
+};
+
 /**
- * rfx_srl_decode - SRL decoder for progressive tile upgrades
- * 
- * This decodes the SRL (Subband Residual Layer) data used in progressive
- * tile refinement. The sign array stores the sign of previously decoded
- * coefficients, which determines whether to read from SRL or RAW stream.
+ * Upgrade a single subband block using SRL and RAW streams
+ * Based on FreeRDP's progressive_rfx_upgrade_block
  *
- * @param srlData     SRL bitstream data
- * @param srlLen      SRL data length in bytes
- * @param current     Current coefficient buffer (modified in place)
- * @param sign        Sign buffer from previous decode
- * @param length      Number of coefficients
- * @param numBits     Number of bits per coefficient for this pass
+ * @param srl        SRL bitstream state
+ * @param raw        RAW bitstream state  
+ * @param current    Coefficient buffer for this subband
+ * @param sign       Sign buffer for this subband
+ * @param length     Number of coefficients in subband
+ * @param shift      Shift amount for this subband
+ * @param numBits    Number of bits to read per coefficient
+ * @param isLL3      True if this is LL3 subband (uses only RAW)
+ */
+static void upgrade_subband_block(SRL_STATE* srl, BITSTREAM* raw,
+                                   int16_t* current, int16_t* sign,
+                                   size_t length, int shift, int numBits, bool isLL3)
+{
+    if (numBits == 0)
+        return;
+    
+    uint32_t mask = (1u << numBits) - 1;
+    
+    for (size_t i = 0; i < length; i++)
+    {
+        int32_t input = 0;
+        
+        if (isLL3)
+        {
+            /* LL3 subband: always read from RAW stream */
+            if (BitStream_GetRemainingLength(raw) >= numBits)
+            {
+                input = (int16_t)((raw->accumulator >> (32 - numBits)) & mask);
+                BitStream_Shift(raw, numBits);
+            }
+        }
+        else if (sign[i] > 0)
+        {
+            /* Positive sign: read from RAW stream */
+            if (BitStream_GetRemainingLength(raw) >= numBits)
+            {
+                input = (int16_t)((raw->accumulator >> (32 - numBits)) & mask);
+                BitStream_Shift(raw, numBits);
+            }
+        }
+        else if (sign[i] < 0)
+        {
+            /* Negative sign: read from RAW stream and negate */
+            if (BitStream_GetRemainingLength(raw) >= numBits)
+            {
+                input = (int16_t)((raw->accumulator >> (32 - numBits)) & mask);
+                BitStream_Shift(raw, numBits);
+                input = -input;
+            }
+        }
+        else
+        {
+            /* Zero sign: read from SRL stream */
+            if (BitStream_GetRemainingLength(srl->bs) > 0)
+            {
+                input = srl_read_value(srl, numBits);
+                /* Store actual decoded value (not just sign bit) like FreeRDP */
+                sign[i] = (int16_t)input;
+            }
+        }
+        
+        /* Apply shift and add to current coefficient */
+        int32_t val = input << shift;
+        int32_t result = current[i] + val;
+        
+        /* Clamp to int16_t range */
+        if (result > 32767) result = 32767;
+        if (result < -32768) result = -32768;
+        
+        current[i] = (int16_t)result;
+    }
+}
+
+/**
+ * rfx_progressive_upgrade_component - Full per-subband upgrade
+ * Based on FreeRDP's progressive_rfx_upgrade_component
+ *
+ * @param srlData      SRL bitstream data
+ * @param srlLen       SRL data length in bytes
+ * @param rawData      RAW bitstream data
+ * @param rawLen       RAW data length in bytes  
+ * @param current      Current coefficient buffer (4096 int16_t)
+ * @param sign         Sign buffer (4096 int16_t, stored as int16_t for FreeRDP compat)
+ * @param shift        Per-subband shift values
+ * @param numBits      Per-subband numBits values (difference from previous bitPos)
+ * @param extrapolate  True if using extrapolated tile layout
  * @return 0 on success, -1 on error
+ */
+int rfx_progressive_upgrade_component(
+    const uint8_t* srlData, size_t srlLen,
+    const uint8_t* rawData, size_t rawLen,
+    int16_t* current, int16_t* sign,
+    const RfxComponentCodecQuant* shift,
+    const RfxComponentCodecQuant* numBits,
+    bool extrapolate)
+{
+    BITSTREAM bsSrl, bsRaw;
+    
+    /* Initialize SRL stream */
+    if (srlData && srlLen > 0) {
+        BitStream_Attach(&bsSrl, srlData, (uint32_t)srlLen);
+        BitStream_Fetch(&bsSrl);
+    } else {
+        memset(&bsSrl, 0, sizeof(bsSrl));
+    }
+    
+    /* Initialize RAW stream */
+    if (rawData && rawLen > 0) {
+        BitStream_Attach(&bsRaw, rawData, (uint32_t)rawLen);
+        BitStream_Fetch(&bsRaw);
+    } else {
+        memset(&bsRaw, 0, sizeof(bsRaw));
+    }
+    
+    SRL_STATE srlState;
+    srlState.bs = &bsSrl;
+    srlState.kp = 8;
+    srlState.nz = 0;
+    srlState.mode = 0;
+    
+    /* Select subband layout based on extrapolate flag */
+    const struct { size_t offset; size_t length; }* subbands = 
+        extrapolate ? SUBBAND_EXTRAPOLATED : SUBBAND_NORMAL;
+    
+    /* Process each subband with its own shift and numBits */
+    /* Order: HL1, LH1, HH1, HL2, LH2, HH2, HL3, LH3, HH3, LL3 */
+    upgrade_subband_block(&srlState, &bsRaw, 
+        &current[subbands[0].offset], &sign[subbands[0].offset],
+        subbands[0].length, shift->HL1, numBits->HL1, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[1].offset], &sign[subbands[1].offset],
+        subbands[1].length, shift->LH1, numBits->LH1, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[2].offset], &sign[subbands[2].offset],
+        subbands[2].length, shift->HH1, numBits->HH1, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[3].offset], &sign[subbands[3].offset],
+        subbands[3].length, shift->HL2, numBits->HL2, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[4].offset], &sign[subbands[4].offset],
+        subbands[4].length, shift->LH2, numBits->LH2, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[5].offset], &sign[subbands[5].offset],
+        subbands[5].length, shift->HH2, numBits->HH2, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[6].offset], &sign[subbands[6].offset],
+        subbands[6].length, shift->HL3, numBits->HL3, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[7].offset], &sign[subbands[7].offset],
+        subbands[7].length, shift->LH3, numBits->LH3, false);
+    
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[8].offset], &sign[subbands[8].offset],
+        subbands[8].length, shift->HH3, numBits->HH3, false);
+    
+    /* LL3 uses only RAW stream (isLL3 = true) */
+    upgrade_subband_block(&srlState, &bsRaw,
+        &current[subbands[9].offset], &sign[subbands[9].offset],
+        subbands[9].length, shift->LL3, numBits->LL3, true);
+    
+    return 0;
+}
+
+/**
+ * rfx_srl_decode - Legacy SRL decoder (kept for compatibility)
+ * NOTE: This uses simplified flat processing. For proper progressive upgrades,
+ * use rfx_progressive_upgrade_component which handles per-subband shifts.
  */
 int rfx_srl_decode(const uint8_t* srlData, size_t srlLen,
                    int16_t* current, int8_t* sign,
-                   size_t length, int numBits)
+                   size_t length, int shiftBits)
 {
     if (!srlData || srlLen == 0 || !current || !sign || length == 0)
         return -1;
     
     BITSTREAM bs;
     BitStream_Attach(&bs, srlData, (uint32_t)srlLen);
-    BitStream_Fetch(&bs);  /* CRITICAL: Fetch initial 32 bits */
+    BitStream_Fetch(&bs);
     
     SRL_STATE state;
     state.bs = &bs;
@@ -622,17 +832,24 @@ int rfx_srl_decode(const uint8_t* srlData, size_t srlLen,
     state.nz = 0;
     state.mode = 0;
     
+    uint32_t numBits = 1;
+    
     for (size_t i = 0; i < length && BitStream_GetRemainingLength(&bs) > 0; i++)
     {
         if (sign[i] == 0)
         {
-            /* Zero sign means read from SRL stream */
-            int16_t val = srl_read_value(&state, (uint32_t)numBits);
+            int16_t val = srl_read_value(&state, numBits);
+            
+            if (val != 0 && shiftBits > 0) {
+                int32_t shifted = (int32_t)val << shiftBits;
+                if (shifted > 32767) shifted = 32767;
+                if (shifted < -32768) shifted = -32768;
+                val = (int16_t)shifted;
+            }
+            
             current[i] += val;
-            sign[i] = (int8_t)val;  /* Update sign for next pass */
+            sign[i] = (val > 0) ? 1 : ((val < 0) ? -1 : 0);
         }
-        /* Non-zero sign means coefficient already has a value, 
-           would need to read from RAW stream (not implemented here) */
     }
     
     return 0;

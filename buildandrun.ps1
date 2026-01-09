@@ -3,11 +3,15 @@ param(
     [Parameter(Mandatory=$true, Position=0)]
     [string]$image = "",
     [switch]$NoCache,
+    [switch]$SmartChache,
     [switch]$JustRun
 )
 
 if($JustRun -and $NoCache) {
     throw "Cannot use -JustRun and -NoCache together."
+}
+if($SmartChache -and $NoCache) {
+    throw "Cannot use -SmartChache and -NoCache together."
 }
 
 # current path of the script
@@ -37,7 +41,7 @@ if($image -eq "frontend") {
             Set-Location $scriptDir
         }
     }
-    docker run --rm -it -p 8000:8000 rdp-frontend
+    docker run --rm -it -p 8000:8000 --name rdp-frontend rdp-frontend
 }
 elseif($image -eq "backend") {
     Set-Location "$scriptDir/backend"
@@ -52,7 +56,14 @@ elseif($image -eq "backend") {
                 }
             }
             else {
-                docker build -t rdp-backend .
+                if($SmartChache) {
+                    $REBUILD_NEEDED = Get-Date -Format 'yyyy-MM-dd--hh-mm-ss'
+                }
+                else {
+                    $REBUILD_NEEDED = "0"
+                }
+
+                docker build -t rdp-backend --build-arg REBUILD_NEEDED=$REBUILD_NEEDED .
                 if($LASTEXITCODE -ne 0) {
                     throw "Docker build failed with exit code $LASTEXITCODE"
                 }
@@ -62,7 +73,7 @@ elseif($image -eq "backend") {
             Set-Location $scriptDir
         }
     }
-    docker run --rm -it -p 8765:8765 rdp-backend
+    docker run --rm -it -p 8765:8765 --name rdp-backend rdp-backend
 }
 else {
     Write-Host "Please specify an image to build and run: -image frontend or -image backend"

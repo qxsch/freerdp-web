@@ -13,6 +13,7 @@ export const Magic = {
     // Surface management
     SURF: new Uint8Array([0x53, 0x55, 0x52, 0x46]),  // "SURF" - createSurface
     DELS: new Uint8Array([0x44, 0x45, 0x4C, 0x53]),  // "DELS" - deleteSurface
+    MAPS: new Uint8Array([0x4D, 0x41, 0x50, 0x53]),  // "MAPS" - mapSurfaceToOutput
     
     // Frame lifecycle
     STFR: new Uint8Array([0x53, 0x54, 0x46, 0x52]),  // "STFR" - startFrame
@@ -22,11 +23,15 @@ export const Magic = {
     PROG: new Uint8Array([0x50, 0x52, 0x4F, 0x47]),  // "PROG" - progressive tile
     WEBP: new Uint8Array([0x57, 0x45, 0x42, 0x50]),  // "WEBP" - WebP tile
     TILE: new Uint8Array([0x54, 0x49, 0x4C, 0x45]),  // "TILE" - raw RGBA tile
+    CLRC: new Uint8Array([0x43, 0x4C, 0x52, 0x43]),  // "CLRC" - ClearCodec tile (raw wire for WASM)
     
     // Surface operations
     SFIL: new Uint8Array([0x53, 0x46, 0x49, 0x4C]),  // "SFIL" - solidFill
     S2SF: new Uint8Array([0x53, 0x32, 0x53, 0x46]),  // "S2SF" - surfaceToSurface
     C2SF: new Uint8Array([0x43, 0x32, 0x53, 0x46]),  // "C2SF" - cacheToSurface
+    S2CH: new Uint8Array([0x53, 0x32, 0x43, 0x48]),  // "S2CH" - surfaceToCache
+    EVCT: new Uint8Array([0x45, 0x56, 0x43, 0x54]),  // "EVCT" - evictCache
+    RSGR: new Uint8Array([0x52, 0x53, 0x47, 0x52]),  // "RSGR" - resetGraphics
     
     // Video
     H264: new Uint8Array([0x48, 0x32, 0x36, 0x34]),  // "H264" - H.264 NAL
@@ -35,8 +40,7 @@ export const Magic = {
     FACK: new Uint8Array([0x46, 0x41, 0x43, 0x4B]),  // "FACK" - frameAck
     BPRS: new Uint8Array([0x42, 0x50, 0x52, 0x53]),  // "BPRS" - backpressure
     
-    // existing format compatibility
-    DELT: new Uint8Array([0x44, 0x45, 0x4C, 0x54]),  // "DELT" - delta frame
+    // Audio
     OPUS: new Uint8Array([0x4F, 0x50, 0x55, 0x53]),  // "OPUS" - Opus audio
     AUDI: new Uint8Array([0x41, 0x55, 0x44, 0x49]),  // "AUDI" - raw audio
 };
@@ -130,6 +134,20 @@ export function parseDeleteSurface(data) {
     return {
         type: 'deleteSurface',
         surfaceId: readU16LE(data, 4),
+    };
+}
+
+/**
+ * Parse mapSurfaceToOutput message
+ * Layout: MAPS(4) + surfaceId(2) + outputX(2) + outputY(2) = 10 bytes
+ */
+export function parseMapSurface(data) {
+    if (data.length < 10) return null;
+    return {
+        type: 'mapSurface',
+        surfaceId: readU16LE(data, 4),
+        outputX: readU16LE(data, 6),
+        outputY: readU16LE(data, 8),
     };
 }
 
@@ -229,6 +247,29 @@ export function parseRawTile(data) {
 }
 
 /**
+ * Parse ClearCodec tile message
+ * Layout: CLRC(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data
+ * Total header: 22 bytes
+ */
+export function parseClearCodecTile(data) {
+    if (data.length < 22) return null;
+    const dataSize = readU32LE(data, 18);
+    if (data.length < 22 + dataSize) return null;
+    
+    return {
+        type: 'tile',
+        codec: 'clearcodec',
+        frameId: readU32LE(data, 4),
+        surfaceId: readU16LE(data, 8),
+        x: readU16LE(data, 10),
+        y: readU16LE(data, 12),
+        w: readU16LE(data, 14),
+        h: readU16LE(data, 16),
+        payload: data.subarray(22, 22 + dataSize),
+    };
+}
+
+/**
  * Parse solidFill message
  * Layout: SFIL(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + color(4) = 22 bytes
  */
@@ -277,9 +318,53 @@ export function parseCacheToSurface(data) {
         type: 'cacheToSurface',
         frameId: readU32LE(data, 4),
         surfaceId: readU16LE(data, 8),
-        cacheId: readU16LE(data, 10),
-        dstX: readU16LE(data, 12),
-        dstY: readU16LE(data, 14),
+        cacheSlot: readU16LE(data, 10),
+        dstX: readI16LE(data, 12),
+        dstY: readI16LE(data, 14),
+    };
+}
+
+/**
+ * Parse surfaceToCache message
+ * Layout: S2CH(4) + frameId(4) + surfaceId(2) + cacheSlot(2) + x(2) + y(2) + w(2) + h(2) = 20 bytes
+ */
+export function parseSurfaceToCache(data) {
+    if (data.length < 20) return null;
+    return {
+        type: 'surfaceToCache',
+        frameId: readU32LE(data, 4),
+        surfaceId: readU16LE(data, 8),
+        cacheSlot: readU16LE(data, 10),
+        x: readI16LE(data, 12),
+        y: readI16LE(data, 14),
+        w: readU16LE(data, 16),
+        h: readU16LE(data, 18),
+    };
+}
+
+/**
+ * Parse evictCache message
+ * Layout: EVCT(4) + frameId(4) + cacheSlot(2) = 10 bytes
+ */
+export function parseEvictCache(data) {
+    if (data.length < 10) return null;
+    return {
+        type: 'evictCache',
+        frameId: readU32LE(data, 4),
+        cacheSlot: readU16LE(data, 8),
+    };
+}
+
+/**
+ * Parse resetGraphics message
+ * Layout: RSGR(4) + width(2) + height(2) = 8 bytes
+ */
+export function parseResetGraphics(data) {
+    if (data.length < 8) return null;
+    return {
+        type: 'resetGraphics',
+        width: readU16LE(data, 4),
+        height: readU16LE(data, 6),
     };
 }
 
@@ -317,12 +402,13 @@ export function parseH264Frame(data) {
 
 /**
  * Build frameAck message
- * Layout: FACK(4) + frameId(4) = 8 bytes
+ * Layout: FACK(4) + frameId(4) + totalFramesDecoded(4) = 12 bytes
  */
-export function buildFrameAck(frameId) {
-    const data = new Uint8Array(8);
+export function buildFrameAck(frameId, totalFramesDecoded) {
+    const data = new Uint8Array(12);
     data.set(Magic.FACK, 0);
     writeU32LE(data, 4, frameId);
+    writeU32LE(data, 8, totalFramesDecoded);
     return data;
 }
 
@@ -335,49 +421,6 @@ export function buildBackpressure(level) {
     data.set(Magic.BPRS, 0);
     data[4] = level;
     return data;
-}
-
-// ============================================================================
-// Legacy delta frame parser
-// ============================================================================
-
-/**
- * Parse legacy DELT frame
- * Layout: DELT(4) + jsonLength(4) + json + webp tiles
- * @returns {Object} { type: 'deltaFrame', rects: [{x, y, size, data}...] }
- */
-export function parseDeltaFrame(data) {
-    if (data.length < 8) return null;
-    
-    const jsonLength = readU32LE(data, 4);
-    if (jsonLength <= 0 || jsonLength > data.length - 8) return null;
-    
-    try {
-        const jsonStr = new TextDecoder().decode(data.subarray(8, 8 + jsonLength));
-        const metadata = JSON.parse(jsonStr);
-        
-        if (!metadata.rects) return null;
-        
-        const tiles = [];
-        let offset = 8 + jsonLength;
-        
-        for (const rect of metadata.rects) {
-            if (offset + rect.size > data.length) break;
-            
-            tiles.push({
-                x: rect.x,
-                y: rect.y,
-                w: rect.w || rect.width,
-                h: rect.h || rect.height,
-                data: data.subarray(offset, offset + rect.size),
-            });
-            offset += rect.size;
-        }
-        
-        return { type: 'deltaFrame', tiles };
-    } catch (e) {
-        return null;
-    }
 }
 
 // ============================================================================
@@ -395,16 +438,20 @@ export function parseMessage(data) {
     switch (type) {
         case 'SURF': return parseCreateSurface(data);
         case 'DELS': return parseDeleteSurface(data);
+        case 'MAPS': return parseMapSurface(data);
         case 'STFR': return parseStartFrame(data);
         case 'ENFR': return parseEndFrame(data);
         case 'PROG': return parseProgressiveTile(data);
         case 'WEBP': return parseWebPTile(data);
         case 'TILE': return parseRawTile(data);
+        case 'CLRC': return parseClearCodecTile(data);
         case 'SFIL': return parseSolidFill(data);
         case 'S2SF': return parseSurfaceToSurface(data);
         case 'C2SF': return parseCacheToSurface(data);
+        case 'S2CH': return parseSurfaceToCache(data);
+        case 'EVCT': return parseEvictCache(data);
+        case 'RSGR': return parseResetGraphics(data);
         case 'H264': return parseH264Frame(data);
-        case 'DELT': return parseDeltaFrame(data);
         default: return null;
     }
 }

@@ -55,9 +55,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+ARG FREERDP_VERSION=3.20.0
+
 # Clone FreeRDP3 stable branch
 WORKDIR /build
-RUN git clone --depth 1 --branch 3.20.0 https://github.com/FreeRDP/FreeRDP.git freerdp
+RUN git clone --depth 1 --branch ${FREERDP_VERSION} https://github.com/FreeRDP/FreeRDP.git freerdp && \
+    echo "FreeRDP ${FREERDP_VERSION} cloned successfully"
 
 # Build FreeRDP3 with H.264/AVC444 support enabled
 # H.264 GFX support requires WITH_FFMPEG=ON which enables WITH_VIDEO_FFMPEG
@@ -128,6 +131,9 @@ ENV LD_LIBRARY_PATH=/opt/freerdp3/lib
 # Copy native source code
 WORKDIR /build
 COPY native/ ./native/
+
+# Rebuild argument to force rebuilds when needed
+ARG REBUILD_NEEDED=0
 
 # Build the libraries against our custom FreeRDP3
 WORKDIR /build/native
@@ -211,14 +217,14 @@ WORKDIR /app
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
+# Rebuild argument to force rebuilds when needed
+ARG REBUILD_NEEDED=0
+
 # Copy requirements first for better caching
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Verify Pillow has WebP support
-RUN python3 -c "from PIL import features; print('WebP support:', features.check('webp'))"
 
 # Copy application code
 COPY *.py ./

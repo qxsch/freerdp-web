@@ -185,11 +185,22 @@ async def handle_binary_message(data: bytes, rdp_bridge: Optional[RDPBridge], cl
     msg_type = get_message_type(data)
     
     if msg_type == 'frameAck':
-        # Frame acknowledgment from browser
+        # Frame acknowledgment from browser - forward to FreeRDP!
+        # This is critical for proper backpressure. The browser sends FACK after
+        # it has decoded and presented the frame. We forward this to FreeRDP which
+        # sends FrameAcknowledge to the RDP server. This tells the server we're
+        # ready for more frames - if the browser is slow, ACKs are delayed and
+        # the server throttles its frame rate.
         parsed = parse_frame_ack(data)
         if parsed and rdp_bridge:
             frame_id = parsed['frame_id']
-            await rdp_bridge.ack_h264_frame(frame_id)
+            total_decoded = parsed['total_frames_decoded']
+            if rdp_bridge.send_frame_ack(frame_id, total_decoded):
+                logger.debug(f"Client {client_id}: Forwarded frame ACK for frame {frame_id} (total decoded: {total_decoded})")
+            else:
+                logger.warning(f"Client {client_id}: Failed to forward frame ACK for frame {frame_id}")
+        elif not rdp_bridge:
+            logger.warning(f"Client {client_id}: Frame ACK received but no RDP bridge active")
             
     elif msg_type == 'backpressure':
         # Backpressure signal from browser - queue is getting full
@@ -224,6 +235,14 @@ async def handle_client(websocket: ServerConnection):
                 msg_type = data.get('type')
                 
                 if msg_type == 'connect':
+                    if not all(k in data for k in ('host', 'username', 'password')):
+                        logger.info(f"Client {client_id} missing required fields for connect")
+                        await websocket.send(json.dumps({
+                            'type': 'error',
+                            'message': 'Failed to connect to RDP host - missing required fields'
+                        }))
+
+
                     # Start RDP session
                     config = RDPConfig(
                         host=data['host'],
@@ -310,10 +329,10 @@ async def handle_client(websocket: ServerConnection):
                     await websocket.send(json.dumps({'type': 'pong'}))
                 
                 elif msg_type == 'ack_frame':
-                    # Acknowledge H.264 frame to prevent server back-pressure
-                    if rdp_bridge:
-                        frame_id = data.get('frame_id', 0)
-                        await rdp_bridge.ack_h264_frame(frame_id)
+                    # Acknowledge H.264 frame - FreeRDP handles this automatically
+                    # Just log for debugging
+                    frame_id = data.get('frame_id', 0)
+                    logger.debug(f"Frame ack received: {frame_id}")
                 
                 else:
                     logger.warning(f"Unknown message type: {msg_type}")

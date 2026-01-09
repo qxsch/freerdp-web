@@ -16,18 +16,9 @@
 extern "C" {
 #endif
 
-/* Maximum dirty rectangles per frame.
- * Increased from 64 to 512 to handle complex repaint scenarios like
- * window de-maximize, where many small tiles need updating.
- * When limit is exceeded, we fall back to full frame update. */
-#define RDP_MAX_DIRTY_RECTS 512
-
 /* GFX pipeline constants */
 #define RDP_MAX_GFX_SURFACES 256
-#define RDP_MAX_GFX_CACHE_SLOTS 4096  /* Max bitmap cache slots for GFX */
-#define RDP_MAX_H264_FRAMES 16
-#define RDP_H264_FRAME_BUFFER_SIZE (2 * 1024 * 1024)  /* 2MB per frame max */
-#define RDP_MAX_GFX_EVENTS 64  /* Max pending GFX lifecycle events */
+#define RDP_MAX_GFX_EVENTS 4096  /* Max pending GFX lifecycle events */
 
 /* Session registry limits (compile-time defaults, runtime configurable) */
 #define RDP_MAX_SESSIONS_DEFAULT 100
@@ -58,7 +49,7 @@ typedef enum {
     RDP_STATE_ERROR
 } RdpState;
 
-/* Dirty rectangle structure */
+/* Rectangle structure (used for GFX frame positioning) */
 typedef struct {
     int32_t x;
     int32_t y;
@@ -86,22 +77,6 @@ typedef enum {
     RDP_H264_FRAME_TYPE_B = 2     /* Bi-predictive frame */
 } RdpH264FrameType;
 
-/* H.264 frame from GFX pipeline */
-typedef struct {
-    uint32_t frame_id;            /* RDP frame ID for acknowledgment */
-    uint16_t surface_id;          /* Target surface ID */
-    RdpGfxCodecId codec_id;       /* Actual codec used (AVC420/AVC444/AVC444v2) */
-    RdpH264FrameType frame_type;  /* IDR/P/B frame */
-    RdpRect dest_rect;            /* Destination rectangle on surface */
-    uint32_t nal_size;            /* Size of NAL units */
-    uint8_t* nal_data;            /* H.264 NAL units (Annex-B format) */
-    /* For AVC444: second chroma stream */
-    uint32_t chroma_nal_size;     /* Size of chroma NAL units (0 for AVC420) */
-    uint8_t* chroma_nal_data;     /* Chroma NAL units for AVC444 */
-    uint64_t timestamp;           /* Capture timestamp (microseconds) */
-    bool needs_ack;               /* Whether frame requires acknowledgment */
-} RdpH264Frame;
-
 /* GFX surface descriptor */
 typedef struct {
     uint16_t surface_id;
@@ -119,10 +94,17 @@ typedef enum {
     RDP_GFX_EVENT_NONE = 0,
     RDP_GFX_EVENT_CREATE_SURFACE,   /* Surface created */
     RDP_GFX_EVENT_DELETE_SURFACE,   /* Surface deleted */
+    RDP_GFX_EVENT_MAP_SURFACE,      /* Map surface to output (3) */
     RDP_GFX_EVENT_START_FRAME,      /* Frame processing started */
     RDP_GFX_EVENT_END_FRAME,        /* Frame processing ended */
     RDP_GFX_EVENT_SOLID_FILL,       /* Solid fill operation */
     RDP_GFX_EVENT_SURFACE_TO_SURFACE, /* Surface copy operation */
+    RDP_GFX_EVENT_CACHE_TO_SURFACE, /* Cache to surface blit */
+    RDP_GFX_EVENT_SURFACE_TO_CACHE, /* Store surface region in cache (9) */
+    RDP_GFX_EVENT_WEBP_TILE,        /* WebP-encoded tile (10) */
+    RDP_GFX_EVENT_VIDEO_FRAME,      /* H.264/Progressive video frame (11) */
+    RDP_GFX_EVENT_EVICT_CACHE,      /* Evict cache slot (12) */
+    RDP_GFX_EVENT_RESET_GRAPHICS,   /* Reset graphics (13) - new dimensions */
 } RdpGfxEventType;
 
 /* GFX event for Python consumption */
@@ -131,14 +113,25 @@ typedef struct {
     uint32_t frame_id;              /* Frame ID (for START_FRAME/END_FRAME) */
     uint16_t surface_id;            /* Surface ID */
     uint16_t dst_surface_id;        /* Destination surface (for SURFACE_TO_SURFACE) */
-    uint32_t width;                 /* Width (for CREATE_SURFACE, SOLID_FILL) */
-    uint32_t height;                /* Height (for CREATE_SURFACE, SOLID_FILL) */
+    uint32_t width;                 /* Width (for CREATE_SURFACE, SOLID_FILL, S2S, S2C, WEBP_TILE) */
+    uint32_t height;                /* Height (for CREATE_SURFACE, SOLID_FILL, S2S, S2C, WEBP_TILE) */
     uint32_t pixel_format;          /* Pixel format (for CREATE_SURFACE) */
-    int32_t x;                      /* X coordinate */
-    int32_t y;                      /* Y coordinate */
+    int32_t x;                      /* X coordinate (dest X for S2S/C2S/WEBP_TILE) */
+    int32_t y;                      /* Y coordinate (dest Y for S2S/C2S/WEBP_TILE) */
     int32_t src_x;                  /* Source X (for SURFACE_TO_SURFACE) */
     int32_t src_y;                  /* Source Y (for SURFACE_TO_SURFACE) */
     uint32_t color;                 /* Fill color (ARGB, for SOLID_FILL) */
+    uint16_t cache_slot;            /* Cache slot (for CACHE_TO_SURFACE, SURFACE_TO_CACHE) */
+    /* Binary data (WebP for WEBP_TILE, unused for S2C - frontend extracts) */
+    uint8_t* bitmap_data;           /* WebP data (caller frees after Python read) */
+    uint32_t bitmap_size;           /* Size of WebP data in bytes */
+    /* Video frame data (for VIDEO_FRAME - H.264/Progressive) */
+    RdpGfxCodecId codec_id;         /* Codec ID (AVC420/AVC444/Progressive) */
+    RdpH264FrameType video_frame_type; /* IDR/P/B for H.264 */
+    uint8_t* nal_data;              /* NAL data (H.264) or Progressive raw data */
+    uint32_t nal_size;              /* Size of NAL/Progressive data */
+    uint8_t* chroma_nal_data;       /* Chroma NAL for AVC444 (NULL for others) */
+    uint32_t chroma_nal_size;       /* Size of chroma NAL (0 for non-AVC444) */
 } RdpGfxEvent;
 
 /* Opaque session handle */
@@ -230,79 +223,6 @@ const char* rdp_get_error(RdpSession* session);
 int rdp_poll(RdpSession* session, int timeout_ms);
 
 /**
- * Lock the frame buffer to prevent reallocation during read
- * 
- * MUST call rdp_unlock_frame_buffer() after reading the buffer!
- * Use this with rdp_get_frame_buffer() for high-performance direct access.
- * 
- * @param session   Session handle
- */
-void rdp_lock_frame_buffer(RdpSession* session);
-
-/**
- * Unlock the frame buffer after reading
- * 
- * @param session   Session handle
- */
-void rdp_unlock_frame_buffer(RdpSession* session);
-
-/**
- * Get pointer to the frame buffer
- * 
- * IMPORTANT: Caller MUST hold lock via rdp_lock_frame_buffer() before calling
- * and call rdp_unlock_frame_buffer() after reading the buffer!
- * 
- * @param session   Session handle
- * @param width     Output: frame width in pixels
- * @param height    Output: frame height in pixels  
- * @param stride    Output: bytes per row (may include padding)
- * @return          Pointer to pixel data, or NULL if not connected
- */
-uint8_t* rdp_get_frame_buffer(
-    RdpSession* session,
-    int* width,
-    int* height,
-    int* stride
-);
-
-/**
- * Get dirty rectangles from the last frame update
- * 
- * Call after rdp_poll() returns 1 to get the changed regions.
- * 
- * @param session       Session handle
- * @param rects         Output array for rectangles
- * @param max_rects     Maximum number of rectangles to return
- * @return              Number of rectangles written, or negative on error
- */
-int rdp_get_dirty_rects(
-    RdpSession* session,
-    RdpRect* rects,
-    int max_rects
-);
-
-/**
- * Clear dirty rectangles after processing
- */
-void rdp_clear_dirty_rects(RdpSession* session);
-
-/**
- * Peek at the current dirty rectangle count without clearing or copying
- * 
- * @return Number of dirty rectangles currently accumulated
- */
-int rdp_peek_dirty_rect_count(RdpSession* session);
-
-/**
- * Check if a full frame refresh is needed
- * 
- * Returns true after connect, resize, or when too many dirty rects accumulated.
- * After calling this, the flag is cleared.
- * Returns false while a GFX frame is in progress.
- */
-bool rdp_needs_full_frame(RdpSession* session);
-
-/**
  * Check if a GFX frame is currently being processed
  * 
  * When true, Python should wait before sending frames to avoid sending
@@ -317,8 +237,7 @@ bool rdp_gfx_frame_in_progress(RdpSession* session);
  * Get the last completed GFX frame ID
  * 
  * Returns the frame ID of the most recently completed GFX frame (after EndFrame).
- * Python can track this to know when new dirty rects are ready to be sent.
- * Only read dirty rects when this value changes from the last check.
+ * Python can track this to know when new GFX events are ready to be streamed.
  * 
  * @return Last completed frame ID, or 0 if no frames completed yet
  */
@@ -520,38 +439,6 @@ bool rdp_gfx_is_active(RdpSession* session);
 RdpGfxCodecId rdp_gfx_get_codec(RdpSession* session);
 
 /**
- * Check if H.264 frames are available
- * 
- * @param session   Session handle
- * @return          Number of frames available (0 if none)
- */
-int rdp_has_h264_frames(RdpSession* session);
-
-/**
- * Get next H.264 frame from the GFX pipeline queue
- * 
- * The frame data is valid until the next call to rdp_get_h264_frame()
- * or rdp_ack_h264_frame(). For AVC444, both nal_data and chroma_nal_data
- * must be combined per MS-RDPEGFX specification.
- * 
- * @param session   Session handle
- * @param frame     Output: frame descriptor (caller must NOT free nal_data)
- * @return          0 on success, -1 if no frames, -2 on error
- */
-int rdp_get_h264_frame(RdpSession* session, RdpH264Frame* frame);
-
-/**
- * Acknowledge an H.264 frame (send RDPGFX_FRAME_ACKNOWLEDGE_PDU)
- * 
- * Must be called after processing each frame to prevent server back-pressure.
- * 
- * @param session   Session handle  
- * @param frame_id  Frame ID from RdpH264Frame.frame_id
- * @return          0 on success, negative on error
- */
-int rdp_ack_h264_frame(RdpSession* session, uint32_t frame_id);
-
-/**
  * Get information about a GFX surface
  * 
  * @param session       Session handle
@@ -568,6 +455,23 @@ int rdp_gfx_get_surface(RdpSession* session, uint16_t surface_id, RdpGfxSurface*
  * @return          Primary surface ID or 0 if not mapped
  */
 uint16_t rdp_gfx_get_primary_surface(RdpSession* session);
+
+/**
+ * Send a frame acknowledgment to the RDP server
+ * 
+ * In wire-through mode, ACKs are sent by the browser after decoding/presenting
+ * frames. This provides proper backpressure - if the browser is slow to decode,
+ * ACKs are delayed and the server throttles its frame rate.
+ * 
+ * Call this when the browser sends a FACK (frame ack) message after compositing
+ * a frame received via the GFX event stream.
+ * 
+ * @param session              Session handle
+ * @param frame_id             Frame ID to acknowledge (from END_FRAME event / browser FACK)
+ * @param total_frames_decoded Running count of frames decoded by browser
+ * @return                     0 on success, -1 on error
+ */
+int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t total_frames_decoded);
 
 /* ============================================================================
  * GFX Event Queue API (for wire format streaming)
@@ -596,6 +500,15 @@ int rdp_gfx_get_event(RdpSession* session, RdpGfxEvent* event);
  * @param session   Session handle
  */
 void rdp_gfx_clear_events(RdpSession* session);
+
+/**
+ * Free GFX event data (WebP tile data allocated by C)
+ * 
+ * Call this after copying bitmap_data from a WEBP_TILE event.
+ * 
+ * @param data      Pointer returned in RdpGfxEvent.bitmap_data
+ */
+void rdp_free_gfx_event_data(void* data);
 
 /**
  * Check if Progressive codec is enabled

@@ -33,19 +33,25 @@
 /* Pixel format - output is always BGRA32 */
 #define RFX_PIXEL_FORMAT_BGRA32 0x20
 
-/* Component codec quant (5 values per component) */
+/* Component codec quant (10 values per component)
+ * Order must match FreeRDP: LL3, HL3, LH3, HH3, HL2, LH2, HH2, HL1, LH1, HH1
+ * IMPORTANT: Note HL comes before LH at each level! */
 typedef struct {
     uint8_t LL3;
-    uint8_t LH3;
     uint8_t HL3;
+    uint8_t LH3;
     uint8_t HH3;
-    uint8_t LH2;
     uint8_t HL2;
+    uint8_t LH2;
     uint8_t HH2;
-    uint8_t LH1;
     uint8_t HL1;
+    uint8_t LH1;
     uint8_t HH1;
 } RfxComponentCodecQuant;
+
+/* Helper macros to access RfxComponentCodecQuant fields by index (0-9) */
+#define QUANT_GET(q, i) (((const uint8_t*)&(q))[i])
+#define QUANT_SET(q, i, v) (((uint8_t*)&(q))[i] = (uint8_t)(v))
 
 /* Progressive codec quant (quality progression) */
 typedef struct {
@@ -81,8 +87,9 @@ typedef struct {
     /* Decoded BGRA pixels (64*64*4 = 16384 bytes) */
     uint8_t* data;
     
-    /* Sign buffer for progressive refinement (64*64*3 = 12288 bytes) */
-    int8_t* sign;
+    /* Sign buffer for progressive refinement (4096*3 int16_t = 24576 bytes)
+     * Using int16_t like FreeRDP for compatibility with upgrade functions */
+    int16_t* sign;
     
     /* Current wavelet coefficients Y/Cb/Cr (64*64*2 = 8192 bytes each) */
     int16_t* yData;
@@ -99,8 +106,18 @@ typedef struct {
     RfxComponentCodecQuant cbProgQuant;
     RfxComponentCodecQuant crProgQuant;
     
-    /* Dirty flag for this frame */
+    /* Per-subband bit positions (quant + progQuant) - updated each pass */
+    RfxComponentCodecQuant yBitPos;
+    RfxComponentCodecQuant cbBitPos;
+    RfxComponentCodecQuant crBitPos;
+    
+    /* Dirty flag - tile was updated this frame and needs to be rendered */
     bool dirty;
+    
+    /* Valid flag - tile has valid decoded content
+     * Set to true after TILE_FIRST decode, false after SYNC/CONTEXT reset.
+     * TILE_UPGRADE should skip tiles with valid=false to avoid refining garbage. */
+    bool valid;
 } RfxTile;
 
 /* Surface context */

@@ -8,10 +8,18 @@
 
 #define BUILD_VERSION "__BUILD_TIME__"
 
+/* DEBUG: Force extrapolate mode for testing
+ * 0 = use server's flag (normal operation)
+ * 1 = force extrapolate=true  (use extrapolated DWT path)
+ * 2 = force extrapolate=false (use non-extrapolated DWT path)
+ */
+#define FORCE_EXTRAPOLATE_MODE 0  /* Normal operation - use server's flag */
+
 #include "rfx_types.h"
 #include <emscripten.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* External functions from other modules */
 extern int rfx_rlgr_decode(const uint8_t* input, size_t inputSize,
@@ -19,10 +27,32 @@ extern int rfx_rlgr_decode(const uint8_t* input, size_t inputSize,
 extern int rfx_srl_decode(const uint8_t* input, size_t inputSize,
                           int16_t* current, int8_t* sign,
                           size_t coeffCount, int bitPos);
+extern int rfx_progressive_upgrade_component(
+    const uint8_t* srlData, size_t srlLen,
+    const uint8_t* rawData, size_t rawLen,
+    int16_t* current, int16_t* sign,
+    const RfxComponentCodecQuant* shift,
+    const RfxComponentCodecQuant* numBits,
+    bool extrapolate);
 extern void rfx_differential_decode(int16_t* buffer, size_t size);
 extern void rfx_dwt_decode(int16_t* buffer, int size);
+extern void rfx_dwt_decode_non_extrapolated(int16_t* buffer, int size);
 extern void rfx_dequantize(int16_t* buffer, const RfxComponentCodecQuant* quant);
+extern void rfx_dequantize_non_extrapolated(int16_t* buffer, const RfxComponentCodecQuant* quant);
 extern void rfx_dequantize_progressive(int16_t* buffer, 
+                                        const RfxComponentCodecQuant* quant,
+                                        const RfxComponentCodecQuant* progQuant);
+extern void rfx_dequantize_progressive_non_extrapolated(int16_t* buffer, 
+                                        const RfxComponentCodecQuant* quant,
+                                        const RfxComponentCodecQuant* progQuant);
+
+/* Partial dequantization for correct extrapolated tile order */
+extern void rfx_dequantize_except_ll3(int16_t* buffer, const RfxComponentCodecQuant* quant);
+extern void rfx_dequantize_ll3_only(int16_t* buffer, const RfxComponentCodecQuant* quant);
+extern void rfx_dequantize_progressive_except_ll3(int16_t* buffer, 
+                                        const RfxComponentCodecQuant* quant,
+                                        const RfxComponentCodecQuant* progQuant);
+extern void rfx_dequantize_progressive_ll3_only(int16_t* buffer, 
                                         const RfxComponentCodecQuant* quant,
                                         const RfxComponentCodecQuant* progQuant);
 extern void rfx_ycbcr_to_rgba(const int16_t* yData, const int16_t* cbData,
@@ -31,6 +61,11 @@ extern void rfx_ycbcr_to_rgba(const int16_t* yData, const int16_t* cbData,
 /* Tile pixel buffer size */
 #define TILE_PIXELS (RFX_TILE_SIZE * RFX_TILE_SIZE)
 #define TILE_BYTES (TILE_PIXELS * 4)
+
+
+
+/* Tile flags */
+#define RFX_TILE_DIFFERENCE 0x01
 
 /* Thread pool configuration */
 #define MAX_WORKER_THREADS 4
@@ -141,6 +176,8 @@ static RfxTile* alloc_tile(uint16_t xIdx, uint16_t yIdx) {
     tile->x = xIdx * RFX_TILE_SIZE;
     tile->y = yIdx * RFX_TILE_SIZE;
     tile->pass = 0;
+    tile->dirty = false;
+    tile->valid = false;  /* Not valid until TILE_FIRST decodes */
     
     /* Allocate pixel data */
     tile->data = (uint8_t*)calloc(TILE_BYTES, 1);
@@ -150,8 +187,9 @@ static RfxTile* alloc_tile(uint16_t xIdx, uint16_t yIdx) {
     tile->cbData = (int16_t*)calloc(TILE_PIXELS, sizeof(int16_t));
     tile->crData = (int16_t*)calloc(TILE_PIXELS, sizeof(int16_t));
     
-    /* Allocate sign buffer for progressive refinement */
-    tile->sign = (int8_t*)calloc(TILE_PIXELS * 3, sizeof(int8_t));
+    /* Allocate sign buffer for progressive refinement
+     * Using int16_t like FreeRDP for compatibility with upgrade functions */
+    tile->sign = (int16_t*)calloc(TILE_PIXELS * 3, sizeof(int16_t));
     
     if (!tile->data || !tile->yData || !tile->cbData || !tile->crData || !tile->sign) {
         free(tile->data);
@@ -238,6 +276,7 @@ void prog_delete_surface(ProgressiveContext* ctx, uint16_t surfaceId) {
 
 /**
  * Reset surface (clear all tiles)
+ * Resets both coefficient state AND pixel data, marking tiles invalid.
  */
 EMSCRIPTEN_KEEPALIVE
 void prog_reset_surface(ProgressiveContext* ctx, uint16_t surfaceId) {
@@ -250,6 +289,7 @@ void prog_reset_surface(ProgressiveContext* ctx, uint16_t surfaceId) {
         if (surface->tiles[i]) {
             surface->tiles[i]->pass = 0;
             surface->tiles[i]->dirty = false;
+            surface->tiles[i]->valid = false;  /* Mark not drawable */
             memset(surface->tiles[i]->data, 0, TILE_BYTES);
             memset(surface->tiles[i]->yData, 0, TILE_PIXELS * sizeof(int16_t));
             memset(surface->tiles[i]->cbData, 0, TILE_PIXELS * sizeof(int16_t));
@@ -385,7 +425,7 @@ static int decode_tile_simple(ProgressiveContext* ctx, RfxSurface* surface,
     uint8_t quantIdxCr = data[2];
     uint16_t xIdx = read_u16_le(data + 3);
     uint16_t yIdx = read_u16_le(data + 5);
-    /* uint8_t flags = data[7]; */
+    uint8_t flags = data[7];
     uint16_t yLen = read_u16_le(data + 8);
     uint16_t cbLen = read_u16_le(data + 10);
     uint16_t crLen = read_u16_le(data + 12);
@@ -412,33 +452,106 @@ static int decode_tile_simple(ProgressiveContext* ctx, RfxSurface* surface,
     RfxComponentCodecQuant* cbQuant = &ctx->quantVals[quantIdxCb];
     RfxComponentCodecQuant* crQuant = &ctx->quantVals[quantIdxCr];
     
-    /* Decode Y component */
+    /* Check if this is a difference tile (sub-band diffing) */
+    bool coeffDiff = (flags & RFX_TILE_DIFFERENCE) != 0;
+    
+    /* Determine LL3 subband offset and size based on extrapolate flag
+     * extrapolate=1: LL3@4015 (81 coefficients, 9x9) - extrapolated tiles
+     * extrapolate=0: LL3@4032 (64 coefficients, 8x8) - non-extrapolated tiles */
+    size_t ll3Offset = ctx->extrapolate ? 4015 : 4032;
+    size_t ll3Size = ctx->extrapolate ? 81 : 64;
+    
+    /* Decode Y component
+     * CRITICAL: Order differs based on extrapolate flag!
+     * Non-extrapolated: RLGR -> differential(LL3) -> dequantize(all)
+     * Extrapolated:     RLGR -> dequantize(except LL3) -> differential(LL3) -> dequantize(LL3) */
     memset(yBuffer, 0, TILE_PIXELS * sizeof(int16_t));
-    memset(cbBuffer, 0, TILE_PIXELS * sizeof(int16_t));
-    memset(crBuffer, 0, TILE_PIXELS * sizeof(int16_t));
     rfx_rlgr_decode(yData, yLen, yBuffer, TILE_PIXELS);
-    rfx_differential_decode(&yBuffer[4015], 81);  /* LL3 subband (extrapolated) */
-    rfx_dequantize(yBuffer, yQuant);
-    rfx_dwt_decode(yBuffer, RFX_TILE_SIZE);
     
-    /* Decode Cb component */
+    if (ctx->extrapolate) {
+        rfx_dequantize_except_ll3(yBuffer, yQuant);
+        rfx_differential_decode(&yBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_ll3_only(yBuffer, yQuant);
+    } else {
+        rfx_differential_decode(&yBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_non_extrapolated(yBuffer, yQuant);
+    }
+    
+    /* Apply sub-band diffing if flag is set */
+    if (coeffDiff && tile->pass > 0) {
+        /* Add decoded coefficients to stored tile coefficients */
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            yBuffer[i] += tile->yData[i];
+        }
+    }
+    /* Store coefficients for future diffing */
+    memcpy(tile->yData, yBuffer, TILE_PIXELS * sizeof(int16_t));
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(yBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(yBuffer, RFX_TILE_SIZE);
+    }
+    
+    /* Decode Cb component - same order as Y */
+    memset(cbBuffer, 0, TILE_PIXELS * sizeof(int16_t));
     rfx_rlgr_decode(cbData, cbLen, cbBuffer, TILE_PIXELS);
-    rfx_differential_decode(&cbBuffer[4015], 81);
-    rfx_dequantize(cbBuffer, cbQuant);
-    rfx_dwt_decode(cbBuffer, RFX_TILE_SIZE);
+    if (ctx->extrapolate) {
+        rfx_dequantize_except_ll3(cbBuffer, cbQuant);
+        rfx_differential_decode(&cbBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_ll3_only(cbBuffer, cbQuant);
+    } else {
+        rfx_differential_decode(&cbBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_non_extrapolated(cbBuffer, cbQuant);
+    }
     
-    /* Decode Cr component */
+    if (coeffDiff && tile->pass > 0) {
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            cbBuffer[i] += tile->cbData[i];
+        }
+    }
+    memcpy(tile->cbData, cbBuffer, TILE_PIXELS * sizeof(int16_t));
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(cbBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(cbBuffer, RFX_TILE_SIZE);
+    }
+    
+    /* Decode Cr component - same order as Y */
+    memset(crBuffer, 0, TILE_PIXELS * sizeof(int16_t));
     rfx_rlgr_decode(crData, crLen, crBuffer, TILE_PIXELS);
-    rfx_differential_decode(&crBuffer[4015], 81);
-    rfx_dequantize(crBuffer, crQuant);
-    rfx_dwt_decode(crBuffer, RFX_TILE_SIZE);
+    if (ctx->extrapolate) {
+        rfx_dequantize_except_ll3(crBuffer, crQuant);
+        rfx_differential_decode(&crBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_ll3_only(crBuffer, crQuant);
+    } else {
+        rfx_differential_decode(&crBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_non_extrapolated(crBuffer, crQuant);
+    }
+    
+    if (coeffDiff && tile->pass > 0) {
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            crBuffer[i] += tile->crData[i];
+        }
+    }
+    memcpy(tile->crData, crBuffer, TILE_PIXELS * sizeof(int16_t));;
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(crBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(crBuffer, RFX_TILE_SIZE);
+    }
+    
+    /* Zero-fill tile RGBA buffer before conversion to detect stale data issues */
+    memset(tile->data, 0, TILE_BYTES);
     
     /* Convert to RGBA */
     rfx_ycbcr_to_rgba(yBuffer, cbBuffer, crBuffer,
                       tile->data, RFX_TILE_SIZE * 4);
     
+
+    
     tile->pass = 1;
     tile->dirty = true;
+    tile->valid = true;  /* Tile now has valid decoded content */
     
     return 0;
 }
@@ -463,7 +576,7 @@ static int decode_tile_first(ProgressiveContext* ctx, RfxSurface* surface,
     uint8_t quantIdxCr = data[2];
     uint16_t xIdx = read_u16_le(data + 3);
     uint16_t yIdx = read_u16_le(data + 5);
-    /* uint8_t flags = data[7]; */
+    uint8_t flags = data[7];
     uint8_t quality = data[8];
     uint16_t yLen = read_u16_le(data + 9);
     uint16_t cbLen = read_u16_le(data + 11);
@@ -494,6 +607,7 @@ static int decode_tile_first(ProgressiveContext* ctx, RfxSurface* surface,
     /* Get progressive quantization values based on quality index */
     /* Quality 0xFF means full quality (use zero progQuant for all subbands) */
     RfxProgressiveCodecQuant* progQuant = NULL;
+    
     if (quality == 0xFF || ctx->numProgQuant == 0) {
         /* Full quality - use zero shift for progressive quant */
         static const RfxProgressiveCodecQuant zeroProgQuant = {{0,0,0,0,0,0,0,0,0,0}, 
@@ -522,50 +636,140 @@ static int decode_tile_first(ProgressiveContext* ctx, RfxSurface* surface,
     /* Note: Extrapolated tiles have LL3 at offset 4015 with 81 coefficients (9x9) */
     /* IMPORTANT: Zero the buffer before RLGR decode for first tiles to ensure any
      * unencoded coefficients are zero (RLGR may not fill all 4096 slots) */
-    memset(tile->yData, 0, TILE_PIXELS * sizeof(int16_t));
-    rfx_rlgr_decode(yData, yLen, tile->yData, TILE_PIXELS);
-    rfx_differential_decode(&tile->yData[4015], 81);  /* LL3 subband (extrapolated) */
     
-    memcpy(yBuffer, tile->yData, TILE_PIXELS * sizeof(int16_t));
-    rfx_dequantize_progressive(yBuffer, &tile->yQuant, &tile->yProgQuant);
+    /* Check if this is a difference tile (sub-band diffing) */
+    bool coeffDiff = (flags & RFX_TILE_DIFFERENCE) != 0;
+    
+    /* Determine LL3 subband offset and size based on extrapolate flag */
+    size_t ll3Offset = ctx->extrapolate ? 4015 : 4032;
+    size_t ll3Size = ctx->extrapolate ? 81 : 64;
+    
+    /* Decode Y component
+     * CRITICAL: Order differs based on extrapolate flag!
+     * Non-extrapolated: RLGR -> differential(LL3) -> dequantize(all)
+     * Extrapolated:     RLGR -> dequantize(except LL3) -> differential(LL3) -> dequantize(LL3)
+     *
+     * ALSO CRITICAL: Must save coefficients after RLGR for progressive upgrades!
+     * FreeRDP copies the entire buffer to sign before dequantization.
+     * The sign values are used to determine: sign > 0 -> read RAW, sign < 0 -> read RAW negated, 
+     * sign == 0 -> read SRL (and store decoded value back to sign). */
+    memset(yBuffer, 0, TILE_PIXELS * sizeof(int16_t));
+    rfx_rlgr_decode(yData, yLen, yBuffer, TILE_PIXELS);
+    
+    /* Copy entire RLGR-decoded buffer to sign (like FreeRDP CopyMemory) */
+    int16_t* ySign = tile->sign;
+    memcpy(ySign, yBuffer, TILE_PIXELS * sizeof(int16_t));
+    
+    if (ctx->extrapolate) {
+        rfx_dequantize_progressive_except_ll3(yBuffer, &tile->yQuant, &tile->yProgQuant);
+        rfx_differential_decode(&yBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_progressive_ll3_only(yBuffer, &tile->yQuant, &tile->yProgQuant);
+    } else {
+        rfx_differential_decode(&yBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_progressive_non_extrapolated(yBuffer, &tile->yQuant, &tile->yProgQuant);
+    }
+    
+    /* Apply sub-band diffing if flag is set and we have previous state */
+    if (coeffDiff && tile->pass > 0) {
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            yBuffer[i] += tile->yData[i];
+        }
+    }
     
     /* CRITICAL: Store dequantized coefficients back to tile->yData for progressive upgrades.
      * FreeRDP stores dequantized coefficients in 'current' buffer between passes.
      * Upgrades add new shifted values to already-dequantized coefficients. */
     memcpy(tile->yData, yBuffer, TILE_PIXELS * sizeof(int16_t));
+
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(yBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(yBuffer, RFX_TILE_SIZE);
+    }
     
-    rfx_dwt_decode(yBuffer, RFX_TILE_SIZE);
+    /* Decode Cb component - same order as Y */
+    memset(cbBuffer, 0, TILE_PIXELS * sizeof(int16_t));
+    rfx_rlgr_decode(cbData, cbLen, cbBuffer, TILE_PIXELS);
     
-    /* Decode Cb component */
-    memset(tile->cbData, 0, TILE_PIXELS * sizeof(int16_t));
-    rfx_rlgr_decode(cbData, cbLen, tile->cbData, TILE_PIXELS);
-    rfx_differential_decode(&tile->cbData[4015], 81);  /* LL3 subband (extrapolated) */
-    memcpy(cbBuffer, tile->cbData, TILE_PIXELS * sizeof(int16_t));
-    rfx_dequantize_progressive(cbBuffer, &tile->cbQuant, &tile->cbProgQuant);
+    /* Copy entire RLGR-decoded buffer to sign (like FreeRDP) */
+    int16_t* cbSign = tile->sign + TILE_PIXELS;
+    memcpy(cbSign, cbBuffer, TILE_PIXELS * sizeof(int16_t));
+    
+    if (ctx->extrapolate) {
+        rfx_dequantize_progressive_except_ll3(cbBuffer, &tile->cbQuant, &tile->cbProgQuant);
+        rfx_differential_decode(&cbBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_progressive_ll3_only(cbBuffer, &tile->cbQuant, &tile->cbProgQuant);
+    } else {
+        rfx_differential_decode(&cbBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_progressive_non_extrapolated(cbBuffer, &tile->cbQuant, &tile->cbProgQuant);
+    }
+    
+    if (coeffDiff && tile->pass > 0) {
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            cbBuffer[i] += tile->cbData[i];
+        }
+    }
     memcpy(tile->cbData, cbBuffer, TILE_PIXELS * sizeof(int16_t));
-    rfx_dwt_decode(cbBuffer, RFX_TILE_SIZE);
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(cbBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(cbBuffer, RFX_TILE_SIZE);
+    }
     
-    /* Decode Cr component */
-    memset(tile->crData, 0, TILE_PIXELS * sizeof(int16_t));
-    rfx_rlgr_decode(crData, crLen, tile->crData, TILE_PIXELS);
-    rfx_differential_decode(&tile->crData[4015], 81);  /* LL3 subband (extrapolated) */
-    memcpy(crBuffer, tile->crData, TILE_PIXELS * sizeof(int16_t));
-    rfx_dequantize_progressive(crBuffer, &tile->crQuant, &tile->crProgQuant);
+    /* Decode Cr component - same order as Y */
+    memset(crBuffer, 0, TILE_PIXELS * sizeof(int16_t));
+    rfx_rlgr_decode(crData, crLen, crBuffer, TILE_PIXELS);
+    
+    /* Copy entire RLGR-decoded buffer to sign (like FreeRDP) */
+    int16_t* crSign = tile->sign + TILE_PIXELS * 2;
+    memcpy(crSign, crBuffer, TILE_PIXELS * sizeof(int16_t));
+    
+    if (ctx->extrapolate) {
+        rfx_dequantize_progressive_except_ll3(crBuffer, &tile->crQuant, &tile->crProgQuant);
+        rfx_differential_decode(&crBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_progressive_ll3_only(crBuffer, &tile->crQuant, &tile->crProgQuant);
+    } else {
+        rfx_differential_decode(&crBuffer[ll3Offset], ll3Size);
+        rfx_dequantize_progressive_non_extrapolated(crBuffer, &tile->crQuant, &tile->crProgQuant);
+    }
+    
+    if (coeffDiff && tile->pass > 0) {
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            crBuffer[i] += tile->crData[i];
+        }
+    }
     memcpy(tile->crData, crBuffer, TILE_PIXELS * sizeof(int16_t));
-    rfx_dwt_decode(crBuffer, RFX_TILE_SIZE);
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(crBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(crBuffer, RFX_TILE_SIZE);
+    }
+    
+    /* Zero-fill tile RGBA buffer before conversion to detect stale data issues */
+    memset(tile->data, 0, TILE_BYTES);
     
     /* Convert to RGBA */
     rfx_ycbcr_to_rgba(yBuffer, cbBuffer, crBuffer,
                       tile->data, RFX_TILE_SIZE * 4);
     
+    /* Save bit positions for progressive upgrades.
+     * bitPos[subband] = quant[subband] + progQuant[subband]
+     * These are used to compute numBits on subsequent upgrades. */
+    for (int s = 0; s < 10; s++) {
+        QUANT_SET(tile->yBitPos, s, QUANT_GET(tile->yQuant, s) + QUANT_GET(tile->yProgQuant, s));
+        QUANT_SET(tile->cbBitPos, s, QUANT_GET(tile->cbQuant, s) + QUANT_GET(tile->cbProgQuant, s));
+        QUANT_SET(tile->crBitPos, s, QUANT_GET(tile->crQuant, s) + QUANT_GET(tile->crProgQuant, s));
+    }
+    
     tile->pass = 1;
     tile->dirty = true;
+    tile->valid = true;  /* Tile now has valid decoded content */
     
     return 0;
 }
 
 /**
- * Decode upgrade progressive tile - thread-safe version
+ * Decode upgrade progressive tile - thread-safe version with per-subband processing
  */
 static int decode_tile_upgrade(ProgressiveContext* ctx, RfxSurface* surface,
                                const uint8_t* data, size_t size) {
@@ -576,12 +780,12 @@ static int decode_tile_upgrade(ProgressiveContext* ctx, RfxSurface* surface,
     int16_t cbBuffer[TILE_PIXELS];
     int16_t crBuffer[TILE_PIXELS];
     
-    /* uint8_t quantIdxY = data[0]; */
-    /* uint8_t quantIdxCb = data[1]; */
-    /* uint8_t quantIdxCr = data[2]; */
+    uint8_t quantIdxY = data[0];
+    uint8_t quantIdxCb = data[1];
+    uint8_t quantIdxCr = data[2];
     uint16_t xIdx = read_u16_le(data + 3);
     uint16_t yIdx = read_u16_le(data + 5);
-    /* uint8_t quality = data[7]; */
+    uint8_t quality = data[7];
     uint16_t ySrlLen = read_u16_le(data + 8);
     uint16_t yRawLen = read_u16_le(data + 10);
     uint16_t cbSrlLen = read_u16_le(data + 12);
@@ -595,12 +799,25 @@ static int decode_tile_upgrade(ProgressiveContext* ctx, RfxSurface* surface,
     const uint8_t* cbSrlData = data + offset; offset += cbSrlLen;
     const uint8_t* cbRawData = data + offset; offset += cbRawLen;
     const uint8_t* crSrlData = data + offset; offset += crSrlLen;
-    /* const uint8_t* crRawData = data + offset; offset += crRawLen; */
+    const uint8_t* crRawData = data + offset; offset += crRawLen;
     
     if (size < offset) return -1;
     
     RfxTile* tile = get_or_create_tile(surface, xIdx, yIdx);
-    if (!tile || tile->pass == 0) return -1;
+    /* Guard: UPGRADE requires a valid prior tile from TILE_FIRST.
+     * If tile was reset by SYNC/CONTEXT, valid=false and we must skip
+     * to avoid refining garbage coefficients. */
+    if (!tile || tile->pass == 0 || !tile->valid) {
+        /* Track skip count and log periodically */
+        static int skipCount = 0;
+        skipCount++;
+        if (skipCount <= 5 || (skipCount % 100 == 0)) {
+            printf("[UPGRADE] SKIP tile (%u,%u): tile=%p pass=%d valid=%d (total skipped=%d)\n", 
+                   xIdx, yIdx, (void*)tile, tile ? tile->pass : -1, 
+                   tile ? tile->valid : 0, skipCount);
+        }
+        return -1;
+    }
     
     /* Track tile index for batch updates */
     uint32_t tileIdx = yIdx * surface->gridWidth + xIdx;
@@ -608,39 +825,106 @@ static int decode_tile_upgrade(ProgressiveContext* ctx, RfxSurface* surface,
         ctx->updatedTileIndices[ctx->numUpdatedTiles++] = tileIdx;
     }
     
-    int bitPos = 6 - tile->pass;
-    if (bitPos < 0) bitPos = 0;
+    /* Get current quantization values for this upgrade pass */
+    RfxComponentCodecQuant yQuant = ctx->quantVals[quantIdxY];
+    RfxComponentCodecQuant cbQuant = ctx->quantVals[quantIdxCb];
+    RfxComponentCodecQuant crQuant = ctx->quantVals[quantIdxCr];
     
-    /* Apply SRL refinement */
-    if (ySrlLen > 0) {
-        rfx_srl_decode(ySrlData, ySrlLen, tile->yData, tile->sign, TILE_PIXELS, bitPos);
-    }
-    if (cbSrlLen > 0) {
-        rfx_srl_decode(cbSrlData, cbSrlLen, tile->cbData, tile->sign + TILE_PIXELS, TILE_PIXELS, bitPos);
-    }
-    if (crSrlLen > 0) {
-        rfx_srl_decode(crSrlData, crSrlLen, tile->crData, tile->sign + TILE_PIXELS * 2, TILE_PIXELS, bitPos);
+    /* Get progressive quantization values based on quality index */
+    RfxComponentCodecQuant yProgQuant, cbProgQuant, crProgQuant;
+    if (quality == 0xFF || quality >= ctx->numProgQuant) {
+        /* Full quality - use zero shift for progressive quant */
+        memset(&yProgQuant, 0, sizeof(yProgQuant));
+        memset(&cbProgQuant, 0, sizeof(cbProgQuant));
+        memset(&crProgQuant, 0, sizeof(crProgQuant));
+    } else {
+        RfxProgressiveCodecQuant* progQuant = &ctx->quantProgVals[quality];
+        yProgQuant = progQuant->yQuant;
+        cbProgQuant = progQuant->cbQuant;
+        crProgQuant = progQuant->crQuant;
     }
     
-    /* Apply RAW updates if present */
-    (void)yRawData;
-    (void)cbRawData;
-    (void)crRawLen;
-    /* RAW data is currently ignored - full implementation would merge RAW coefficients */
+    /* Compute shift = quant + progQuant - 1 and numBits = oldBitPos - newBitPos for each subband */
+    RfxComponentCodecQuant yShift, cbShift, crShift;
+    RfxComponentCodecQuant yNumBits, cbNumBits, crNumBits;
+    for (int s = 0; s < 10; s++) {
+        /* shift = quant + progQuant - 1 (but not less than 0) */
+        int yS = QUANT_GET(yQuant, s) + QUANT_GET(yProgQuant, s) - 1;
+        int cbS = QUANT_GET(cbQuant, s) + QUANT_GET(cbProgQuant, s) - 1;
+        int crS = QUANT_GET(crQuant, s) + QUANT_GET(crProgQuant, s) - 1;
+        QUANT_SET(yShift, s, (yS > 0) ? yS : 0);
+        QUANT_SET(cbShift, s, (cbS > 0) ? cbS : 0);
+        QUANT_SET(crShift, s, (crS > 0) ? crS : 0);
+        
+        /* newBitPos = quant + progQuant (for this pass) */
+        int yNewBitPos = QUANT_GET(yQuant, s) + QUANT_GET(yProgQuant, s);
+        int cbNewBitPos = QUANT_GET(cbQuant, s) + QUANT_GET(cbProgQuant, s);
+        int crNewBitPos = QUANT_GET(crQuant, s) + QUANT_GET(crProgQuant, s);
+        
+        /* numBits = oldBitPos - newBitPos (how many bits to decode for this subband) */
+        QUANT_SET(yNumBits, s, QUANT_GET(tile->yBitPos, s) - yNewBitPos);
+        QUANT_SET(cbNumBits, s, QUANT_GET(tile->cbBitPos, s) - cbNewBitPos);
+        QUANT_SET(crNumBits, s, QUANT_GET(tile->crBitPos, s) - crNewBitPos);
+        
+        /* Update stored bitPos for next upgrade pass */
+        QUANT_SET(tile->yBitPos, s, yNewBitPos);
+        QUANT_SET(tile->cbBitPos, s, cbNewBitPos);
+        QUANT_SET(tile->crBitPos, s, crNewBitPos);
+    }
+    
+    /* Apply per-subband progressive upgrade with SRL + RAW streams */
+    if (ySrlLen > 0 || yRawLen > 0) {
+        rfx_progressive_upgrade_component(ySrlData, ySrlLen, yRawData, yRawLen,
+                                          tile->yData, tile->sign,
+                                          &yShift, &yNumBits, ctx->extrapolate);
+    }
+    if (cbSrlLen > 0 || cbRawLen > 0) {
+        rfx_progressive_upgrade_component(cbSrlData, cbSrlLen, cbRawData, cbRawLen,
+                                          tile->cbData, tile->sign + TILE_PIXELS,
+                                          &cbShift, &cbNumBits, ctx->extrapolate);
+    }
+    if (crSrlLen > 0 || crRawLen > 0) {
+        rfx_progressive_upgrade_component(crSrlData, crSrlLen, crRawData, crRawLen,
+                                          tile->crData, tile->sign + TILE_PIXELS * 2,
+                                          &crShift, &crNumBits, ctx->extrapolate);
+    }
+    
+    /* Update stored quant/progQuant for potential future use */
+    tile->yQuant = yQuant;
+    tile->cbQuant = cbQuant;
+    tile->crQuant = crQuant;
+    tile->yProgQuant = yProgQuant;
+    tile->cbProgQuant = cbProgQuant;
+    tile->crProgQuant = crProgQuant;
     
     /* Reconstruct tile from updated coefficients - use stack-allocated buffers.
-     * IMPORTANT: tile->*Data now contains DEQUANTIZED coefficients from first pass.
-     * SRL decode has already added shifted values. Do NOT call rfx_dequantize_progressive
+     * IMPORTANT: tile->*Data now contains DEQUANTIZED coefficients.
+     * Upgrade has already added shifted values. Do NOT call rfx_dequantize_progressive
      * again - that would shift the already-shifted coefficients! */
     memcpy(yBuffer, tile->yData, TILE_PIXELS * sizeof(int16_t));
     /* Note: coefficients are already dequantized, go straight to DWT */
-    rfx_dwt_decode(yBuffer, RFX_TILE_SIZE);
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(yBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(yBuffer, RFX_TILE_SIZE);
+    }
     
     memcpy(cbBuffer, tile->cbData, TILE_PIXELS * sizeof(int16_t));
-    rfx_dwt_decode(cbBuffer, RFX_TILE_SIZE);
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(cbBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(cbBuffer, RFX_TILE_SIZE);
+    }
     
     memcpy(crBuffer, tile->crData, TILE_PIXELS * sizeof(int16_t));
-    rfx_dwt_decode(crBuffer, RFX_TILE_SIZE);
+    if (ctx->extrapolate) {
+        rfx_dwt_decode(crBuffer, RFX_TILE_SIZE);
+    } else {
+        rfx_dwt_decode_non_extrapolated(crBuffer, RFX_TILE_SIZE);
+    }
+    
+    /* Zero-fill tile RGBA buffer before conversion to detect stale data issues */
+    memset(tile->data, 0, TILE_BYTES);
     
     rfx_ycbcr_to_rgba(yBuffer, cbBuffer, crBuffer,
                       tile->data, RFX_TILE_SIZE * 4);
@@ -670,7 +954,15 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
      * Bit 0 (0x01) = RFX_DWT_REDUCE_EXTRAPOLATE:
      * If extrapolate=1: LL3@4015 (81 coefficients, 9x9)
      * If extrapolate=0: LL3@4032 (64 coefficients, 8x8) - DIFFERENT LAYOUT! */
+#if FORCE_EXTRAPOLATE_MODE == 1
+    ctx->extrapolate = true;  /* FORCED: extrapolated path */
+    printf("[PROG] FORCE_EXTRAPOLATE_MODE=1: Using extrapolated DWT (server sent flags=0x%02x)\n", flags);
+#elif FORCE_EXTRAPOLATE_MODE == 2
+    ctx->extrapolate = false;  /* FORCED: non-extrapolated path */
+    printf("[PROG] FORCE_EXTRAPOLATE_MODE=2: Using non-extrapolated DWT (server sent flags=0x%02x)\n", flags);
+#else
     ctx->extrapolate = (flags & 0x01) ? true : false;
+#endif
     
     size_t offset = 12;
     
@@ -691,7 +983,8 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
     offset += progQuantBytes;
     ctx->numProgQuant = numProgQuant;
 
-    /* Process tiles */
+    /* Process tiles - count types for diagnostics */
+    uint16_t countSimple = 0, countFirst = 0, countUpgrade = 0;
     for (uint16_t i = 0; i < numTiles; i++) {
         if (offset + 6 > size) break;
         
@@ -706,19 +999,40 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
         switch (blockType) {
             case PROGRESSIVE_WBT_TILE_SIMPLE:
                 decode_tile_simple(ctx, surface, tileData, tileSize);
+                countSimple++;
                 break;
             case PROGRESSIVE_WBT_TILE_FIRST:
                 decode_tile_first(ctx, surface, tileData, tileSize);
+                countFirst++;
                 break;
             case PROGRESSIVE_WBT_TILE_UPGRADE:
                 decode_tile_upgrade(ctx, surface, tileData, tileSize);
+                countUpgrade++;
+                break;
+            default:
+                /* Log unexpected block types (once) */
+                {
+                    static int unknownCount = 0;
+                    if (unknownCount++ < 3) {
+                        printf("[PROG] Unknown blockType=0x%04X len=%u\n", blockType, blockLen);
+                    }
+                }
                 break;
         }
         
         offset += blockLen;
     }
     
+    /* Validate tile count like FreeRDP does */
+    uint16_t totalTiles = countSimple + countFirst + countUpgrade;
+    if (totalTiles != numTiles) {
+        printf("[PROG] WARNING: tile count mismatch: parsed=%u expected=%u (simple=%u first=%u upgrade=%u)\n",
+               totalTiles, numTiles, countSimple, countFirst, countUpgrade);
+    }
+    
     (void)tileDataSize;
+    (void)countFirst;
+    (void)countUpgrade;
     return 0;
 }
 
@@ -767,7 +1081,12 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
         
         switch (blockType) {
             case PROGRESSIVE_WBT_SYNC:
-                /* Validate sync block: blockLen=12, magic=0xCACCACCA, version=0x0100 */
+                /* WBT_SYNC: State reset + resynchronization point
+                 * - Ensures decoder and encoder states do not diverge
+                 * - Invalidates previous cached progressive tile state
+                 * - Inserted when a new sequence of progressive tiles begins
+                 * 
+                 * Validate sync block: blockLen=12, magic=0xCACCACCA, version=0x0100 */
                 if (blockLen == 12 && blockDataSize >= 6) {
                     uint32_t magic = read_u32_le(blockData);
                     uint16_t version = read_u16_le(blockData + 4);
@@ -779,6 +1098,33 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
                         printf("[PROG] SYNC: bad version 0x%04X\n", version);
                         return -1;
                     }
+                    
+                    /* Reset progressive state for the current surface
+                     * This clears all cached tile coefficient data AND pixel data
+                     * to prevent stale progressive state from causing artifacts.
+                     * Per RFX/GFX protocol: When codec state resets, pixel cache
+                     * must also be invalidated since old pixels were decoded with
+                     * old codec parameters. */
+                    if (surface) {
+                        uint32_t resetCount = 0;
+                        for (uint32_t i = 0; i < surface->gridSize; i++) {
+                            if (surface->tiles[i]) {
+                                surface->tiles[i]->pass = 0;
+                                surface->tiles[i]->dirty = false;
+                                surface->tiles[i]->valid = false;  /* Mark not drawable */
+                                /* Reset BOTH coefficient buffers AND pixel data */
+                                memset(surface->tiles[i]->data, 0, TILE_BYTES);
+                                memset(surface->tiles[i]->yData, 0, TILE_PIXELS * sizeof(int16_t));
+                                memset(surface->tiles[i]->cbData, 0, TILE_PIXELS * sizeof(int16_t));
+                                memset(surface->tiles[i]->crData, 0, TILE_PIXELS * sizeof(int16_t));
+                                memset(surface->tiles[i]->sign, 0, TILE_PIXELS * 3);
+                                resetCount++;
+                            }
+                        }
+                        printf("[PROG] SYNC: Reset %u tiles (coefficients + pixels + valid) for surface %u (frame %u)\n", 
+                               resetCount, surfaceId, frameId);
+                    }
+                    
                     ctx->state |= FLAG_WBT_SYNC;
                 }
                 break;
@@ -826,7 +1172,8 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
 
 /**
  * Get tile pixel data for rendering
- * Returns pointer to tile's RGBA data, or NULL if tile doesn't exist/not dirty
+ * Returns pointer to tile's RGBA data, or NULL if tile doesn't exist, not dirty, or not valid.
+ * Invalid tiles (after SYNC/CONTEXT reset) are skipped to avoid showing stale content.
  */
 EMSCRIPTEN_KEEPALIVE
 uint8_t* prog_get_tile_data(ProgressiveContext* ctx, uint16_t surfaceId,
@@ -841,7 +1188,32 @@ uint8_t* prog_get_tile_data(ProgressiveContext* ctx, uint16_t surfaceId,
     uint32_t idx = yIdx * surface->gridWidth + xIdx;
     RfxTile* tile = surface->tiles[idx];
     
-    if (!tile || !tile->dirty) return NULL;
+    /* Skip if tile doesn't exist, not dirty, or not valid (reset by SYNC/CONTEXT) */
+    if (!tile || !tile->dirty || !tile->valid) return NULL;
+    
+    return tile->data;
+}
+
+/**
+ * Get tile pixel data FORCE - returns data even if not dirty
+ * Used for repaint after surface recreate where we need to redraw all tiles
+ * Returns pointer to tile's RGBA data, or NULL if tile doesn't exist or has no data
+ */
+EMSCRIPTEN_KEEPALIVE
+uint8_t* prog_get_tile_data_force(ProgressiveContext* ctx, uint16_t surfaceId,
+                                  uint16_t xIdx, uint16_t yIdx) {
+    if (!ctx || surfaceId >= RFX_MAX_SURFACES) return NULL;
+    
+    RfxSurface* surface = ctx->surfaces[surfaceId];
+    if (!surface) return NULL;
+    
+    if (xIdx >= surface->gridWidth || yIdx >= surface->gridHeight) return NULL;
+    
+    uint32_t idx = yIdx * surface->gridWidth + xIdx;
+    RfxTile* tile = surface->tiles[idx];
+    
+    // Return data even if not dirty - but only if tile and data exist
+    if (!tile || !tile->data) return NULL;
     
     return tile->data;
 }
@@ -954,6 +1326,16 @@ EMSCRIPTEN_KEEPALIVE
 int prog_is_frame_complete(ProgressiveContext* ctx) {
     if (!ctx) return 0;
     return (ctx->state & FLAG_WBT_FRAME_END) ? 1 : 0;
+}
+
+/**
+ * Get current extrapolate flag (for debugging)
+ * Returns 1 if extrapolate mode, 0 if non-extrapolate
+ */
+EMSCRIPTEN_KEEPALIVE
+int prog_get_extrapolate(ProgressiveContext* ctx) {
+    if (!ctx) return -1;
+    return ctx->extrapolate ? 1 : 0;
 }
 
 /* ============================================================================
@@ -1125,9 +1507,26 @@ static int decode_region_parallel(ProgressiveContext* ctx, RfxSurface* surface,
     uint16_t numRects = read_u16_le(data + 1);
     uint8_t numQuant = data[3];
     uint8_t numProgQuant = data[4];
-    /* uint8_t flags = data[5]; */
+    uint8_t flags = data[5];
     uint16_t numTiles = read_u16_le(data + 6);
     uint32_t tileDataSize = read_u32_le(data + 8);
+    
+    /* Store extrapolate flag in context for use by tile decoders
+     * Bit 0 (0x01) = RFX_DWT_REDUCE_EXTRAPOLATE */
+#if FORCE_EXTRAPOLATE_MODE == 1
+    ctx->extrapolate = true;  /* FORCED: extrapolated path */
+    printf("[PROG-PAR] FORCE_EXTRAPOLATE_MODE=1: Using extrapolated DWT (server sent flags=0x%02x)\n", flags);
+#elif FORCE_EXTRAPOLATE_MODE == 2
+    ctx->extrapolate = false;  /* FORCED: non-extrapolated path */
+    printf("[PROG-PAR] FORCE_EXTRAPOLATE_MODE=2: Using non-extrapolated DWT (server sent flags=0x%02x)\n", flags);
+#else
+    ctx->extrapolate = (flags & 0x01) ? true : false;
+    
+    /* IMPORTANT: Non-extrapolated tiles require different subband layout! */
+    if (!ctx->extrapolate) {
+        printf("[PROG] WARNING: Non-extrapolated tiles detected (flags=0x%02x) - may cause artifacts!\n", flags);
+    }
+#endif
     
     size_t offset = 12;
     
@@ -1149,6 +1548,7 @@ static int decode_region_parallel(ProgressiveContext* ctx, RfxSurface* surface,
     ctx->numProgQuant = numProgQuant;
     
     /* Submit tiles to worker threads */
+    uint16_t tilesSubmitted = 0;
     for (uint16_t i = 0; i < numTiles; i++) {
         if (offset + 6 > size) break;
         
@@ -1164,9 +1564,16 @@ static int decode_region_parallel(ProgressiveContext* ctx, RfxSurface* surface,
             blockType == PROGRESSIVE_WBT_TILE_FIRST ||
             blockType == PROGRESSIVE_WBT_TILE_UPGRADE) {
             submit_tile_job(ctx, surface, tileData, tileSize, blockType);
+            tilesSubmitted++;
         }
         
         offset += blockLen;
+    }
+    
+    /* Validate tile count like FreeRDP does */
+    if (tilesSubmitted != numTiles) {
+        printf("[PROG-PARALLEL] WARNING: tile count mismatch: submitted=%u expected=%u\n",
+               tilesSubmitted, numTiles);
     }
     
     (void)tileDataSize;
@@ -1207,6 +1614,9 @@ int prog_decompress_parallel(ProgressiveContext* ctx, const uint8_t* srcData,
     
     size_t offset = 0;
     
+    /* Reset updated tile tracking for new frame */
+    ctx->numUpdatedTiles = 0;
+    
     while (offset + 6 <= srcSize) {
         uint16_t blockType = read_u16_le(srcData + offset);
         uint32_t blockLen = read_u32_le(srcData + offset + 2);
@@ -1218,10 +1628,71 @@ int prog_decompress_parallel(ProgressiveContext* ctx, const uint8_t* srcData,
         
         switch (blockType) {
             case PROGRESSIVE_WBT_SYNC:
+                /* WBT_SYNC: State reset + resynchronization point
+                 * Reset progressive state for the current surface - MUST match serial version! */
+                if (blockLen == 12 && blockDataSize >= 6) {
+                    uint32_t magic = read_u32_le(blockData);
+                    uint16_t version = read_u16_le(blockData + 4);
+                    if (magic != 0xCACCACCA) {
+                        printf("[PROG-PARALLEL] SYNC: bad magic 0x%08X\n", magic);
+                        return -1;
+                    }
+                    if (version != 0x0100) {
+                        printf("[PROG-PARALLEL] SYNC: bad version 0x%04X\n", version);
+                        return -1;
+                    }
+                    
+                    /* Reset all tiles - matching serial prog_decompress behavior exactly */
+                    uint32_t resetCount = 0;
+                    for (uint32_t i = 0; i < surface->gridSize; i++) {
+                        if (surface->tiles[i]) {
+                            surface->tiles[i]->pass = 0;
+                            surface->tiles[i]->dirty = false;
+                            surface->tiles[i]->valid = false;  /* CRITICAL: Mark not drawable */
+                            /* Reset BOTH coefficient buffers AND pixel data */
+                            memset(surface->tiles[i]->data, 0, TILE_BYTES);
+                            memset(surface->tiles[i]->yData, 0, TILE_PIXELS * sizeof(int16_t));
+                            memset(surface->tiles[i]->cbData, 0, TILE_PIXELS * sizeof(int16_t));
+                            memset(surface->tiles[i]->crData, 0, TILE_PIXELS * sizeof(int16_t));
+                            memset(surface->tiles[i]->sign, 0, TILE_PIXELS * 3);
+                            resetCount++;
+                        }
+                    }
+                    printf("[PROG-PARALLEL] SYNC: Reset %u tiles (coefficients + pixels + valid) for surface %u (frame %u)\n", 
+                           resetCount, surfaceId, frameId);
+                    
+                    ctx->state |= FLAG_WBT_SYNC;
+                }
+                break;
+                
             case PROGRESSIVE_WBT_FRAME_BEGIN:
+                /* Parse frame begin: blockLen=12, frameIndex (u32), regionCount (u16) */
+                if (blockLen == 12 && blockDataSize >= 6) {
+                    ctx->frameIndex = read_u32_le(blockData);
+                    ctx->regionCount = read_u16_le(blockData + 4);
+                    ctx->state |= FLAG_WBT_FRAME_BEGIN;
+                    ctx->state &= ~FLAG_WBT_FRAME_END;
+                }
+                break;
+                
             case PROGRESSIVE_WBT_FRAME_END:
+                /* Frame end: blockLen=6, no payload */
+                ctx->state |= FLAG_WBT_FRAME_END;
+                ctx->state &= ~FLAG_WBT_FRAME_BEGIN;
+                break;
+                
             case PROGRESSIVE_WBT_CONTEXT:
-                /* These are processed synchronously */
+                /* Parse context: blockLen=10, ctxId (u8), tileSize (u16), flags (u8) */
+                if (blockLen == 10 && blockDataSize >= 4) {
+                    ctx->ctxId = blockData[0];
+                    ctx->tileSize = read_u16_le(blockData + 1);
+                    ctx->ctxFlags = blockData[3];
+                    if (ctx->tileSize != 64) {
+                        printf("[PROG-PARALLEL] CONTEXT: bad tileSize %u\n", ctx->tileSize);
+                        return -1;
+                    }
+                    ctx->state |= FLAG_WBT_CONTEXT;
+                }
                 break;
                 
             case PROGRESSIVE_WBT_REGION:

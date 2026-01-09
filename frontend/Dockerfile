@@ -1,5 +1,5 @@
-# RDP Web Client Frontend - Progressive WASM Decoder Build
-# Multi-stage build: compile Progressive codec WASM with Emscripten, serve with nginx
+# RDP Web Client Frontend - Progressive & ClearCodec WASM Decoder Build
+# Multi-stage build: compile WASM decoders with Emscripten, serve with nginx
 #
 # NOTE: Keep FreeRDP version in sync with backend/Dockerfile (currently 3.20.0)
 
@@ -13,12 +13,16 @@ WORKDIR /build
 # Copy Progressive codec sources
 COPY progressive/ ./progressive/
 
+# Copy ClearCodec codec sources
+COPY clearcodec/ ./clearcodec/
+
 # Inject build timestamp into source files
 RUN BUILD_TIME=$(date +%H:%M:%S) && \
     sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" ./progressive/progressive_wasm.c && \
+    sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" ./clearcodec/clearcodec_wasm.c && \
     echo "Build time: $BUILD_TIME"
 
-# Build WASM with optimizations, SIMD, and pthreads for parallel tile decoding
+# Build Progressive WASM with optimizations, SIMD, and pthreads for parallel tile decoding
 WORKDIR /build/progressive
 RUN mkdir -p build && \
     emcc -O3 -msimd128 -pthread \
@@ -26,18 +30,38 @@ RUN mkdir -p build && \
         -s MODULARIZE=1 \
         -s EXPORT_ES6=1 \
         -s EXPORT_NAME="ProgressiveDecoderModule" \
-        -s EXPORTED_FUNCTIONS="['_prog_create','_prog_free','_prog_create_surface','_prog_delete_surface','_prog_decompress','_prog_decompress_parallel','_prog_get_tile_data','_prog_get_dirty_tile_count','_prog_get_dirty_tile_info','_malloc','_free']" \
+        -s EXPORTED_FUNCTIONS="['_prog_create','_prog_free','_prog_create_surface','_prog_delete_surface','_prog_decompress','_prog_decompress_parallel','_prog_get_tile_data','_prog_get_dirty_tile_count','_prog_get_dirty_tile_info','_prog_get_extrapolate','_malloc','_free']" \
         -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap','getValue','setValue']" \
         -s USE_PTHREADS=1 \
         -s PTHREAD_POOL_SIZE=4 \
         -s ALLOW_MEMORY_GROWTH=1 \
-        -s INITIAL_MEMORY=33554432 \
+        -s INITIAL_MEMORY=67108864 \
         -s STACK_SIZE=1048576 \
         -s ENVIRONMENT='web,worker' \
         -I. \
         rfx_rlgr.c rfx_dwt.c rfx_decode.c progressive_wasm.c \
         -o build/progressive_decoder.js && \
     echo "Progressive WASM decoder built successfully with pthread support" && \
+    ls -la build/
+
+# Build ClearCodec WASM decoder (no pthreads needed - simpler codec)
+WORKDIR /build/clearcodec
+RUN mkdir -p build && \
+    emcc -O3 -msimd128 \
+        -s WASM=1 \
+        -s MODULARIZE=1 \
+        -s EXPORT_ES6=1 \
+        -s EXPORT_NAME="ClearCodecDecoderModule" \
+        -s EXPORTED_FUNCTIONS="['_clear_create','_clear_free','_clear_context_reset','_clear_decompress','_clear_alloc_output','_clear_free_output','_malloc','_free']" \
+        -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap','getValue','setValue']" \
+        -s ALLOW_MEMORY_GROWTH=1 \
+        -s INITIAL_MEMORY=16777216 \
+        -s STACK_SIZE=1048576 \
+        -s ENVIRONMENT='web,worker' \
+        -I. \
+        clearcodec_wasm.c \
+        -o build/clearcodec_decoder.js && \
+    echo "ClearCodec WASM decoder built successfully" && \
     ls -la build/
 
 # ==============================================================================
@@ -57,10 +81,14 @@ RUN BUILD_TIME=$(date +%H:%M:%S) && \
     sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" /usr/share/nginx/html/gfx-worker.js && \
     echo "gfx-worker.js build time: $BUILD_TIME"
 
-# Copy built WASM from builder stage (includes pthread worker)
+# Copy built WASM from builder stage (includes pthread worker for progressive)
 COPY --from=wasm-builder /build/progressive/build/progressive_decoder.js /usr/share/nginx/html/progressive/
 COPY --from=wasm-builder /build/progressive/build/progressive_decoder.wasm /usr/share/nginx/html/progressive/
 COPY --from=wasm-builder /build/progressive/build/progressive_decoder.worker.js /usr/share/nginx/html/progressive/
+
+# Copy ClearCodec WASM
+COPY --from=wasm-builder /build/clearcodec/build/clearcodec_decoder.js /usr/share/nginx/html/clearcodec/
+COPY --from=wasm-builder /build/clearcodec/build/clearcodec_decoder.wasm /usr/share/nginx/html/clearcodec/
 
 # Custom nginx config with COOP/COEP headers
 COPY nginx.conf /etc/nginx/conf.d/default.conf

@@ -22,6 +22,9 @@ pkg_check_modules(LIBAVCODEC REQUIRED libavcodec)
 pkg_check_modules(LIBAVUTIL REQUIRED libavutil)
 pkg_check_modules(LIBSWSCALE REQUIRED libswscale)
 
+# libwebp for encoding tiles (ClearCodec, Uncompressed, Planar → WebP)
+pkg_check_modules(LIBWEBP REQUIRED libwebp)
+
 # ==============================================================================
 # Main RDP Bridge Library
 # ==============================================================================
@@ -40,6 +43,7 @@ target_include_directories(rdp_bridge PRIVATE
     ${LIBAVCODEC_INCLUDE_DIRS}
     ${LIBAVUTIL_INCLUDE_DIRS}
     ${LIBSWSCALE_INCLUDE_DIRS}
+    ${LIBWEBP_INCLUDE_DIRS}
 )
 
 # Link directories
@@ -51,6 +55,7 @@ target_link_directories(rdp_bridge PRIVATE
     ${LIBAVCODEC_LIBRARY_DIRS}
     ${LIBAVUTIL_LIBRARY_DIRS}
     ${LIBSWSCALE_LIBRARY_DIRS}
+    ${LIBWEBP_LIBRARY_DIRS}
 )
 
 # Link libraries
@@ -62,6 +67,7 @@ target_link_libraries(rdp_bridge PRIVATE
     ${LIBAVCODEC_LIBRARIES}
     ${LIBAVUTIL_LIBRARIES}
     ${LIBSWSCALE_LIBRARIES}
+    ${LIBWEBP_LIBRARIES}
     pthread
     dl
 )
@@ -75,6 +81,7 @@ target_compile_options(rdp_bridge PRIVATE
     ${LIBAVCODEC_CFLAGS_OTHER}
     ${LIBAVUTIL_CFLAGS_OTHER}
     ${LIBSWSCALE_CFLAGS_OTHER}
+    ${LIBWEBP_CFLAGS_OTHER}
     -Wall
     -Wextra
     -O2

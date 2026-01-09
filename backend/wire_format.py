@@ -20,6 +20,7 @@ class Magic:
     # Surface management
     SURF = b'SURF'  # createSurface
     DELS = b'DELS'  # deleteSurface
+    MAPS = b'MAPS'  # mapSurfaceToOutput
     
     # Frame lifecycle
     STFR = b'STFR'  # startFrame
@@ -29,11 +30,15 @@ class Magic:
     PROG = b'PROG'  # progressive tile
     WEBP = b'WEBP'  # WebP tile
     TILE = b'TILE'  # raw RGBA tile
+    CLRC = b'CLRC'  # ClearCodec tile (raw wire data for WASM decoding)
     
     # Surface operations
     SFIL = b'SFIL'  # solidFill
     S2SF = b'S2SF'  # surfaceToSurface
     C2SF = b'C2SF'  # cacheToSurface
+    S2CH = b'S2CH'  # surfaceToCache (frontend stores in its cache)
+    EVCT = b'EVCT'  # evictCache (frontend deletes cache slot)
+    RSGR = b'RSGR'  # resetGraphics (frontend resets all state)
     
     # Video
     H264 = b'H264'  # H.264 NAL
@@ -42,8 +47,7 @@ class Magic:
     FACK = b'FACK'  # frameAck
     BPRS = b'BPRS'  # backpressure
     
-    # Legacy format compatibility
-    DELT = b'DELT'  # delta frame (existing format)
+    # Audio
     OPUS = b'OPUS'  # Opus audio
     AUDI = b'AUDI'  # raw audio
 
@@ -91,6 +95,23 @@ def build_delete_surface(surface_id: int) -> bytes:
     return struct.pack('<4sH', Magic.DELS, surface_id)
 
 
+def build_map_surface_to_output(surface_id: int, output_x: int = 0, output_y: int = 0) -> bytes:
+    """
+    Build mapSurfaceToOutput message.
+    
+    Layout: MAPS(4) + surfaceId(2) + outputX(2) + outputY(2) = 10 bytes
+    
+    Args:
+        surface_id: Surface to map to primary output
+        output_x: X position on output (usually 0)
+        output_y: Y position on output (usually 0)
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sHHH', Magic.MAPS, surface_id, output_x, output_y)
+
+
 def build_start_frame(frame_id: int) -> bytes:
     """
     Build startFrame message.
@@ -119,6 +140,183 @@ def build_end_frame(frame_id: int) -> bytes:
         Binary message ready to send via WebSocket
     """
     return struct.pack('<4sI', Magic.ENFR, frame_id)
+
+
+def build_solid_fill(frame_id: int, surface_id: int,
+                     x: int, y: int, w: int, h: int,
+                     color: int) -> bytes:
+    """
+    Build solidFill message.
+    
+    Layout: SFIL(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + color(4) = 22 bytes
+    
+    Args:
+        frame_id: Frame sequence number
+        surface_id: Target surface
+        x, y: Destination coordinates
+        w, h: Fill dimensions
+        color: Fill color (BGRA32)
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sIHhhHHI',
+                       Magic.SFIL,
+                       frame_id,
+                       surface_id,
+                       x, y, w, h,
+                       color)
+
+
+def build_surface_to_surface(frame_id: int, src_surface_id: int, dst_surface_id: int,
+                             src_x: int, src_y: int, src_w: int, src_h: int,
+                             dst_x: int, dst_y: int) -> bytes:
+    """
+    Build surfaceToSurface message.
+    
+    Layout: S2SF(4) + frameId(4) + srcSurfaceId(2) + dstSurfaceId(2) + 
+            srcX(2) + srcY(2) + srcW(2) + srcH(2) + dstX(2) + dstY(2) = 24 bytes
+    
+    Args:
+        frame_id: Frame sequence number
+        src_surface_id: Source surface
+        dst_surface_id: Destination surface
+        src_x, src_y: Source coordinates
+        src_w, src_h: Source dimensions
+        dst_x, dst_y: Destination coordinates
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sIHHhhHHhh',
+                       Magic.S2SF,
+                       frame_id,
+                       src_surface_id,
+                       dst_surface_id,
+                       src_x, src_y, src_w, src_h,
+                       dst_x, dst_y)
+
+
+def build_surface_to_cache(frame_id: int, surface_id: int, cache_slot: int,
+                           x: int, y: int, w: int, h: int) -> bytes:
+    """
+    Build surfaceToCache message.
+    
+    Tells frontend to extract pixels from surface and store in its local cache.
+    Layout: S2CH(4) + frameId(4) + surfaceId(2) + cacheSlot(2) + 
+            x(2) + y(2) + w(2) + h(2) = 20 bytes
+    
+    Args:
+        frame_id: Frame sequence number
+        surface_id: Source surface
+        cache_slot: Cache slot to store in (0-4095)
+        x, y: Source rectangle origin
+        w, h: Source rectangle dimensions
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sIHHhhHH',
+                       Magic.S2CH,
+                       frame_id,
+                       surface_id,
+                       cache_slot,
+                       x, y, w, h)
+
+
+def build_cache_to_surface(frame_id: int, surface_id: int, cache_slot: int,
+                           dst_x: int, dst_y: int) -> bytes:
+    """
+    Build cacheToSurface message.
+    
+    Tells frontend to blit from its local cache to a surface.
+    Layout: C2SF(4) + frameId(4) + surfaceId(2) + cacheSlot(2) + 
+            dstX(2) + dstY(2) = 16 bytes
+    
+    Args:
+        frame_id: Frame sequence number
+        surface_id: Destination surface
+        cache_slot: Cache slot to read from
+        dst_x, dst_y: Destination coordinates
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sIHHhh',
+                       Magic.C2SF,
+                       frame_id,
+                       surface_id,
+                       cache_slot,
+                       dst_x, dst_y)
+
+
+def build_evict_cache(frame_id: int, cache_slot: int) -> bytes:
+    """
+    Build evictCache message.
+    
+    Tells frontend to delete a cache slot.
+    Layout: EVCT(4) + frameId(4) + cacheSlot(2) = 10 bytes
+    
+    Args:
+        frame_id: Frame sequence number
+        cache_slot: Cache slot to evict
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sIH',
+                       Magic.EVCT,
+                       frame_id,
+                       cache_slot)
+
+
+def build_reset_graphics(width: int, height: int) -> bytes:
+    """
+    Build resetGraphics message.
+    
+    Tells frontend to reset all state (surfaces, cache, progressive decoder).
+    Layout: RSGR(4) + width(2) + height(2) = 8 bytes
+    
+    Args:
+        width: New display width
+        height: New display height
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sHH',
+                       Magic.RSGR,
+                       width,
+                       height)
+
+
+def build_clearcodec_tile(frame_id: int, surface_id: int,
+                          x: int, y: int, w: int, h: int,
+                          data: bytes) -> bytes:
+    """
+    Build ClearCodec tile message.
+    
+    Layout: CLRC(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + 
+            dataSize(4) + data
+    Total header: 22 bytes
+    
+    Args:
+        frame_id: Frame sequence number
+        surface_id: Target surface
+        x, y: Destination coordinates on surface
+        w, h: Tile dimensions
+        data: ClearCodec compressed data (raw wire data for WASM decoding)
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    header = struct.pack('<4sIHHHHHI',
+                         Magic.CLRC,
+                         frame_id,
+                         surface_id,
+                         x, y, w, h,
+                         len(data))
+    return header + data
 
 
 def build_progressive_tile(frame_id: int, surface_id: int,
@@ -208,99 +406,6 @@ def build_raw_tile(frame_id: int, surface_id: int,
     return header + data
 
 
-def build_solid_fill(frame_id: int, surface_id: int,
-                     color: int, rects: list) -> bytes:
-    """
-    Build solidFill message.
-    
-    Layout: SFIL(4) + frameId(4) + surfaceId(2) + color(4) + rectCount(2) +
-            [x(2) + y(2) + w(2) + h(2)] * rectCount
-    Base header: 16 bytes + 8 bytes per rect
-    
-    Args:
-        frame_id: Frame sequence number
-        surface_id: Target surface
-        color: Fill color (ARGB32)
-        rects: List of (x, y, w, h) tuples
-    
-    Returns:
-        Binary message ready to send via WebSocket
-    """
-    header = struct.pack('<4sIHIH',
-                         Magic.SFIL,
-                         frame_id,
-                         surface_id,
-                         color,
-                         len(rects))
-    
-    rect_data = b''.join(
-        struct.pack('<HHHH', r[0], r[1], r[2], r[3]) 
-        for r in rects
-    )
-    
-    return header + rect_data
-
-
-def build_surface_to_surface(frame_id: int, 
-                              src_surface_id: int, dst_surface_id: int,
-                              src_x: int, src_y: int,
-                              dst_x: int, dst_y: int,
-                              w: int, h: int) -> bytes:
-    """
-    Build surfaceToSurface message.
-    
-    Layout: S2SF(4) + frameId(4) + srcSurfaceId(2) + dstSurfaceId(2) +
-            srcX(2) + srcY(2) + dstX(2) + dstY(2) + w(2) + h(2) = 24 bytes
-    
-    Args:
-        frame_id: Frame sequence number
-        src_surface_id: Source surface
-        dst_surface_id: Destination surface
-        src_x, src_y: Source coordinates
-        dst_x, dst_y: Destination coordinates
-        w, h: Copy region dimensions
-    
-    Returns:
-        Binary message ready to send via WebSocket
-    """
-    return struct.pack('<4sIHHHHHHHH',
-                       Magic.S2SF,
-                       frame_id,
-                       src_surface_id,
-                       dst_surface_id,
-                       src_x, src_y,
-                       dst_x, dst_y,
-                       w, h)
-
-
-def build_cache_to_surface(frame_id: int, surface_id: int, cache_slot: int,
-                            dst_x: int, dst_y: int,
-                            w: int, h: int) -> bytes:
-    """
-    Build cacheToSurface message.
-    
-    Layout: C2SF(4) + frameId(4) + surfaceId(2) + cacheSlot(2) +
-            dstX(2) + dstY(2) + w(2) + h(2) = 20 bytes
-    
-    Args:
-        frame_id: Frame sequence number
-        surface_id: Target surface
-        cache_slot: Source cache slot index
-        dst_x, dst_y: Destination coordinates
-        w, h: Region dimensions
-    
-    Returns:
-        Binary message ready to send via WebSocket
-    """
-    return struct.pack('<4sIHHHHHH',
-                       Magic.C2SF,
-                       frame_id,
-                       surface_id,
-                       cache_slot,
-                       dst_x, dst_y,
-                       w, h)
-
-
 def build_h264_frame(frame_id: int, surface_id: int, codec_id: int,
                      frame_type: int, x: int, y: int, w: int, h: int,
                      nal_data: bytes, chroma_data: bytes = b'') -> bytes:
@@ -345,7 +450,7 @@ def parse_frame_ack(data: bytes) -> Optional[dict]:
     """
     Parse frameAck message from browser.
     
-    Layout: FACK(4) + frameId(4) = 8 bytes
+    Layout: FACK(4) + frameId(4) + totalFramesDecoded(4) = 12 bytes
     
     Args:
         data: Binary message from WebSocket
@@ -353,15 +458,16 @@ def parse_frame_ack(data: bytes) -> Optional[dict]:
     Returns:
         Parsed message dict or None if invalid
     """
-    if len(data) < 8:
+    if len(data) < 12:
         return None
     if data[:4] != Magic.FACK:
         return None
     
-    frame_id = struct.unpack('<I', data[4:8])[0]
+    frame_id, total_decoded = struct.unpack('<II', data[4:12])
     return {
         'type': 'frameAck',
-        'frame_id': frame_id
+        'frame_id': frame_id,
+        'total_frames_decoded': total_decoded
     }
 
 
@@ -419,7 +525,6 @@ def get_message_type(data: bytes) -> Optional[str]:
         Magic.H264: 'h264Frame',
         Magic.FACK: 'frameAck',
         Magic.BPRS: 'backpressure',
-        Magic.DELT: 'deltaFrame',
         Magic.OPUS: 'opusAudio',
         Magic.AUDI: 'rawAudio',
     }

@@ -634,6 +634,12 @@ export class RDPClient {
                 return;
             }
 
+            // host, user and pass are required
+            if (!credentials.host || !credentials.user || !credentials.pass) {
+                reject(new Error('Missing required connection fields: host, user, pass'));
+                return;
+            }
+
             this._pendingConnect = { resolve, reject };
             this._updateStatus('connecting', 'Connecting...');
             this._el.loading.querySelector('p').textContent = 'Connecting...';

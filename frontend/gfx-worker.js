@@ -2,10 +2,15 @@
  * GFX Compositor Worker
  * 
  * Handles off-main-thread rendering of RDP graphics:
- * - Progressive tile decoding via WASM
+ * - Progressive tile decoding via WASM (RFX Progressive codec)
+ * - H.264 decoding via VideoDecoder API (AVC420/AVC444)
  * - WebP tile decoding via createImageBitmap
  * - Surface management and composition
  * - Frame lifecycle and acknowledgment
+ * 
+ * IMPORTANT: Strict message ordering is guaranteed by processing messages
+ * sequentially through a queue. No message is processed until the previous
+ * one completes (including async operations like H.264 decode).
  */
 
 const BUILD_VERSION = '__BUILD_TIME__';
@@ -17,6 +22,38 @@ import {
 } from './wire-format.js';
 
 // ============================================================================
+// Message Queue for Strict Ordering
+// ============================================================================
+
+/** @type {Array} Queue of pending messages */
+const messageQueue = [];
+
+/** @type {boolean} Whether we're currently processing a message */
+let isProcessing = false;
+
+/**
+ * Add message to queue and process if not already processing.
+ * Ensures strict sequential processing of all messages.
+ */
+async function enqueueMessage(msg) {
+    messageQueue.push(msg);
+    
+    // If already processing, the current processor will pick up this message
+    if (isProcessing) return;
+    
+    isProcessing = true;
+    while (messageQueue.length > 0) {
+        const next = messageQueue.shift();
+        try {
+            await processMessage(next);
+        } catch (err) {
+            console.error('[GFX Worker] Error processing message:', err);
+        }
+    }
+    isProcessing = false;
+}
+
+// ============================================================================
 // State
 // ============================================================================
 
@@ -26,8 +63,23 @@ let wasmModule = null;
 /** @type {number|null} Progressive decoder context pointer */
 let progCtx = null;
 
+/** @type {Object|null} ClearCodec WASM module instance */
+let clearWasmModule = null;
+
+/** @type {number|null} ClearCodec decoder context pointer */
+let clearCtx = null;
+
+/** @type {boolean} Whether ClearCodec WASM is ready */
+let clearWasmReady = false;
+
 /** @type {Map<number, Surface>} Surface ID → surface state */
 const surfaces = new Map();
+
+/** 
+ * Cache slot → cached bitmap entry (for SurfaceToCache/CacheToSurface)
+ * Enhanced with source tracking for debugging cache corruption issues
+ */
+const bitmapCache = new Map();
 
 /** @type {OffscreenCanvas|null} Primary render target */
 let primaryCanvas = null;
@@ -41,6 +93,9 @@ let primarySurfaceId = null;
 /** @type {number|null} Current frame being processed */
 let currentFrameId = null;
 
+/** @type {Set<number>} Surfaces updated in the current frame */
+let frameUpdatedSurfaces = new Set();
+
 /** @type {boolean} Whether WASM is ready */
 let wasmReady = false;
 
@@ -49,6 +104,9 @@ let pendingOps = 0;
 
 /** @type {number} Max pending ops before backpressure */
 const MAX_PENDING_OPS = 64;
+
+/** @type {number} Total frames decoded - sent in FACK for MS-RDPEGFX compliance */
+let totalFramesDecoded = 0;
 
 // ============================================================================
 // Codec IDs (matching rdp_bridge.h RdpGfxCodecId enum)
@@ -92,6 +150,201 @@ let h264DecoderError = false;
 let h264NeedsKeyframe = true;
 
 // ============================================================================
+// Debugging toggles
+// ============================================================================
+
+/** 
+ * CACHE_BYPASS: Skip SurfaceToCache/CacheToSurface entirely.
+ * If artifacts vanish with this enabled, the cache path is implicated.
+ */
+const CACHE_BYPASS = false;  // Confirmed cache is not the issue
+
+/**
+ * FORCE_SINGLE_THREADED: Disable parallel WASM decode to rule out threading issues.
+ * If artifacts vanish with this enabled, there's a race condition in parallel decode.
+ */
+const FORCE_SINGLE_THREADED = true;  // Confirmed threading is not the issue
+
+/**
+ * FORCE_ALPHA_255: Force all WebP decoded pixels to have alpha=255.
+ * If stripes disappear with this enabled, the issue is alpha corruption in WebP pipeline.
+ */
+const FORCE_ALPHA_255 = false;  // DISABLED - was making stripes worse (black instead of transparent)
+
+/**
+ * FRAME_ORDER_DIAG: Log every operation within a frame to diagnose ordering issues.
+ * Shows exact sequence of tile draws vs cache operations.
+ */
+const FRAME_ORDER_DIAG = true;
+
+/** @type {number} Frame order log limit */
+let frameOrderLogCount = 0;
+const FRAME_ORDER_LOG_LIMIT = 200;
+
+/** @type {Array} Operations in current frame for order diagnosis */
+let frameOrderOps = [];
+
+// ============================================================================
+// Stripe Detection Diagnostics (for debugging horizontal stripe artifacts)
+// ============================================================================
+
+/** @type {boolean} Enable stripe detection logging */
+const STRIPE_DIAG_ENABLED = true;
+
+/** @type {number} Number of tiles to check - SEPARATE counters for WebP vs Progressive */
+let stripeDiagCountProg = 0;
+let stripeDiagCountWebP = 0;
+const STRIPE_DIAG_MAX = 10;  // Per source type
+
+/** @type {boolean} Dump raw pixel values for first stripe tile */
+const STRIPE_PIXEL_DUMP = true;
+let stripePixelDumpDone = false;
+
+/**
+ * ALPHA DIAGNOSTIC: Check for alpha channel corruption in tile
+ * Logs ALL tiles, not just stripe-detected ones, to catch alpha issues
+ * Returns object with alpha statistics if issues found
+ */
+let alphaDiagCount = 0;
+const ALPHA_DIAG_MAX = 20;
+
+function checkAlphaCorruption(pixelData, tileX, tileY, source) {
+    if (!STRIPE_DIAG_ENABLED || alphaDiagCount >= ALPHA_DIAG_MAX) return null;
+    
+    const pixelCount = pixelData.length / 4;
+    let zeroAlphaCount = 0;
+    let partialAlphaCount = 0;
+    let fullAlphaCount = 0;
+    let alphaRowIssues = [];
+    
+    // Check alpha values
+    for (let i = 0; i < pixelData.length; i += 4) {
+        const alpha = pixelData[i + 3];
+        if (alpha === 0) zeroAlphaCount++;
+        else if (alpha === 255) fullAlphaCount++;
+        else partialAlphaCount++;
+    }
+    
+    // Check for rows with mostly zero alpha (corrupted rows)
+    const width = Math.sqrt(pixelCount);
+    if (Number.isInteger(width)) {
+        for (let y = 0; y < width; y++) {
+            let rowZeroAlpha = 0;
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                if (pixelData[idx + 3] === 0) rowZeroAlpha++;
+            }
+            if (rowZeroAlpha > width * 0.5) {
+                alphaRowIssues.push({ row: y, zeroCount: rowZeroAlpha });
+            }
+        }
+    }
+    
+    // For WebP tiles, ALWAYS log alpha stats for first few tiles (even if no issue)
+    if (source === 'WebP' && alphaDiagCount < 5) {
+        alphaDiagCount++;
+        console.warn(`[ALPHA DIAG] ${source} tile (${tileX},${tileY}) ${Math.sqrt(pixelCount)}x${Math.sqrt(pixelCount)}: ` +
+            `alpha=0: ${zeroAlphaCount} (${(zeroAlphaCount/pixelCount*100).toFixed(1)}%), ` +
+            `alpha=255: ${fullAlphaCount} (${(fullAlphaCount/pixelCount*100).toFixed(1)}%), ` +
+            `partial: ${partialAlphaCount}`);
+        return { zeroAlphaCount, partialAlphaCount, fullAlphaCount, alphaRowIssues };
+    }
+    
+    // Report if there's suspicious alpha corruption
+    const hasIssue = zeroAlphaCount > pixelCount * 0.1 || alphaRowIssues.length > 0;
+    if (hasIssue) {
+        alphaDiagCount++;
+        console.warn(`[ALPHA DIAG] ${source} tile (${tileX},${tileY}): ` +
+            `alpha=0: ${zeroAlphaCount}/${pixelCount} (${(zeroAlphaCount/pixelCount*100).toFixed(1)}%), ` +
+            `alpha=255: ${fullAlphaCount}, partial: ${partialAlphaCount}, ` +
+            `rowIssues: ${alphaRowIssues.length}`);
+        if (alphaRowIssues.length > 0 && alphaRowIssues.length <= 10) {
+            console.warn(`[ALPHA DIAG] Rows with >50% zero alpha:`, alphaRowIssues);
+        }
+        return { zeroAlphaCount, partialAlphaCount, fullAlphaCount, alphaRowIssues };
+    }
+    
+    return null;
+}
+
+/**
+ * Detect horizontal stripe patterns in a tile's pixel data.
+ * Now takes a 'source' parameter to track WebP vs Progressive separately.
+ * 
+ * @param {Uint8ClampedArray} pixelData - RGBA pixel data
+ * @param {number} tileX - X coordinate for logging
+ * @param {number} tileY - Y coordinate for logging
+ * @param {string} source - 'WebP' or 'PROG' to track separately
+ * @returns {Object|null} Stripe info if detected, null otherwise
+ */
+function detectStripes(pixelData, tileX, tileY, source = 'PROG') {
+    // Use separate counters for WebP vs Progressive
+    const isWebP = source === 'WebP';
+    const currentCount = isWebP ? stripeDiagCountWebP : stripeDiagCountProg;
+    if (!STRIPE_DIAG_ENABLED || currentCount >= STRIPE_DIAG_MAX) return null;
+    
+    const width = 64;
+    const height = 64;
+    const rowBrightness = new Float32Array(height);
+    
+    // Calculate average brightness per row
+    for (let y = 0; y < height; y++) {
+        let sum = 0;
+        for (let x = 0; x < width; x++) {
+            const idx = (y * width + x) * 4;
+            // Luminance: 0.299R + 0.587G + 0.114B
+            sum += pixelData[idx] * 0.299 + pixelData[idx+1] * 0.587 + pixelData[idx+2] * 0.114;
+        }
+        rowBrightness[y] = sum / width;
+    }
+    
+    // Detect sudden brightness changes (potential stripes)
+    const stripeRows = [];
+    const threshold = 30; // Brightness difference threshold
+    
+    for (let y = 1; y < height; y++) {
+        const diff = Math.abs(rowBrightness[y] - rowBrightness[y-1]);
+        if (diff > threshold) {
+            stripeRows.push({ row: y, diff: diff.toFixed(1), 
+                prev: rowBrightness[y-1].toFixed(1), 
+                curr: rowBrightness[y].toFixed(1) });
+        }
+    }
+    
+    // Check for repeating pattern (e.g., every 8 or 16 rows)
+    if (stripeRows.length >= 3) {
+        if (isWebP) stripeDiagCountWebP++; else stripeDiagCountProg++;
+        
+        const pattern = stripeRows.map(s => s.row);
+        const gaps = [];
+        for (let i = 1; i < pattern.length; i++) {
+            gaps.push(pattern[i] - pattern[i-1]);
+        }
+        
+        console.warn(`[STRIPE DIAG ${source}] Tile (${tileX},${tileY}): ${stripeRows.length} potential stripe rows:`, 
+            stripeRows, `gaps:`, gaps);
+        
+        // For the FIRST stripe tile of each type, dump first 8 pixel values per row
+        const dumpCount = isWebP ? stripeDiagCountWebP : stripeDiagCountProg;
+        if (dumpCount === 1) {
+            console.warn(`[STRIPE DIAG ${source}] === Pixel dump for first ${source} stripe tile (R,G,B,A) ===`);
+            for (let y = 0; y < 16; y++) {
+                const rowPixels = [];
+                for (let x = 0; x < 8; x++) {
+                    const idx = (y * 64 + x) * 4;
+                    rowPixels.push(`(${pixelData[idx]},${pixelData[idx+1]},${pixelData[idx+2]},${pixelData[idx+3]})`);
+                }
+                console.warn(`  Row ${y}: ${rowPixels.join(' ')}`);
+            }
+        }
+        
+        return { rows: stripeRows, pattern: gaps };
+    }
+    
+    return null;
+}
+
+// ============================================================================
 // Surface management
 // ============================================================================
 
@@ -105,7 +358,15 @@ let h264NeedsKeyframe = true;
  */
 
 /**
+ * Track last deleted surface info for potential preservation
+ * Used to preserve WASM Progressive state when surface is immediately recreated
+ */
+let lastDeletedSurface = null;
+
+/**
  * Create a new surface
+ * Per RFX/GFX protocol: Surface create always starts with fresh progressive state.
+ * The server will send new TILE_FIRST data for any tiles it wants to render.
  */
 function createSurface(surfaceId, width, height) {
     // Delete existing if present
@@ -115,8 +376,9 @@ function createSurface(surfaceId, width, height) {
     
     const canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext('2d', { 
-        alpha: false,
-        desynchronized: true  // Reduce latency
+        alpha: true,  // Enable alpha for proper UI compositing with transparency
+        desynchronized: true,  // Reduce latency
+        willReadFrequently: true  // Optimize for SurfaceToCache getImageData calls
     });
     
     // Fill with black initially
@@ -131,24 +393,52 @@ function createSurface(surfaceId, width, height) {
         ctx
     });
     
-    // Create surface in WASM progressive decoder
+    // Always create fresh WASM Progressive state for new surfaces
+    // Per RFX/GFX protocol: Surface lifecycle = Progressive codec lifecycle
+    // The server will send fresh TILE_FIRST data, not UPGRADE tiles expecting old state
     if (wasmReady && progCtx) {
+        // Delete any existing WASM state (may exist from previous surface with same ID)
+        wasmModule._prog_delete_surface(progCtx, surfaceId);
         wasmModule._prog_create_surface(progCtx, surfaceId, width, height);
+        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height} (fresh Progressive state)`);
+    } else {
+        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height}`);
     }
     
-    console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height}`);
+    // Clear the last deleted surface info (no longer needed for preservation logic)
+    lastDeletedSurface = null;
 }
 
 /**
  * Delete a surface
+ * Per RFX/GFX protocol: When surface is deleted, BOTH the surface cache (JS canvas)
+ * AND the progressive codec state (WASM) must be cleared together.
+ * They are tied - you cannot have valid progressive state without a valid surface.
  */
 function deleteSurface(surfaceId) {
     const surface = surfaces.get(surfaceId);
     if (!surface) return;
     
+    // Store info about deleted surface (for logging/debugging purposes only)
+    lastDeletedSurface = {
+        id: surfaceId,
+        width: surface.width,
+        height: surface.height,
+        timestamp: Date.now()
+    };
+    
+    // Delete JS surface cache
     surfaces.delete(surfaceId);
     
-    // Delete from WASM
+    // Remove from frameUpdatedSurfaces tracking
+    frameUpdatedSurfaces.delete(surfaceId);
+    
+    // NOTE: Do NOT evict bitmap cache entries here!
+    // The RDP bitmap cache is independent of surfaces. Cache entries survive
+    // surface delete/recreate. The server explicitly sends EvictCacheEntry PDU
+    // when it wants to invalidate cache slots.
+    
+    // Delete WASM Progressive state - per protocol, both caches die together
     if (wasmReady && progCtx) {
         wasmModule._prog_delete_surface(progCtx, surfaceId);
     }
@@ -157,7 +447,7 @@ function deleteSurface(surfaceId) {
         primarySurfaceId = null;
     }
     
-    console.log(`[GFX Worker] Deleted surface ${surfaceId}`);
+    console.log(`[GFX Worker] Deleted surface ${surfaceId} (both JS canvas and WASM Progressive state cleared)`);
 }
 
 /**
@@ -201,7 +491,10 @@ async function initWasm() {
                     return './progressive/' + path;
                 }
                 return path;
-            }
+            },
+            // Capture printf/stderr from WASM code
+            print: (text) => console.log('[WASM]', text),
+            printErr: (text) => console.warn('[WASM-ERR]', text)
         });
         
         // Create progressive context
@@ -219,12 +512,58 @@ async function initWasm() {
         }
         
         wasmReady = true;
-        console.log(`[GFX Worker] Progressive WASM decoder initialized (parallel: ${parallelDecompressAvailable})`);
+        const effectiveParallel = parallelDecompressAvailable && !FORCE_SINGLE_THREADED;
+        console.log(`[GFX Worker] Progressive WASM decoder initialized (parallel: ${parallelDecompressAvailable}, FORCE_SINGLE_THREADED: ${FORCE_SINGLE_THREADED}, effective: ${effectiveParallel})`);
         
     } catch (err) {
         console.warn('[GFX Worker] Progressive WASM not available:', err.message);
         console.warn('[GFX Worker] Progressive tiles will not be decoded');
         wasmReady = false;
+    }
+}
+
+/**
+ * Initialize ClearCodec decoder WASM module
+ */
+async function initClearCodecWasm() {
+    try {
+        // Dynamic import of the ClearCodec WASM module
+        const module = await import('./clearcodec/clearcodec_decoder.js');
+        
+        // Emscripten MODULARIZE exports the factory as default
+        const ModuleFactory = module.default;
+        
+        if (typeof ModuleFactory !== 'function') {
+            throw new Error('ClearCodec WASM module factory not found in exports');
+        }
+        
+        // Initialize WASM
+        clearWasmModule = await ModuleFactory({
+            // Help Emscripten find the wasm file
+            locateFile: (path) => {
+                if (path.endsWith('.wasm')) {
+                    return './clearcodec/' + path;
+                }
+                return path;
+            },
+            // Capture printf/stderr from WASM code
+            print: (text) => console.log('[CLEAR-WASM]', text),
+            printErr: (text) => console.warn('[CLEAR-WASM-ERR]', text)
+        });
+        
+        // Create ClearCodec context (session-level, shared across all surfaces)
+        clearCtx = clearWasmModule._clear_create();
+        if (!clearCtx) {
+            throw new Error('Failed to create ClearCodec decoder context');
+        }
+        
+        clearWasmReady = true;
+        console.log('[GFX Worker] ClearCodec WASM decoder initialized');
+        
+    } catch (err) {
+        console.warn('[GFX Worker] ClearCodec WASM not available:', err.message);
+        console.warn('[GFX Worker] ClearCodec tiles will not be decoded');
+        clearWasmReady = false;
     }
 }
 
@@ -242,11 +581,18 @@ function decodeProgressiveTile(msg) {
         return;
     }
     
-    const surface = surfaces.get(msg.surfaceId);
+    let surface = surfaces.get(msg.surfaceId);
+    let actualSurfaceId = msg.surfaceId;
+    
     if (!surface) {
-        console.warn(`[GFX Worker] Unknown surface ${msg.surfaceId}`);
+        // Surface was deleted - discard stale data for it
+        // Do NOT apply to a different surface (would cause wrong content like login screen on desktop)
+        console.warn(`[GFX Worker] Discarding Progressive data for deleted surface ${msg.surfaceId}`);
         return;
     }
+    
+    // Track that this surface was updated in the current frame
+    frameUpdatedSurfaces.add(actualSurfaceId);
     
     const payload = msg.payload;
     
@@ -255,16 +601,18 @@ function decodeProgressiveTile(msg) {
     wasmModule.HEAPU8.set(payload, inputPtr);
     
     // Use parallel decompress when available for better performance with many tiles
+    // FORCE_SINGLE_THREADED overrides to test for race conditions
     let result;
-    if (parallelDecompressAvailable) {
+    const useParallel = parallelDecompressAvailable && !FORCE_SINGLE_THREADED;
+    if (useParallel) {
         result = wasmModule._prog_decompress_parallel(
             progCtx, inputPtr, payload.byteLength, 
-            msg.surfaceId, msg.frameId
+            actualSurfaceId, msg.frameId
         );
     } else {
         result = wasmModule._prog_decompress(
             progCtx, inputPtr, payload.byteLength, 
-            msg.surfaceId, msg.frameId
+            actualSurfaceId, msg.frameId
         );
     }
     
@@ -278,12 +626,22 @@ function decodeProgressiveTile(msg) {
     // Check frame state - only render when frame is complete
     const frameComplete = wasmModule._prog_is_frame_complete(progCtx);
     
+    // Debug: get extrapolate flag for analysis
+    const extrapolate = wasmModule._prog_get_extrapolate ? wasmModule._prog_get_extrapolate(progCtx) : -1;
+    
     // Use new batch tile tracking API for efficient iteration
     const updatedCount = wasmModule._prog_get_updated_tile_count(progCtx);
     
     // Skip rendering if no tiles updated
     if (updatedCount === 0) {
         return;
+    }
+    
+    // Log extrapolate flag to diagnose which decode path is used
+    // extrapolate=0: non-extrapolated (LL3@4032, 64 coeffs)
+    // extrapolate=1: extrapolated (LL3@4015, 81 coeffs)
+    if (updatedCount > 0 && stripeDiagCountProg === 0) {
+        console.warn(`[PROG DIAG] Frame ${msg.frameId}: extrapolate=${extrapolate}, tiles=${updatedCount}`);
     }
     
     let tilesDrawn = 0;
@@ -306,7 +664,7 @@ function decodeProgressiveTile(msg) {
             const tileY = yIdx * 64;
             
             // Get tile pixel data
-            const tileDataPtr = wasmModule._prog_get_tile_data(progCtx, msg.surfaceId, xIdx, yIdx);
+            const tileDataPtr = wasmModule._prog_get_tile_data(progCtx, actualSurfaceId, xIdx, yIdx);
             if (!tileDataPtr) {
                 continue;
             }
@@ -316,23 +674,118 @@ function decodeProgressiveTile(msg) {
             const tileH = Math.min(64, surface.height - tileY);
             
             // Create ImageData from WASM memory
+            // IMPORTANT: Use wasmModule.HEAPU8.buffer directly - Emscripten updates this after memory growth
+            // We must copy the data because WASM memory can be resized/detached
             const tileSize = 64 * 64 * 4;
-            const pixelData = new Uint8ClampedArray(
-                wasmModule.HEAPU8.buffer, tileDataPtr, tileSize
-            );
             
-            // Note: we need to copy because the WASM buffer may be detached/resized
-            const imageData = new ImageData(
-                new Uint8ClampedArray(pixelData), 64, 64
-            );
+            // Safety check: ensure pointer is within WASM memory bounds
+            const wasmBuffer = wasmModule.HEAPU8.buffer;
+            if (tileDataPtr + tileSize > wasmBuffer.byteLength) {
+                console.error(`[GFX Worker] Tile data pointer out of bounds: ${tileDataPtr} + ${tileSize} > ${wasmBuffer.byteLength}`);
+                continue;
+            }
+            
+            // Create a fresh view and immediately copy to avoid stale buffer issues
+            const pixelData = new Uint8ClampedArray(wasmBuffer, tileDataPtr, tileSize);
+            const copiedData = new Uint8ClampedArray(tileSize);
+            copiedData.set(pixelData);
+            
+            // Stripe detection diagnostic
+            detectStripes(copiedData, tileX, tileY);
+            
+            const imageData = new ImageData(copiedData, 64, 64);
             
             // Draw tile to surface
             surface.ctx.putImageData(imageData, tileX, tileY, 0, 0, tileW, tileH);
             tilesDrawn++;
         }
+        
+        if (updatedCount > 0 && tilesDrawn === 0) {
+            console.warn(`[GFX Worker] Progressive: 0/${updatedCount} tiles drawn to surface ${msg.surfaceId}`);
+        }
+        
+        // Frame order diagnosis for Progressive
+        if (FRAME_ORDER_DIAG && tilesDrawn > 0 && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+            frameOrderOps.push(`PROG:surf=${msg.surfaceId},tiles=${tilesDrawn}`);
+        }
     } catch (e) {
         console.error(`[GFX Worker] Progressive tile loop error at tile ${tilesDrawn}:`, e);
     }
+}
+
+/**
+ * Decode and draw a ClearCodec tile using WASM decoder
+ */
+function decodeClearCodecTile(msg) {
+    if (!clearWasmReady || !clearCtx) {
+        console.warn('[GFX Worker] ClearCodec decoder not ready, skipping tile');
+        return;
+    }
+    
+    const surface = surfaces.get(msg.surfaceId);
+    if (!surface) {
+        console.warn(`[GFX Worker] ClearCodec: Unknown surface ${msg.surfaceId}`);
+        return;
+    }
+    
+    // Track that this surface was updated in the current frame
+    frameUpdatedSurfaces.add(msg.surfaceId);
+    
+    const payload = msg.payload;
+    const w = msg.w;
+    const h = msg.h;
+    
+    // Allocate WASM memory for input
+    const inputPtr = clearWasmModule._malloc(payload.byteLength);
+    clearWasmModule.HEAPU8.set(payload, inputPtr);
+    
+    // Allocate output buffer (RGBA = 4 bytes per pixel)
+    const outputSize = w * h * 4;
+    const outputPtr = clearWasmModule._clear_alloc_output(w, h);
+    
+    if (!outputPtr) {
+        console.error('[GFX Worker] ClearCodec: Failed to allocate output buffer');
+        clearWasmModule._free(inputPtr);
+        return;
+    }
+    
+    // Decode ClearCodec to RGBA output
+    // clear_decompress(ctx, srcData, srcSize, nWidth, nHeight, dstData, dstStep, nXDst, nYDst, dstWidth, dstHeight)
+    const result = clearWasmModule._clear_decompress(
+        clearCtx,
+        inputPtr, payload.byteLength,
+        w, h,
+        outputPtr, w * 4,  // dstStep = width * 4
+        0, 0,              // decode at origin of output buffer
+        w, h               // output buffer dimensions = tile dimensions
+    );
+    
+    clearWasmModule._free(inputPtr);
+    
+    if (result < 0) {
+        console.warn(`[GFX Worker] ClearCodec decode failed: ${result}`);
+        clearWasmModule._clear_free_output(outputPtr);
+        return;
+    }
+    
+    // Copy decoded pixels from WASM memory
+    const wasmBuffer = clearWasmModule.HEAPU8.buffer;
+    if (outputPtr + outputSize > wasmBuffer.byteLength) {
+        console.error(`[GFX Worker] ClearCodec output pointer out of bounds`);
+        clearWasmModule._clear_free_output(outputPtr);
+        return;
+    }
+    
+    const pixelData = new Uint8ClampedArray(wasmBuffer, outputPtr, outputSize);
+    const copiedData = new Uint8ClampedArray(outputSize);
+    copiedData.set(pixelData);
+    
+    // Free WASM output buffer
+    clearWasmModule._clear_free_output(outputPtr);
+    
+    // Create ImageData and draw to surface
+    const imageData = new ImageData(copiedData, w, h);
+    surface.ctx.putImageData(imageData, msg.x, msg.y);
 }
 
 /**
@@ -345,14 +798,67 @@ async function decodeWebPTile(msg) {
         return;
     }
     
+    // Frame order diagnosis
+    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+        frameOrderOps.push(`WEBP:surf=${msg.surfaceId},rect=(${msg.x},${msg.y},${msg.w},${msg.h})`);
+    }
+    
+    // Track that this surface was updated in the current frame
+    frameUpdatedSurfaces.add(msg.surfaceId);
+    
     pendingOps++;
     
     try {
         const blob = new Blob([msg.payload], { type: 'image/webp' });
         const bitmap = await createImageBitmap(blob);
         
-        surface.ctx.drawImage(bitmap, msg.x, msg.y, msg.w, msg.h);
-        bitmap.close();
+        // FORCE_ALPHA_255: Test if alpha corruption is the cause of stripes
+        // We need to draw to temp canvas, fix alpha, then draw to surface
+        if (FORCE_ALPHA_255) {
+            const tempCanvas = new OffscreenCanvas(msg.w, msg.h);
+            const tempCtx = tempCanvas.getContext('2d');
+            tempCtx.drawImage(bitmap, 0, 0);
+            const imageData = tempCtx.getImageData(0, 0, msg.w, msg.h);
+            
+            // Force all alpha values to 255
+            for (let i = 3; i < imageData.data.length; i += 4) {
+                imageData.data[i] = 255;
+            }
+            
+            // Check for alpha corruption and stripes BEFORE forcing alpha
+            if (STRIPE_DIAG_ENABLED && stripeDiagCountWebP < STRIPE_DIAG_MAX && msg.w >= 64 && msg.h >= 64) {
+                // Get original pixel data for analysis
+                tempCtx.drawImage(bitmap, 0, 0);
+                const origData = tempCtx.getImageData(0, 0, Math.min(64, msg.w), Math.min(64, msg.h));
+                checkAlphaCorruption(origData.data, msg.x, msg.y, 'WebP');
+                detectStripes(origData.data, msg.x, msg.y, 'WebP');
+            }
+            
+            // Draw fixed imageData to surface
+            surface.ctx.putImageData(imageData, msg.x, msg.y);
+            bitmap.close();
+        } else {
+            // Normal path - WebP alpha and stripe detection
+            if (STRIPE_DIAG_ENABLED && stripeDiagCountWebP < STRIPE_DIAG_MAX && msg.w >= 64 && msg.h >= 64) {
+                // Draw to a temporary canvas to get pixel data
+                const tempCanvas = new OffscreenCanvas(msg.w, msg.h);
+                const tempCtx = tempCanvas.getContext('2d');
+                tempCtx.drawImage(bitmap, 0, 0);
+                const imageData = tempCtx.getImageData(0, 0, Math.min(64, msg.w), Math.min(64, msg.h));
+                
+                // Check for alpha corruption FIRST
+                checkAlphaCorruption(imageData.data, msg.x, msg.y, 'WebP');
+                
+                // Then check for stripe patterns
+                const stripeResult = detectStripes(imageData.data, msg.x, msg.y, 'WebP');
+                if (stripeResult) {
+                    console.warn(`[STRIPE DIAG WebP] WebP tile (${msg.x},${msg.y}) size ${msg.w}x${msg.h} has stripes!`);
+                }
+            }
+            
+            surface.ctx.drawImage(bitmap, msg.x, msg.y, msg.w, msg.h);
+            bitmap.close();
+        }
         
     } catch (err) {
         console.warn('[GFX Worker] WebP decode failed:', err);
@@ -368,6 +874,9 @@ async function decodeWebPTile(msg) {
 function drawRawTile(msg) {
     const surface = surfaces.get(msg.surfaceId);
     if (!surface) return;
+    
+    // Track that this surface was updated in the current frame
+    frameUpdatedSurfaces.add(msg.surfaceId);
     
     const imageData = new ImageData(
         new Uint8ClampedArray(msg.payload.buffer, msg.payload.byteOffset, msg.payload.byteLength),
@@ -401,41 +910,6 @@ async function drawLegacyFullFrame(bytes, mimeType) {
     }
     
     pendingOps--;
-    checkBackpressure();
-}
-
-/**
- * Decode and draw a legacy delta frame (multiple WebP tiles)
- * Used for backwards compatibility with DELT format
- */
-async function decodeDeltaFrame(msg) {
-    if (!primaryCanvas || !primaryCtx) {
-        console.warn('[GFX Worker] No primary canvas for delta frame');
-        return;
-    }
-    
-    if (!msg.tiles || msg.tiles.length === 0) {
-        return;
-    }
-    
-    pendingOps += msg.tiles.length;
-    
-    const decodePromises = msg.tiles.map(async (tile) => {
-        try {
-            const blob = new Blob([tile.data], { type: 'image/webp' });
-            const bitmap = await createImageBitmap(blob);
-            
-            primaryCtx.drawImage(bitmap, tile.x, tile.y);
-            bitmap.close();
-            
-        } catch (err) {
-            console.warn('[GFX Worker] Delta tile decode failed:', err);
-        }
-        
-        pendingOps--;
-    });
-    
-    await Promise.all(decodePromises);
     checkBackpressure();
 }
 
@@ -505,6 +979,7 @@ async function initH264(width, height) {
  * Decode H.264 video frame
  */
 async function decodeH264Frame(msg) {
+    console.log(`[GFX Worker] H264: frame=${msg.frameId} surface=${msg.surfaceId} type=${msg.frameType === 0 ? 'key' : 'delta'} dest=(${msg.destX},${msg.destY},${msg.destW},${msg.destH}) nalSize=${msg.nalSize}`);
     if (!primaryCtx) {
         console.warn('[GFX Worker] No primary context for H.264');
         return;
@@ -575,6 +1050,11 @@ async function decodeH264Frame(msg) {
         });
         
         videoDecoder.decode(chunk);
+        
+        // CRITICAL: Flush to ensure frame is rendered before processing next message.
+        // Without this, SurfaceToCache/CacheToSurface could capture stale pixels
+        // because VideoDecoder.decode() is asynchronous.
+        await videoDecoder.flush();
     } catch (e) {
         console.error('[GFX Worker] H.264 decode error:', e);
         h264DecodeQueue.pop();
@@ -593,6 +1073,9 @@ function applySolidFill(msg) {
     const surface = surfaces.get(msg.surfaceId);
     if (!surface) return;
     
+    // Track that this surface was updated in the current frame
+    frameUpdatedSurfaces.add(msg.surfaceId);
+    
     // Extract BGRA components
     const b = (msg.color >> 0) & 0xFF;
     const g = (msg.color >> 8) & 0xFF;
@@ -610,6 +1093,9 @@ function applySurfaceToSurface(msg) {
     const dstSurface = surfaces.get(msg.dstSurfaceId);
     if (!srcSurface || !dstSurface) return;
     
+    // Track that destination surface was updated in the current frame
+    frameUpdatedSurfaces.add(msg.dstSurfaceId);
+    
     dstSurface.ctx.drawImage(
         srcSurface.canvas,
         msg.srcX, msg.srcY, msg.srcW, msg.srcH,
@@ -618,12 +1104,203 @@ function applySurfaceToSurface(msg) {
 }
 
 /**
- * Cache-to-surface blit
- * Note: Cache management would need additional state tracking
+ * Surface-to-cache: extract region from surface and store in local cache
+ * Enhanced with source tracking and content checksum for debugging
+ */
+/** @type {number} Counter for S2C logging */
+let s2cLogCount = 0;
+const S2C_LOG_LIMIT = 30;
+
+function applySurfaceToCache(msg) {
+    // CACHE_BYPASS: Skip cache entirely to test if cache is the problem
+    if (CACHE_BYPASS) {
+        if (frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+            frameOrderOps.push(`S2C-SKIP:slot=${msg.cacheSlot}`);
+        }
+        return;
+    }
+    
+    const surface = surfaces.get(msg.surfaceId);
+    if (!surface) {
+        console.warn(`[CACHE] SurfaceToCache: unknown surface ${msg.surfaceId}`);
+        return;
+    }
+    
+    // Frame order diagnosis
+    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+        frameOrderOps.push(`S2C:slot=${msg.cacheSlot},surf=${msg.surfaceId},rect=(${msg.x},${msg.y},${msg.w},${msg.h})`);
+    }
+    
+    // Log first few S2C operations to verify they are arriving
+    if (s2cLogCount < S2C_LOG_LIMIT) {
+        console.log(`[CACHE] S2C: slot=${msg.cacheSlot} <- surface=${msg.surfaceId}(${msg.x},${msg.y},${msg.w},${msg.h}) frame=${currentFrameId}`);
+        s2cLogCount++;
+    }
+    
+    // Extract pixel data from surface
+    const imageData = surface.ctx.getImageData(msg.x, msg.y, msg.w, msg.h);
+    
+    // Compute simple checksum for debugging (sum of first 100 pixels)
+    let checksum = 0;
+    const data = imageData.data;
+    const len = Math.min(data.length, 400);  // First 100 pixels (RGBA)
+    for (let i = 0; i < len; i++) {
+        checksum = (checksum + data[i]) >>> 0;
+    }
+    
+    // Store in cache with metadata
+    const entry = {
+        imageData: imageData,
+        sourceSurface: msg.surfaceId,
+        sourceRect: { x: msg.x, y: msg.y, w: msg.w, h: msg.h },
+        frameId: currentFrameId,
+        checksum: checksum
+    };
+    bitmapCache.set(msg.cacheSlot, entry);
+}
+
+/**
+ * Cache-to-surface blit: retrieve cached bitmap and draw to surface
+ * Enhanced with cross-surface detection for debugging
  */
 function applyCacheToSurface(msg) {
-    // TODO: Implement bitmap cache
-    console.warn('[GFX Worker] CacheToSurface not yet implemented');
+    // CACHE_BYPASS: Skip cache entirely to test if cache is the problem
+    if (CACHE_BYPASS) {
+        if (frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+            frameOrderOps.push(`C2S-SKIP:slot=${msg.cacheSlot}`);
+        }
+        return;
+    }
+    
+    const surface = surfaces.get(msg.surfaceId);
+    if (!surface) {
+        console.warn(`[CACHE] CacheToSurface: unknown surface ${msg.surfaceId}`);
+        return;
+    }
+    
+    const entry = bitmapCache.get(msg.cacheSlot);
+    if (!entry) {
+        console.error(`[CACHE] C2S: MISS slot=${msg.cacheSlot} -> surface=${msg.surfaceId}(${msg.dstX},${msg.dstY}) frame=${currentFrameId} (cache size: ${bitmapCache.size})`);
+        return;
+    }
+    
+    // Frame order diagnosis - verify checksum matches what was cached
+    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+        frameOrderOps.push(`C2S:slot=${msg.cacheSlot},surf=${msg.surfaceId},dst=(${msg.dstX},${msg.dstY}),cksum=${entry.checksum},srcFrame=${entry.frameId}`);
+    }
+    
+    // Track that this surface was updated in the current frame
+    frameUpdatedSurfaces.add(msg.surfaceId);
+    
+    // Get the actual ImageData from the entry
+    const cachedData = entry.imageData;
+    
+    // Stripe detection for cached tiles - use WebP counter since cached tiles come from WebP pipeline
+    if (STRIPE_DIAG_ENABLED && stripeDiagCountWebP < STRIPE_DIAG_MAX && 
+        cachedData.width >= 64 && cachedData.height >= 64) {
+        const stripeResult = detectStripes(cachedData.data, msg.dstX, msg.dstY, 'WebP-Cache');
+        if (stripeResult) {
+            console.warn(`[STRIPE DIAG] C2S cached tile slot=${msg.cacheSlot} at (${msg.dstX},${msg.dstY}) has stripes! srcFrame=${entry.frameId}`);
+        }
+    }
+    
+    // Draw cached bitmap to surface at destination position
+    surface.ctx.putImageData(cachedData, msg.dstX, msg.dstY);
+}
+
+/**
+ * Evict a cache slot (server tells us it's no longer valid)
+ * Per RDPGFX protocol, the server sends EvictCacheEntry PDU when it
+ * wants to invalidate a cache slot. This is the ONLY way cache entries
+ * should be deleted (not on surface delete!).
+ */
+/** @type {number} Counter for EVCT logging */
+let evctLogCount = 0;
+const EVCT_LOG_LIMIT = 20;
+
+function applyEvictCache(msg) {
+    const existed = bitmapCache.has(msg.cacheSlot);
+    if (existed) {
+        const entry = bitmapCache.get(msg.cacheSlot);
+        bitmapCache.delete(msg.cacheSlot);
+        
+        // Log first few evictions for debugging
+        if (evctLogCount < EVCT_LOG_LIMIT) {
+            console.log(`[CACHE] EVICT: slot=${msg.cacheSlot} (was from surface=${entry.sourceSurface}) frame=${currentFrameId} cacheSize=${bitmapCache.size}`);
+            evctLogCount++;
+        }
+    } else {
+        // Evicting non-existent slot is not an error per protocol,
+        // but log it for debugging if it happens frequently
+        if (evctLogCount < EVCT_LOG_LIMIT) {
+            console.log(`[CACHE] EVICT: slot=${msg.cacheSlot} (not in cache) frame=${currentFrameId}`);
+            evctLogCount++;
+        }
+    }
+}
+
+/**
+ * Reset all cache state (called on session reset/reconnect)
+ */
+function resetCacheState() {
+    const cacheSize = bitmapCache.size;
+    bitmapCache.clear();
+    if (cacheSize > 0) {
+        console.log(`[GFX Worker] Reset: cleared ${cacheSize} cache entries`);
+    }
+}
+
+/**
+ * Handle resetGraphics from server
+ * Reset surfaces and progressive state, but NOT the bitmap cache.
+ * Per RDPGFX protocol, bitmap cache persists across reset graphics.
+ * Server sends new dimensions; browser should resize accordingly.
+ */
+function applyResetGraphics(msg) {
+    const surfaceCount = surfaces.size;
+    
+    // Delete all surfaces (this also clears WASM progressive state per surface)
+    for (const surfaceId of surfaces.keys()) {
+        deleteSurface(surfaceId);
+    }
+    
+    // NOTE: Do NOT clear bitmap cache here!
+    // The GFX bitmap cache is session-level and persists across surface resets.
+    // Only explicit EvictCacheEntry PDU should remove cache entries.
+    
+    // Reset frame tracking
+    currentFrameId = null;
+    frameUpdatedSurfaces.clear();
+    
+    // Reset H.264 decoder state
+    if (videoDecoder && h264Initialized) {
+        try {
+            videoDecoder.reset();
+            h264NeedsKeyframe = true;
+        } catch (e) {
+            // Ignore reset errors
+        }
+    }
+    h264DecoderError = false;
+    h264DecodeQueue = [];
+    
+    // Reset ClearCodec sequence number (caches are NOT reset per MS-RDPEGFX)
+    if (clearWasmReady && clearCtx) {
+        clearWasmModule._clear_context_reset(clearCtx);
+    }
+    
+    // Update primary canvas size if needed
+    if (primaryCanvas && (primaryCanvas.width !== msg.width || primaryCanvas.height !== msg.height)) {
+        primaryCanvas.width = msg.width;
+        primaryCanvas.height = msg.height;
+        console.log(`[GFX Worker] ResetGraphics: resized canvas to ${msg.width}x${msg.height}`);
+    }
+    
+    // Reset log counters for fresh debugging
+    s2cLogCount = 0;
+    evctLogCount = 0;
+    
+    console.log(`[GFX Worker] ResetGraphics: cleared ${surfaceCount} surfaces, cache preserved (${bitmapCache.size} entries), new size ${msg.width}x${msg.height}`);
 }
 
 // ============================================================================
@@ -648,30 +1325,71 @@ function compositeSurfaceToPrimary(surfaceId) {
  * Start a new frame
  */
 function startFrame(frameId) {
+    // Log previous frame's operations if FRAME_ORDER_DIAG enabled
+    if (FRAME_ORDER_DIAG && frameOrderOps.length > 0 && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+        console.log(`[FRAME-ORDER] Frame ${currentFrameId}: ${frameOrderOps.join(' → ')}`);
+        frameOrderLogCount++;
+    }
+    
     currentFrameId = frameId;
+    frameUpdatedSurfaces.clear();
+    frameOrderOps = [];  // Reset for new frame
+    
+    if (FRAME_ORDER_DIAG && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+        frameOrderOps.push(`START(${frameId})`);
+    }
 }
 
 /**
  * End frame and send acknowledgment
  */
 function endFrame(frameId) {
+    // Log frame operations before ending
+    if (FRAME_ORDER_DIAG && frameOrderOps.length > 0 && frameOrderLogCount < FRAME_ORDER_LOG_LIMIT) {
+        frameOrderOps.push(`END(${frameId})`);
+        console.log(`[FRAME-ORDER] Frame ${frameId}: ${frameOrderOps.join(' → ')}`);
+        frameOrderLogCount++;
+        frameOrderOps = [];
+    }
+    
     if (currentFrameId !== frameId) {
         console.warn(`[GFX Worker] Frame mismatch: expected ${currentFrameId}, got ${frameId}`);
     }
     
-    // Composite primary surface to output canvas if needed
-    if (primarySurfaceId !== null && primaryCanvas && primaryCtx) {
-        const surface = surfaces.get(primarySurfaceId);
-        if (surface) {
-            primaryCtx.drawImage(surface.canvas, 0, 0);
+    // Get updated surfaces for compositing
+    const updatedList = Array.from(frameUpdatedSurfaces);
+    
+    // Composite all surfaces that were updated in this frame to primary canvas
+    if (primaryCanvas && primaryCtx) {
+        // First try primarySurfaceId if set and was updated
+        if (primarySurfaceId !== null && frameUpdatedSurfaces.has(primarySurfaceId)) {
+            const surface = surfaces.get(primarySurfaceId);
+            if (surface) {
+                primaryCtx.drawImage(surface.canvas, 0, 0);
+            }
+        } else if (frameUpdatedSurfaces.size > 0) {
+            // Fallback: composite any updated surfaces (in order of surface ID)
+            const sortedSurfaces = Array.from(frameUpdatedSurfaces).sort((a, b) => a - b);
+            for (const surfaceId of sortedSurfaces) {
+                const surface = surfaces.get(surfaceId);
+                if (surface) {
+                    primaryCtx.drawImage(surface.canvas, 0, 0);
+                } else {
+                    console.warn(`[GFX Worker] EndFrame: surface ${surfaceId} was updated but no longer exists`);
+                }
+            }
         }
+    } else {
+        console.warn(`[GFX Worker] EndFrame: No primary canvas! primaryCanvas=${!!primaryCanvas} primaryCtx=${!!primaryCtx}`);
     }
     
     currentFrameId = null;
+    frameUpdatedSurfaces.clear();
     
-    // Send frame acknowledgment
-    const ackMsg = buildFrameAck(frameId);
-    self.postMessage({ type: 'frameAck', frameId, data: ackMsg.buffer }, [ackMsg.buffer]);
+    // Increment decoded counter and send frame acknowledgment
+    totalFramesDecoded++;
+    const ackMsg = buildFrameAck(frameId, totalFramesDecoded);
+    self.postMessage({ type: 'frameAck', frameId, totalFramesDecoded, data: ackMsg.buffer }, [ackMsg.buffer]);
 }
 
 // ============================================================================
@@ -721,8 +1439,15 @@ async function handleBinaryMessage(data) {
                 return true;
             }
         }
+        // Debug: log unknown message magic
+        const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+        console.warn(`[GFX Worker] Unknown message magic: "${magic}" (${bytes[0].toString(16)} ${bytes[1].toString(16)} ${bytes[2].toString(16)} ${bytes[3].toString(16)})`);
         return false;
     }
+    
+    // Frame lifecycle is now tracked internally - no per-frame logging needed
+    
+    // Cache operations are now logged in applySurfaceToCache/applyCacheToSurface with enhanced debugging
     
     switch (msg.type) {
         case 'createSurface':
@@ -731,6 +1456,11 @@ async function handleBinaryMessage(data) {
             
         case 'deleteSurface':
             deleteSurface(msg.surfaceId);
+            break;
+        
+        case 'mapSurface':
+            console.log(`[GFX Worker] MapSurfaceToOutput: surfaceId=${msg.surfaceId}, outputX=${msg.outputX}, outputY=${msg.outputY}`);
+            mapSurfaceToPrimary(msg.surfaceId);
             break;
             
         case 'startFrame':
@@ -748,6 +1478,8 @@ async function handleBinaryMessage(data) {
                 await decodeWebPTile(msg);
             } else if (msg.codec === 'raw') {
                 drawRawTile(msg);
+            } else if (msg.codec === 'clearcodec') {
+                decodeClearCodecTile(msg);
             }
             break;
             
@@ -759,18 +1491,26 @@ async function handleBinaryMessage(data) {
             applySurfaceToSurface(msg);
             break;
             
+        case 'surfaceToCache':
+            applySurfaceToCache(msg);
+            break;
+            
         case 'cacheToSurface':
             applyCacheToSurface(msg);
             break;
             
-        case 'deltaFrame':
-            await decodeDeltaFrame(msg);
+        case 'evictCache':
+            applyEvictCache(msg);
+            break;
+            
+        case 'resetGraphics':
+            applyResetGraphics(msg);
             break;
             
         case 'videoFrame':
             // Route by codec ID: Progressive goes to WASM decoder, H.264 to VideoDecoder
             if (msg.codecId === CODEC_ID.PROGRESSIVE || msg.codecId === CODEC_ID.PROGRESSIVE_V2) {
-                // Convert H264 frame format to progressive tile format for decoder
+                // Progressive/RFX: synchronous WASM decode - strict ordering maintained
                 decodeProgressiveTile({
                     surfaceId: msg.surfaceId,
                     frameId: msg.frameId,
@@ -781,13 +1521,9 @@ async function handleBinaryMessage(data) {
                     payload: msg.nalData,  // Progressive raw data passed as nalData
                 });
                 
-                // Progressive frames via H264 queue need manual compositing and ack
-                // (normal GFX flow would have StartFrame/EndFrame messages)
-                compositeSurfaceToPrimary(msg.surfaceId);
-                
-                // Send frame acknowledgment for Progressive
-                const ackMsg = buildFrameAck(msg.frameId);
-                self.postMessage({ type: 'frameAck', frameId: msg.frameId, data: ackMsg.buffer }, [ackMsg.buffer]);
+                // Track updated surface for endFrame composition
+                frameUpdatedSurfaces.add(msg.surfaceId);
+                currentFrameId = msg.frameId;
             } else {
                 // H.264/AVC420/AVC444 - decode in worker using VideoDecoder
                 await decodeH264Frame(msg);
@@ -806,28 +1542,34 @@ async function handleBinaryMessage(data) {
 // Worker entry point
 // ============================================================================
 
-self.onmessage = async (event) => {
-    const { type, data } = event.data;
+/**
+ * Process a single message (called sequentially from queue).
+ * This function handles the actual message processing.
+ */
+async function processMessage(event) {
+    const { type, data } = event;
     
     switch (type) {
         case 'init':
-            // Initialize with primary canvas
+            // Initialize with primary canvas (sync, no queue needed)
             primaryCanvas = data.canvas;
             primaryCtx = primaryCanvas.getContext('2d', { 
                 alpha: false,
-                desynchronized: true
+                desynchronized: true,
+                willReadFrequently: true  // For getImageData operations
             });
             
-            // Create primary surface matching canvas size
-            createSurface(0, data.width, data.height);
-            mapSurfaceToPrimary(0);
+            // Don't pre-create surface 0 here - let the server create surfaces
+            // via CreateSurface messages. Pre-creating causes conflicts when 
+            // server sends its own CreateSurface(0) which then gets deleted.
+            // primarySurfaceId will be set when server maps a surface to output.
             
             // WASM already loaded during worker startup
             self.postMessage({ type: 'ready', wasmReady });
             break;
             
         case 'binary':
-            // Binary message from WebSocket
+            // Binary message from WebSocket - process in order
             if (data instanceof ArrayBuffer) {
                 const handled = await handleBinaryMessage(data);
                 if (!handled) {
@@ -853,9 +1595,29 @@ self.onmessage = async (event) => {
             mapSurfaceToPrimary(data.surfaceId);
             break;
             
+        case 'reset':
+            // Reset all state (e.g., on reconnect or session reset)
+            resetCacheState();
+            // Clear all surfaces
+            for (const surfaceId of surfaces.keys()) {
+                deleteSurface(surfaceId);
+            }
+            console.log('[GFX Worker] Session reset complete');
+            break;
+            
         default:
             console.warn('[GFX Worker] Unknown message type:', type);
     }
+}
+
+/**
+ * Worker onmessage handler - enqueues messages for strict sequential processing.
+ * This ensures that async operations (H.264 decode, WebP decode) complete
+ * before the next message is processed.
+ */
+self.onmessage = (event) => {
+    // Enqueue message for sequential processing
+    enqueueMessage(event.data);
 };
 
 // ============================================================================
@@ -863,9 +1625,10 @@ self.onmessage = async (event) => {
 // ============================================================================
 
 (async () => {
-    // Load WASM at worker startup so we know immediately if it works
+    // Load WASM decoders at worker startup so we know immediately if they work
     await initWasm();
+    await initClearCodecWasm();
     
     // Report that worker is loaded with WASM status
-    self.postMessage({ type: 'loaded', wasmReady });
+    self.postMessage({ type: 'loaded', wasmReady, clearWasmReady });
 })();
