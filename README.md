@@ -36,6 +36,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - � **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
 - �🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
 - 📺 Fullscreen mode with dynamic resolution
+- 🎨 **Customizable theming** - Built-in presets (dark, light, midnight, high-contrast) with full color/typography control
 - 📊 Latency monitoring (ping/pong)
 - 🩺 Health check endpoint (`/health`)
 - 🐳 Docker support with multi-stage builds
