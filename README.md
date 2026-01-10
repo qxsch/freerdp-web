@@ -178,6 +178,8 @@ await client.connect({
 
 The RDP client supports comprehensive theming through a semantic, type-safe API. You can use built-in presets or create custom themes with fine-grained control over colors, typography, and shape.
 
+> 📖 **Want to create your own theme?** See the complete [Creating Custom Themes Guide](./CREATING-THEMES.md) for step-by-step instructions, all available options, and best practices.
+
 #### Built-in Presets
 
 | Preset | Description |
