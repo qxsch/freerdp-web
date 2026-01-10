@@ -41,7 +41,7 @@ Themes follow a **layered inheritance** model:
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  Your Custom Overrides (highest priority)               │
-│  { colors: { accent: '#ff5722' } }                    │
+│  { colors: { accent: '#ff5722' } }                      │
 ├─────────────────────────────────────────────────────────┤
 │  Base Preset (if specified)                             │
 │  { preset: 'dark' } → uses darkTheme as base            │
