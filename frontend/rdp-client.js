@@ -2193,7 +2193,7 @@ export class RDPClient {
         const overlayRect = overlay.getBoundingClientRect();
         
         // Scale limits
-        const minScale = 0.5;
+        const minScale = 0.6;
         const maxScale = 1.2;
         
         // Helper functions for calculating dimensions
