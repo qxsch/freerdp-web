@@ -172,6 +172,159 @@ await client.connect({
 | `mouseThrottleMs` | number | `16` | Mouse move event throttle (~60fps) |
 | `resizeDebounceMs` | number | `2000` | Resize debounce delay |
 | `keepConnectionModalOpen` | boolean | `false` | Keep connection modal open when not connected |
+| `theme` | object | `null` | Theme configuration (see Theming section) |
+
+### Theming
+
+The RDP client supports comprehensive theming through a semantic, type-safe API. You can use built-in presets or create custom themes with fine-grained control over colors, typography, and shape.
+
+#### Built-in Presets
+
+| Preset | Description |
+|--------|-------------|
+| `dark` | Default theme with deep blue tones |
+| `light` | Clean light mode for bright environments |
+| `midnight` | Pure dark with purple accents |
+| `highContrast` | Accessibility-focused with maximum contrast |
+
+#### Quick Examples
+
+```javascript
+import { RDPClient, themes } from './rdp-client.js';
+
+// 1. Default dark theme (no config needed)
+const client = new RDPClient(container);
+
+// 2. Use a preset
+const client = new RDPClient(container, {
+    theme: { preset: 'light' }
+});
+
+// 3. Custom accent color
+const client = new RDPClient(container, {
+    theme: {
+        colors: {
+            accent: '#00b4d8',
+            buttonHover: '#0096c7'
+        }
+    }
+});
+
+// 4. Extend a preset with custom colors
+const client = new RDPClient(container, {
+    theme: {
+        preset: 'dark',
+        colors: {
+            accent: '#ff5722',
+            success: '#4caf50'
+        }
+    }
+});
+```
+
+#### Theme Configuration Reference
+
+```javascript
+{
+    // Optional: Base preset to extend
+    preset: 'dark' | 'light' | 'midnight' | 'highContrast',
+    
+    // Color customization
+    colors: {
+        background: '#1a1a2e',       // Main background
+        surface: '#16213e',          // Panels, modals, toolbars
+        border: '#0f3460',           // Borders and separators
+        text: '#eeeeee',             // Primary text color
+        textMuted: '#888888',        // Secondary/muted text
+        accent: '#51cf66',           // Primary accent (focus, active states)
+        accentText: '#000000',       // Text on accent backgrounds
+        error: '#ff6b6b',            // Error/disconnect state
+        success: '#51cf66',          // Success/connected state
+        buttonBg: '#0f3460',         // Button background
+        buttonHover: '#1a4a7a',      // Button hover background
+        buttonText: '#eeeeee',       // Button text color
+        buttonActiveBg: '#51cf66',   // Button pressed background
+        buttonActiveText: '#000000', // Button pressed text
+        inputBg: '#1a1a2e',          // Input field background
+        inputBorder: '#0f3460',      // Input field border
+        inputFocusBorder: '#51cf66', // Input focus border
+    },
+    
+    // Typography customization
+    typography: {
+        fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+        fontSize: '14px',            // Base font size
+        fontSizeSmall: '0.85rem',    // Small text (labels, status)
+    },
+    
+    // Shape customization
+    shape: {
+        borderRadius: '4px',         // Buttons, inputs
+        borderRadiusLarge: '8px',    // Modals, overlays
+    }
+}
+```
+
+#### Dynamic Theme Changes
+
+You can change the theme at runtime using the `setTheme()` method:
+
+```javascript
+// Switch to light mode
+client.setTheme({ preset: 'light' });
+
+// Change just the accent color
+client.setTheme({ 
+    colors: { 
+        accent: '#e91e63',
+        buttonActiveBg: '#e91e63'
+    } 
+});
+
+// Reset to default dark theme
+client.setTheme({ preset: 'dark' });
+```
+
+#### Corporate Branding Example
+
+```javascript
+const client = new RDPClient(container, {
+    theme: {
+        preset: 'dark',
+        colors: {
+            accent: '#0066cc',           // Brand blue
+            accentText: '#ffffff',
+            success: '#28a745',
+            buttonBg: '#2d3748',
+            buttonHover: '#4a5568',
+            buttonActiveBg: '#0066cc',
+            buttonActiveText: '#ffffff',
+            inputFocusBorder: '#0066cc',
+        },
+        typography: {
+            fontFamily: "'Inter', 'Helvetica Neue', Arial, sans-serif",
+        },
+        shape: {
+            borderRadius: '6px',
+            borderRadiusLarge: '12px',
+        }
+    }
+});
+```
+
+#### Accessing Theme Presets
+
+You can access the full theme preset objects for reference or modification:
+
+```javascript
+import { themes } from './rdp-client.js';
+
+// Log all available colors in dark theme
+console.log(themes.dark.colors);
+
+// Use preset colors in your app
+document.body.style.background = themes.midnight.colors.background;
+```
 
 ### Public API
 
@@ -185,6 +338,7 @@ await client.connect({
 | `showKeyboard()` | Show the virtual on-screen keyboard |
 | `hideKeyboard()` | Hide the virtual on-screen keyboard |
 | `isKeyboardVisible()` | Returns `true` if virtual keyboard is visible |
+| `setTheme(config)` | Apply a new theme configuration dynamically |
 | `getStatus()` | Returns `{ connected, resolution, muted }` |
 | `getMuted()` | Returns current mute state (boolean) |
 | `setMuted(bool)` | Set audio mute state |

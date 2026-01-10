@@ -40,6 +40,7 @@ FROM nginx:alpine
 # Copy static files (excluding progressive source)
 COPY index.html /usr/share/nginx/html/
 COPY rdp-client.js /usr/share/nginx/html/
+COPY rdp-themes.js /usr/share/nginx/html/
 COPY wire-format.js /usr/share/nginx/html/
 COPY gfx-worker.js /usr/share/nginx/html/
 COPY favicons/ /usr/share/nginx/html/favicons/

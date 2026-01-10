@@ -2,7 +2,7 @@
  * RDP Web Client - Reusable ES Module
  * Shadow DOM isolated component for browser-based RDP via WebSocket
  * 
- * @example
+ * @example Basic usage
  * import { RDPClient } from './rdp-client.js';
  * 
  * const client = new RDPClient(document.getElementById('container'), {
@@ -13,26 +13,62 @@
  * });
  * 
  * await client.connect({ host: '192.168.1.100', user: 'admin', pass: 'secret' });
+ * 
+ * @example With theme customization
+ * import { RDPClient } from './rdp-client.js';
+ * 
+ * const client = new RDPClient(container, {
+ *   theme: {
+ *     preset: 'dark',
+ *     colors: {
+ *       accent: '#00b4d8',
+ *       buttonHover: '#0096c7'
+ *     }
+ *   }
+ * });
  */
 
+import { resolveTheme, themeToCssVars, sanitizeTheme, themes } from './rdp-themes.js';
+
 // ============================================================
-// STYLES - Shadow DOM isolated styles
+// STYLES - Shadow DOM isolated styles (uses CSS custom properties for theming)
 // ============================================================
 const STYLES = `
 :host {
     display: block;
     width: 100%;
     height: 100%;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    
+    /* Typography */
+    --rdp-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --rdp-font-size: 14px;
+    --rdp-font-size-small: 0.85rem;
+    
+    /* Colors - defaults (overridden by theme) */
     --rdp-bg: #1a1a2e;
-    --rdp-header-bg: #16213e;
+    --rdp-surface: #16213e;
     --rdp-border: #0f3460;
-    --rdp-text: #eee;
-    --rdp-text-muted: #888;
+    --rdp-text: #eeeeee;
+    --rdp-text-muted: #888888;
     --rdp-accent: #51cf66;
+    --rdp-accent-text: #000000;
     --rdp-error: #ff6b6b;
+    --rdp-success: #51cf66;
     --rdp-btn-bg: #0f3460;
     --rdp-btn-hover: #1a4a7a;
+    --rdp-btn-text: #eeeeee;
+    --rdp-btn-active-bg: #51cf66;
+    --rdp-btn-active-text: #000000;
+    --rdp-input-bg: #1a1a2e;
+    --rdp-input-border: #0f3460;
+    --rdp-input-focus-border: #51cf66;
+    
+    /* Shape */
+    --rdp-border-radius: 4px;
+    --rdp-border-radius-lg: 8px;
+    
+    font-family: var(--rdp-font-family);
+    font-size: var(--rdp-font-size);
 }
 
 * {
@@ -53,7 +89,7 @@ const STYLES = `
 
 /* Top Bar */
 .rdp-topbar {
-    background: var(--rdp-header-bg);
+    background: var(--rdp-surface);
     padding: 8px 16px;
     display: flex;
     align-items: center;
@@ -68,7 +104,7 @@ const STYLES = `
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 0.85rem;
+    font-size: var(--rdp-font-size-small);
 }
 
 .rdp-status-dot {
@@ -79,7 +115,7 @@ const STYLES = `
     transition: background 0.3s;
 }
 
-.rdp-status-dot.connected { background: var(--rdp-accent); }
+.rdp-status-dot.connected { background: var(--rdp-success); }
 
 .rdp-controls {
     margin-left: auto;
@@ -90,15 +126,17 @@ const STYLES = `
 .rdp-btn {
     background: var(--rdp-btn-bg);
     border: none;
-    color: var(--rdp-text);
+    color: var(--rdp-btn-text);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: var(--rdp-border-radius);
     cursor: pointer;
-    font-size: 0.85rem;
-    transition: background 0.2s;
+    font-size: var(--rdp-font-size-small);
+    font-family: inherit;
+    transition: background 0.2s, color 0.2s;
 }
 
 .rdp-btn:hover { background: var(--rdp-btn-hover); }
+.rdp-btn:active { background: var(--rdp-btn-active-bg); color: var(--rdp-btn-active-text); }
 .rdp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Screen Area */
@@ -115,7 +153,7 @@ const STYLES = `
 .rdp-screen {
     background: #000;
     border: 2px solid var(--rdp-border);
-    border-radius: 4px;
+    border-radius: var(--rdp-border-radius);
     overflow: hidden;
     position: relative;
     flex: 1;
@@ -155,9 +193,9 @@ const STYLES = `
 
 /* Bottom Bar */
 .rdp-bottombar {
-    background: var(--rdp-header-bg);
+    background: var(--rdp-surface);
     padding: 6px 16px;
-    font-size: 0.8rem;
+    font-size: var(--rdp-font-size-small);
     color: var(--rdp-text-muted);
     display: flex;
     justify-content: space-between;
@@ -184,9 +222,9 @@ const STYLES = `
 .rdp-modal.active { display: flex; }
 
 .rdp-modal-content {
-    background: var(--rdp-header-bg);
+    background: var(--rdp-surface);
     padding: 24px;
-    border-radius: 8px;
+    border-radius: var(--rdp-border-radius-lg);
     max-width: 360px;
     width: 90%;
 }
@@ -209,16 +247,17 @@ const STYLES = `
 .rdp-form-group input {
     width: 100%;
     padding: 8px;
-    border: 1px solid var(--rdp-border);
-    border-radius: 4px;
-    background: var(--rdp-bg);
+    border: 1px solid var(--rdp-input-border);
+    border-radius: var(--rdp-border-radius);
+    background: var(--rdp-input-bg);
     color: var(--rdp-text);
-    font-size: 0.9rem;
+    font-size: var(--rdp-font-size-small);
+    font-family: inherit;
 }
 
 .rdp-form-group input:focus {
     outline: none;
-    border-color: var(--rdp-accent);
+    border-color: var(--rdp-input-focus-border);
 }
 
 .rdp-form-checkbox label {
@@ -240,15 +279,16 @@ const STYLES = `
 }
 
 .rdp-modal-buttons .rdp-btn { flex: 1; }
-.rdp-modal-buttons .rdp-btn-primary { background: var(--rdp-accent); color: #000; }
+.rdp-modal-buttons .rdp-btn-primary { background: var(--rdp-accent); color: var(--rdp-accent-text); }
+.rdp-modal-buttons .rdp-btn-primary:hover { opacity: 0.9; }
 
 /* Virtual Keyboard Overlay */
 .rdp-keyboard-overlay {
     display: none;
     position: absolute;
-    background: rgba(30, 30, 50, 0.95);
+    background: color-mix(in srgb, var(--rdp-surface) 95%, transparent);
     border: 2px solid var(--rdp-border);
-    border-radius: 8px;
+    border-radius: var(--rdp-border-radius-lg);
     padding: 8px;
     z-index: 100;
     user-select: none;
@@ -264,8 +304,8 @@ const STYLES = `
     align-items: center;
     padding: 4px 8px;
     margin-bottom: 8px;
-    background: var(--rdp-header-bg);
-    border-radius: 4px;
+    background: var(--rdp-surface);
+    border-radius: var(--rdp-border-radius);
     cursor: move;
 }
 
@@ -306,30 +346,30 @@ const STYLES = `
 .rdp-key {
     background: var(--rdp-btn-bg);
     border: 1px solid var(--rdp-border);
-    color: var(--rdp-text);
+    color: var(--rdp-btn-text);
     padding: 8px 12px;
     min-width: 36px;
     height: 36px;
-    border-radius: 4px;
+    border-radius: var(--rdp-border-radius);
     cursor: pointer;
     font-size: 0.75rem;
     font-family: inherit;
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: background 0.1s, transform 0.05s;
+    transition: background 0.1s, transform 0.05s, color 0.1s;
 }
 
 .rdp-key:hover { background: var(--rdp-btn-hover); }
-.rdp-key:active { transform: scale(0.95); background: var(--rdp-accent); color: #000; }
-.rdp-key.pressed { background: var(--rdp-accent); color: #000; }
+.rdp-key:active { transform: scale(0.95); background: var(--rdp-btn-active-bg); color: var(--rdp-btn-active-text); }
+.rdp-key.pressed { background: var(--rdp-btn-active-bg); color: var(--rdp-btn-active-text); }
 
 .rdp-key-wide { min-width: 60px; }
 .rdp-key-wider { min-width: 80px; }
 .rdp-key-widest { min-width: 100px; }
 .rdp-key-space { min-width: 200px; }
-.rdp-key-special { background: #2a3a5a; }
-.rdp-key-special:hover { background: #3a4a6a; }
+.rdp-key-special { background: color-mix(in srgb, var(--rdp-btn-bg) 80%, var(--rdp-accent) 20%); }
+.rdp-key-special:hover { background: color-mix(in srgb, var(--rdp-btn-hover) 80%, var(--rdp-accent) 20%); }
 
 .rdp-keyboard-resize {
     position: absolute;
@@ -577,6 +617,7 @@ export class RDPClient {
      * @param {boolean} [options.showBottomBar=true] - Show bottom status bar
      * @param {number} [options.reconnectDelay=3000] - Reconnection delay in ms
      * @param {boolean} [options.keepConnectionModalOpen=false] - Keep connection modal open when disconnected (cannot be closed)
+     * @param {import('./rdp-themes.js').RDPTheme} [options.theme] - Theme configuration
      */
     constructor(container, options = {}) {
         this.options = {
@@ -587,11 +628,13 @@ export class RDPClient {
             mouseThrottleMs: 16,
             resizeDebounceMs: 2000,
             keepConnectionModalOpen: false,
+            theme: null,
             ...options
         };
 
         this._container = container;
         this._initShadowDOM();
+        this._applyTheme(this.options.theme);
         this._initState();
         this._bindElements();
         this._setupEventListeners();
@@ -611,13 +654,20 @@ export class RDPClient {
     _initShadowDOM() {
         this._shadow = this._container.attachShadow({ mode: 'open' });
         
+        // Main styles
         const style = document.createElement('style');
         style.textContent = STYLES;
+        style.id = 'rdp-main-styles';
+        
+        // Theme overrides (separate style element for easy updates)
+        this._themeStyle = document.createElement('style');
+        this._themeStyle.id = 'rdp-theme-styles';
         
         const template = document.createElement('template');
         template.innerHTML = TEMPLATE;
         
         this._shadow.appendChild(style);
+        this._shadow.appendChild(this._themeStyle);
         this._shadow.appendChild(template.content.cloneNode(true));
         
         // Apply visibility options
@@ -627,6 +677,35 @@ export class RDPClient {
         if (!this.options.showBottomBar) {
             this._shadow.querySelector('.rdp-bottombar').classList.add('hidden');
         }
+    }
+    
+    /**
+     * Apply theme configuration
+     * Can be called after initialization to change theme dynamically
+     * @param {import('./rdp-themes.js').RDPTheme} themeConfig - Theme configuration
+     */
+    _applyTheme(themeConfig) {
+        if (!themeConfig) return;
+        
+        // Sanitize and resolve theme
+        const sanitized = sanitizeTheme(themeConfig);
+        const resolved = resolveTheme(sanitized);
+        const cssVars = themeToCssVars(resolved);
+        
+        // Apply as :host styles
+        this._themeStyle.textContent = `:host { ${cssVars}; }`;
+    }
+    
+    /**
+     * Set theme dynamically after initialization
+     * @param {import('./rdp-themes.js').RDPTheme} themeConfig - Theme configuration
+     * @example
+     * client.setTheme({ preset: 'light' });
+     * client.setTheme({ colors: { accent: '#ff5722' } });
+     */
+    setTheme(themeConfig) {
+        this.options.theme = themeConfig;
+        this._applyTheme(themeConfig);
     }
 
     _initState() {
@@ -2304,6 +2383,9 @@ export class RDPClient {
         this._emit('resize', { width, height });
     }
 }
+
+// Re-export theme utilities for convenience
+export { themes, resolveTheme, sanitizeTheme } from './rdp-themes.js';
 
 // Default export for convenience
 export default RDPClient;

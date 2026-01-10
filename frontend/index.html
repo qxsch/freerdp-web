@@ -76,7 +76,7 @@
             top: 12px;
             right: 12px;
             bottom: 12px;
-            width: 340px;
+            width: 400px;
             background: rgba(21, 21, 37, 0.95);
             border-radius: 8px;
             padding: 20px;
@@ -216,6 +216,7 @@
                 <li><code>sendKeys(keys, opts)</code> - Send keystrokes</li>
                 <li><code>sendKeyCombo(combo)</code> - Send key combo</li>
                 <li><code>sendCtrlAltDel()</code> - Send Ctrl+Alt+Del</li>
+                <li><code>setTheme(config)</code> - Apply theme dynamically</li>
                 <li><code>getStatus()</code> - Get connection status</li>
                 <li><code>getMuted()</code> - Get audio mute state</li>
                 <li><code>setMuted(bool)</code> - Set audio mute</li>
@@ -227,6 +228,15 @@
                 <li><code>off(event, fn)</code> - Remove listener</li>
                 <li><code>destroy()</code> - Cleanup resources</li>
             </ul>
+
+            <h2>Theming</h2>
+            <div class="code-block"><code>// Use preset: 'dark', 'light', 'midnight', 'highContrast'
+client.setTheme({ preset: 'light' });
+
+// Or customize colors
+client.setTheme({
+  colors: { accent: '#00b4d8' }
+});</code></div>
 
             <h2>Events</h2>
             <ul class="api-list">
