@@ -6,7 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-OUTPUT_DIR="$SCRIPT_DIR/../progressive"
+OUTPUT_DIR="$SCRIPT_DIR"
 
 echo "=== Building Progressive Decoder WASM with pthread support ==="
 

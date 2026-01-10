@@ -1,0 +1,5 @@
+# Ensure shell scripts always use LF line endings
+*.sh text eol=lf
+
+# Other text files that should use LF in containers
+Dockerfile text eol=lf
