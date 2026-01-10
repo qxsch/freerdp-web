@@ -10,6 +10,7 @@ Uses a native C library (librdp_bridge.so) for direct RDP connection with:
 import asyncio
 import ctypes
 import io
+import json
 import logging
 import os
 import struct
@@ -711,6 +712,7 @@ class RDPBridge:
         
         # Track current frame ID for wire format tile messages
         current_frame_id = 0
+        disconnect_reason = None
         
         while self.running:
             try:
@@ -721,9 +723,11 @@ class RDPBridge:
                 
                 poll_count += 1                
                 if result < 0:
-                    # Error or disconnected
+                    # Error or disconnected - capture reason and signal shutdown
                     error = self._lib.rdp_get_error(self._session)
-                    logger.error(f"RDP poll error: {error.decode('utf-8') if error else 'Unknown'}")
+                    disconnect_reason = error.decode('utf-8') if error else 'Connection closed'
+                    logger.error(f"RDP poll error: {disconnect_reason}")
+                    self.running = False  # Signal all loops to stop
                     break
                 
                 # Check if GFX/H.264 pipeline is active (for logging only)
@@ -781,12 +785,26 @@ class RDPBridge:
                 await asyncio.sleep(0)
                 
             except asyncio.CancelledError:
+                disconnect_reason = 'Cancelled'
                 break
             except Exception as e:
                 logger.error(f"Frame streaming error: {e}")
                 await asyncio.sleep(0)
         
         logger.info(f"Frame streaming ended after {self._frame_count} frames")
+        
+        # Notify WebSocket client about disconnect
+        if disconnect_reason and self.websocket:
+            try:
+                await self.websocket.send(json.dumps({
+                    'type': 'disconnected',
+                    'reason': disconnect_reason
+                }))
+                logger.info(f"Sent disconnect notification to client: {disconnect_reason}")
+                # Close the WebSocket to break the server's message loop
+                await self.websocket.close(1000, disconnect_reason[:120])  # WebSocket close reason max 123 bytes
+            except Exception as e:
+                logger.debug(f"Could not send disconnect notification: {e}")
     
     async def _stream_audio(self):
         """Stream Opus audio from native FreeRDP buffer (no PulseAudio required)"""

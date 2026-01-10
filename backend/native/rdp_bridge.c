@@ -760,6 +760,7 @@ void rdp_destroy(RdpSession* session)
     pthread_mutex_destroy(&ctx->audio_mutex);
     pthread_mutex_destroy(&ctx->opus_mutex);
     pthread_mutex_destroy(&ctx->gfx_mutex);
+    pthread_mutex_destroy(&ctx->gfx_event_mutex);
     
     /* Free audio resources */
     if (ctx->opus_encoder) {
@@ -1135,14 +1136,47 @@ static void bridge_post_disconnect(freerdp* instance)
     rdpContext* context = instance->context;
     BridgeContext* ctx = (BridgeContext*)context;
     
+    fprintf(stderr, "[rdp_bridge] PostDisconnect: cleaning up session resources\n");
+    
+    /* Mark as disconnecting to prevent further GFX operations */
+    ctx->gfx_disconnecting = true;
+    
     /* Unsubscribe from channel events */
     PubSub_UnsubscribeChannelConnected(context->pubSub, bridge_on_channel_connected);
     PubSub_UnsubscribeChannelDisconnected(context->pubSub, bridge_on_channel_disconnected);
     
+    /* Clear GFX event queue to prevent stale events from being processed */
+    pthread_mutex_lock(&ctx->gfx_event_mutex);
+    ctx->gfx_event_write_idx = 0;
+    ctx->gfx_event_read_idx = 0;
+    ctx->gfx_event_count = 0;
+    pthread_mutex_unlock(&ctx->gfx_event_mutex);
+    
+    /* Clear audio state */
+    pthread_mutex_lock(&ctx->audio_mutex);
+    ctx->audio_buffer_pos = 0;
+    ctx->audio_read_pos = 0;
+    ctx->audio_initialized = false;
+    pthread_mutex_unlock(&ctx->audio_mutex);
+    
+    /* Clear Opus state */
+    pthread_mutex_lock(&ctx->opus_mutex);
+    ctx->opus_write_pos = 0;
+    ctx->opus_read_pos = 0;
+    ctx->opus_initialized = 0;
+    pthread_mutex_unlock(&ctx->opus_mutex);
+    
+    /* Clear GFX state */
+    pthread_mutex_lock(&ctx->gfx_mutex);
+    ctx->gfx_active = false;
+    ctx->gfx_pipeline_ready = false;
+    ctx->gfx_pipeline_needs_init = false;
+    ctx->gfx_frame_in_progress = false;
+    pthread_mutex_unlock(&ctx->gfx_mutex);
+    
     ctx->disp = NULL;
     ctx->gfx = NULL;
     ctx->rdpsnd = NULL;
-    ctx->audio_initialized = false;
     ctx->state = RDP_STATE_DISCONNECTED;
     ctx->frame_buffer = NULL;
     
@@ -1153,6 +1187,8 @@ static void bridge_post_disconnect(freerdp* instance)
     }
     
     gdi_free(instance);
+    
+    fprintf(stderr, "[rdp_bridge] PostDisconnect: cleanup complete\n");
 }
 
 static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventArgs* e)
