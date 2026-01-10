@@ -1219,11 +1219,18 @@ async function processMessage(event) {
         case 'resize':
             // Handle canvas/surface resize
             if (primaryCanvas) {
-                primaryCanvas.width = data.width;
-                primaryCanvas.height = data.height;
+                // Only resize if dimensions actually changed
+                if (primaryCanvas.width !== data.width || primaryCanvas.height !== data.height) {
+                    primaryCanvas.width = data.width;
+                    primaryCanvas.height = data.height;
+                    console.log(`[GFX Worker] Primary canvas resized to ${data.width}x${data.height}`);
+                }
             }
             if (primarySurfaceId !== null) {
-                createSurface(primarySurfaceId, data.width, data.height);
+                const existing = surfaces.get(primarySurfaceId);
+                if (!existing || existing.canvas.width !== data.width || existing.canvas.height !== data.height) {
+                    createSurface(primarySurfaceId, data.width, data.height);
+                }
             }
             break;
             

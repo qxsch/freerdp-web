@@ -2280,18 +2280,25 @@ export class RDPClient {
     }
 
     _handleServerResize(width, height) {
-        if (this._canvas.width === width && this._canvas.height === height) return;
-        
-        this._canvas.width = width;
-        this._canvas.height = height;
+        // Update resolution display
         this._el.resolution.textContent = `Resolution: ${width}x${height}`;
         
-        // Notify GFX worker of resize
+        // When using OffscreenCanvas (transferred to worker), we cannot resize
+        // the HTMLCanvasElement directly. The worker owns the canvas now.
+        // We need to notify the worker to resize the OffscreenCanvas instead.
         if (this._gfxWorker && this._gfxWorkerReady) {
             this._gfxWorker.postMessage({
                 type: 'resize',
                 data: { width, height }
             });
+        } else {
+            // Fallback: only resize HTMLCanvasElement if NOT transferred to worker
+            try {
+                this._canvas.width = width;
+                this._canvas.height = height;
+            } catch (e) {
+                // Canvas was transferred to offscreen, ignore
+            }
         }
         
         this._emit('resize', { width, height });
