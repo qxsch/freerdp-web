@@ -565,9 +565,8 @@ The native library wasn't built or installed. Use Docker which handles this auto
 ### No audio in browser
 - **Check browser compatibility**: Audio requires Chrome 94+, Edge 94+, Safari 26+, or Firefox 130+ (WebCodecs AudioDecoder)
 - **Check RDP server settings**: Ensure audio redirection is enabled on the Windows VM
-- **Check console logs**: Look for `[OPUS]` messages confirming audio frames are received
 
-### Container health check failing
+### Container health check
 The backend exposes `/health` endpoint. Test with:
 ```bash
 curl http://localhost:8765/health
