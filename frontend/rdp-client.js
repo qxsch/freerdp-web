@@ -847,6 +847,14 @@ export class RDPClient {
         this._el.btnKeyboard.addEventListener('click', () => this._toggleKeyboard());
         this._el.btnFullscreen.addEventListener('click', () => this._toggleFullscreen());
         
+        // Loading area - click to open modal if not connected/connecting
+        this._el.loading.addEventListener('click', () => {
+            if (!this._isConnected && !this._pendingConnect) {
+                this._showModal();
+            }
+        });
+        this._el.loading.style.cursor = 'pointer';
+        
         // Modal
         this._el.modalConnect.addEventListener('click', () => this._handleModalConnect());
         this._el.modalCancel.addEventListener('click', () => this._hideModal());
