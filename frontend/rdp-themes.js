@@ -60,11 +60,27 @@
  */
 
 /**
+ * @typedef {Object} RDPThemeFontFace
+ * @property {string} family - Font family name (e.g., 'Inter')
+ * @property {string} src - Font source URL (woff2, woff, ttf, otf)
+ * @property {string} [weight] - Font weight (e.g., '400', '700', '400 700')
+ * @property {string} [style] - Font style ('normal', 'italic')
+ * @property {string} [display] - Font display strategy ('swap', 'block', 'fallback')
+ */
+
+/**
+ * @typedef {Object} RDPThemeFonts
+ * @property {string[]} [googleFonts] - Google Fonts URLs (e.g., 'https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap')
+ * @property {RDPThemeFontFace[]} [fontFaces] - Custom @font-face definitions
+ */
+
+/**
  * @typedef {Object} RDPTheme
  * @property {'dark'|'light'|'midnight'|'highContrast'} [preset] - Base preset to extend
  * @property {RDPThemeColors} [colors] - Color overrides
  * @property {RDPThemeTypography} [typography] - Typography overrides
  * @property {RDPThemeShape} [shape] - Shape/spacing overrides
+ * @property {RDPThemeFonts} [fonts] - Custom font imports
  */
 
 // ============================================================
@@ -353,5 +369,127 @@ export function sanitizeTheme(themeConfig) {
         }
     }
     
+    // Sanitize fonts
+    if (sanitized.fonts) {
+        sanitized.fonts = { ...sanitized.fonts };
+        
+        // Validate Google Font URLs
+        if (sanitized.fonts.googleFonts) {
+            sanitized.fonts.googleFonts = sanitized.fonts.googleFonts.filter(url => {
+                if (!isValidFontUrl(url)) {
+                    console.warn(`[RDPTheme] Invalid Google Font URL: ${url}`);
+                    return false;
+                }
+                return true;
+            });
+        }
+        
+        // Validate font faces
+        if (sanitized.fonts.fontFaces) {
+            sanitized.fonts.fontFaces = sanitized.fonts.fontFaces.filter(face => {
+                if (!face.family || typeof face.family !== 'string') {
+                    console.warn(`[RDPTheme] Font face missing 'family' property`);
+                    return false;
+                }
+                if (!face.src || !isValidFontUrl(face.src)) {
+                    console.warn(`[RDPTheme] Invalid font source URL for "${face.family}": ${face.src}`);
+                    return false;
+                }
+                return true;
+            });
+        }
+    }
+    
     return sanitized;
+}
+
+// ============================================================
+// FONT UTILITIES
+// ============================================================
+
+/**
+ * Allowed font URL patterns (security: prevent arbitrary resource loading)
+ */
+const ALLOWED_FONT_PATTERNS = [
+    // Google Fonts
+    /^https:\/\/fonts\.googleapis\.com\/css2?/,
+    /^https:\/\/fonts\.gstatic\.com\//,
+    // Adobe Fonts (Typekit)
+    /^https:\/\/use\.typekit\.net\//,
+    // Font files (woff2, woff, ttf, otf) - any HTTPS source
+    /^https:\/\/.+\.(woff2?|ttf|otf)(\?.*)?$/i,
+    // Data URLs for embedded fonts
+    /^data:font\/(woff2?|ttf|opentype);base64,/,
+];
+
+/**
+ * Validate font URL against allowed patterns
+ * @param {string} url - Font URL to validate
+ * @returns {boolean} True if URL is allowed
+ */
+export function isValidFontUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    return ALLOWED_FONT_PATTERNS.some(pattern => pattern.test(url));
+}
+
+/**
+ * Generate CSS for font imports
+ * @param {RDPThemeFonts} fonts - Font configuration
+ * @returns {string} CSS string with @import and @font-face rules
+ */
+export function fontsToCss(fonts) {
+    if (!fonts) return '';
+    
+    const rules = [];
+    
+    // Google Fonts @import rules
+    if (fonts.googleFonts && fonts.googleFonts.length > 0) {
+        for (const url of fonts.googleFonts) {
+            rules.push(`@import url('${url}');`);
+        }
+    }
+    
+    // Custom @font-face rules
+    if (fonts.fontFaces && fonts.fontFaces.length > 0) {
+        for (const face of fonts.fontFaces) {
+            const srcFormat = getFontFormat(face.src);
+            const fontFace = `@font-face {
+    font-family: '${escapeCssString(face.family)}';
+    src: url('${face.src}')${srcFormat ? ` format('${srcFormat}')` : ''};
+    font-weight: ${face.weight || 'normal'};
+    font-style: ${face.style || 'normal'};
+    font-display: ${face.display || 'swap'};
+}`;
+            rules.push(fontFace);
+        }
+    }
+    
+    return rules.join('\n');
+}
+
+/**
+ * Detect font format from URL
+ * @param {string} url - Font URL
+ * @returns {string|null} Format identifier or null
+ */
+function getFontFormat(url) {
+    if (!url) return null;
+    if (url.includes('.woff2')) return 'woff2';
+    if (url.includes('.woff')) return 'woff';
+    if (url.includes('.ttf')) return 'truetype';
+    if (url.includes('.otf')) return 'opentype';
+    if (url.startsWith('data:font/woff2')) return 'woff2';
+    if (url.startsWith('data:font/woff')) return 'woff';
+    if (url.startsWith('data:font/ttf')) return 'truetype';
+    if (url.startsWith('data:font/opentype')) return 'opentype';
+    return null;
+}
+
+/**
+ * Escape string for use in CSS
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string
+ */
+function escapeCssString(str) {
+    return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }

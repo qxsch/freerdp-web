@@ -264,6 +264,12 @@ const client = new RDPClient(container, {
     shape: {
         borderRadius: '4px',         // Buttons, inputs
         borderRadiusLarge: '8px',    // Modals, overlays
+    },
+    
+    // Custom fonts (loaded into Shadow DOM)
+    fonts: {
+        googleFonts: ['https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap'],
+        fontFaces: [{ family: 'CustomFont', src: 'https://example.com/font.woff2' }]
     }
 }
 ```

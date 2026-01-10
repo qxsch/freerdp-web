@@ -28,7 +28,7 @@
  * });
  */
 
-import { resolveTheme, themeToCssVars, sanitizeTheme, themes } from './rdp-themes.js';
+import { resolveTheme, themeToCssVars, sanitizeTheme, fontsToCss, themes } from './rdp-themes.js';
 
 // ============================================================
 // STYLES - Shadow DOM isolated styles (uses CSS custom properties for theming)
@@ -692,8 +692,11 @@ export class RDPClient {
         const resolved = resolveTheme(sanitized);
         const cssVars = themeToCssVars(resolved);
         
-        // Apply as :host styles
-        this._themeStyle.textContent = `:host { ${cssVars}; }`;
+        // Generate font imports CSS
+        const fontCss = fontsToCss(sanitized.fonts);
+        
+        // Apply as :host styles with optional font imports
+        this._themeStyle.textContent = `${fontCss}\n:host { ${cssVars}; }`;
     }
     
     /**

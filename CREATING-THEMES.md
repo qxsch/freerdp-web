@@ -10,10 +10,11 @@ This guide walks you through creating custom themes for the RDP Web Client. Whet
 4. [Color Properties Reference](#color-properties-reference)
 5. [Typography Properties Reference](#typography-properties-reference)
 6. [Shape Properties Reference](#shape-properties-reference)
-7. [Step-by-Step: Creating a Corporate Theme](#step-by-step-creating-a-corporate-theme)
-8. [Step-by-Step: Creating an Accessible Theme](#step-by-step-creating-an-accessible-theme)
-9. [Best Practices](#best-practices)
-10. [Troubleshooting](#troubleshooting)
+7. [Custom Fonts](#custom-fonts)
+8. [Step-by-Step: Creating a Corporate Theme](#step-by-step-creating-a-corporate-theme)
+9. [Step-by-Step: Creating an Accessible Theme](#step-by-step-creating-an-accessible-theme)
+10. [Best Practices](#best-practices)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -57,7 +58,7 @@ This means you only need to specify the values you want to change!
 
 ## Theme Structure
 
-A complete theme has three sections: **colors**, **typography**, and **shape**.
+A complete theme has four sections: **colors**, **typography**, **shape**, and **fonts**.
 
 ```javascript
 const myTheme = {
@@ -106,6 +107,23 @@ const myTheme = {
     shape: {
         borderRadius: '4px',        // Buttons, inputs
         borderRadiusLarge: '8px',   // Modals, overlays
+    },
+    
+    fonts: {
+        // Google Fonts (recommended for ease of use)
+        googleFonts: [
+            'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap'
+        ],
+        // Or custom @font-face definitions
+        fontFaces: [
+            {
+                family: 'CustomFont',
+                src: 'https://example.com/fonts/custom.woff2',
+                weight: '400',
+                style: 'normal',
+                display: 'swap'
+            }
+        ]
     }
 };
 ```
@@ -269,6 +287,133 @@ shape: { borderRadius: '8px', borderRadiusLarge: '16px' }
 // Pill-shaped buttons
 shape: { borderRadius: '9999px', borderRadiusLarge: '16px' }
 ```
+
+---
+
+## Custom Fonts
+
+Since the RDP client uses Shadow DOM, fonts from your page won't automatically be available inside the component. The theme system provides a secure way to import custom fonts directly into the Shadow DOM.
+
+### Using Google Fonts (Recommended)
+
+The easiest way to use custom fonts:
+
+```javascript
+const client = new RDPClient(container, {
+    theme: {
+        fonts: {
+            googleFonts: [
+                'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap'
+            ]
+        },
+        typography: {
+            fontFamily: "'Inter', sans-serif"
+        }
+    }
+});
+```
+
+You can include multiple font families:
+
+```javascript
+fonts: {
+    googleFonts: [
+        'https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap',
+        'https://fonts.googleapis.com/css2?family=JetBrains+Mono&display=swap'
+    ]
+}
+```
+
+### Using Custom Font Files
+
+For self-hosted fonts or fonts not on Google Fonts, use `fontFaces`:
+
+```javascript
+const client = new RDPClient(container, {
+    theme: {
+        fonts: {
+            fontFaces: [
+                {
+                    family: 'Corporate Sans',
+                    src: 'https://cdn.example.com/fonts/corporate-sans-regular.woff2',
+                    weight: '400',
+                    style: 'normal',
+                    display: 'swap'
+                },
+                {
+                    family: 'Corporate Sans',
+                    src: 'https://cdn.example.com/fonts/corporate-sans-bold.woff2',
+                    weight: '700',
+                    style: 'normal',
+                    display: 'swap'
+                }
+            ]
+        },
+        typography: {
+            fontFamily: "'Corporate Sans', Arial, sans-serif"
+        }
+    }
+});
+```
+
+### Font Face Properties
+
+| Property | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `family` | ✅ Yes | - | Font family name to use in CSS |
+| `src` | ✅ Yes | - | URL to the font file (woff2, woff, ttf, otf) |
+| `weight` | No | `'normal'` | Font weight (`'400'`, `'700'`, `'100 900'`) |
+| `style` | No | `'normal'` | Font style (`'normal'`, `'italic'`) |
+| `display` | No | `'swap'` | Font display strategy (`'swap'`, `'block'`, `'fallback'`) |
+
+### Allowed Font Sources (Security)
+
+For security, only fonts from trusted sources are allowed:
+
+| Source | Example URL |
+|--------|-------------|
+| Google Fonts | `https://fonts.googleapis.com/css2?...` |
+| Google Fonts Static | `https://fonts.gstatic.com/...` |
+| Adobe Fonts (Typekit) | `https://use.typekit.net/...` |
+| Any HTTPS font file | `https://cdn.example.com/font.woff2` |
+| Data URLs | `data:font/woff2;base64,...` |
+
+⚠️ **Note**: HTTP URLs (non-HTTPS) are not allowed for security reasons.
+
+### Complete Font Example
+
+```javascript
+const corporateTheme = {
+    preset: 'dark',
+    
+    fonts: {
+        googleFonts: [
+            'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap'
+        ]
+    },
+    
+    typography: {
+        fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
+        fontSize: '14px',
+        fontSizeSmall: '0.875rem'
+    },
+    
+    colors: {
+        accent: '#0066cc'
+    }
+};
+
+const client = new RDPClient(container, {
+    theme: corporateTheme
+});
+```
+
+### Font Loading Tips
+
+1. **Use `display: 'swap'`** - Shows fallback font immediately, swaps when custom font loads
+2. **Subset fonts** - Use only the character sets you need (e.g., `&subset=latin`)
+3. **Preconnect** - Add `<link rel="preconnect" href="https://fonts.googleapis.com">` to your HTML for faster loading
+4. **Limit weights** - Only include font weights you actually use
 
 ---
 
@@ -549,22 +694,46 @@ client.setTheme({ colors: { accent: 'not-a-color' } });
 
 ### Font Not Loading
 
-**Symptoms**: Custom font not appearing
+**Symptoms**: Custom font not appearing inside the RDP client
 
 **Solutions**:
-1. Ensure the font is loaded before the client initializes
-2. Add a fallback font family
-3. Check for CORS issues if loading from CDN
 
-```html
-<!-- Load font before your script -->
-<link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet">
-```
+1. **Use the theme's `fonts` property** - Since the client uses Shadow DOM, external fonts must be imported via the theme:
 
 ```javascript
-// Always include fallbacks
-fontFamily: "'Inter', -apple-system, sans-serif"
+// ✅ Correct: Import font via theme
+client.setTheme({
+    fonts: {
+        googleFonts: [
+            'https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap'
+        ]
+    },
+    typography: {
+        fontFamily: "'Inter', sans-serif"
+    }
+});
+
+// ❌ Won't work: Font loaded in parent document only
+// <link href="...Inter..." rel="stylesheet"> in your HTML
+// The Shadow DOM can't see fonts from the parent document
 ```
+
+2. **Check the browser console** for validation warnings:
+```
+[RDPTheme] Invalid Google Font URL: ...
+[RDPTheme] Invalid font source URL for "FontName": ...
+```
+
+3. **Verify the URL is HTTPS** - HTTP URLs are blocked for security
+
+4. **Always include fallback fonts**:
+```javascript
+fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif"
+```
+
+5. **Check CORS headers** if using self-hosted fonts - the font server must allow cross-origin requests
+
+6. **Use `display: 'swap'`** to see fallback font while custom font loads
 
 ---
 
