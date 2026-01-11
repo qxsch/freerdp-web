@@ -181,7 +181,7 @@ function createSurface(surfaceId, width, height) {
     
     const canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext('2d', { 
-        alpha: true,  // Enable alpha for proper UI compositing with transparency
+        alpha: false,
         desynchronized: true,  // Reduce latency
         willReadFrequently: true  // Optimize for SurfaceToCache getImageData calls
     });
