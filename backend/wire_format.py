@@ -39,6 +39,7 @@ class Magic:
     S2CH = b'S2CH'  # surfaceToCache (frontend stores in its cache)
     EVCT = b'EVCT'  # evictCache (frontend deletes cache slot)
     RSGR = b'RSGR'  # resetGraphics (frontend resets all state)
+    CAPS = b'CAPS'  # capsConfirm (server capability confirmation)
     
     # Video
     H264 = b'H264'  # H.264 NAL
@@ -288,6 +289,26 @@ def build_reset_graphics(width: int, height: int) -> bytes:
                        Magic.RSGR,
                        width,
                        height)
+
+
+def build_caps_confirm(version: int, flags: int) -> bytes:
+    """
+    Build capsConfirm message.
+    
+    Informs frontend about server's confirmed GFX capabilities.
+    Layout: CAPS(4) + version(4) + flags(4) = 12 bytes
+    
+    Args:
+        version: GFX capability version (e.g., 0x00080105 = 8.1)
+        flags: GFX capability flags (THINCLIENT, SMALL_CACHE, AVC420_ENABLED, etc.)
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sII',
+                       Magic.CAPS,
+                       version,
+                       flags)
 
 
 def build_clearcodec_tile(frame_id: int, surface_id: int,

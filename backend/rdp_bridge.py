@@ -29,6 +29,7 @@ from wire_format import (
     build_surface_to_cache, build_cache_to_surface, build_evict_cache,
     build_map_surface_to_output, build_webp_tile, build_h264_frame,
     build_reset_graphics, parse_frame_ack, parse_backpressure, get_message_type,
+    build_caps_confirm,
     build_clearcodec_tile
 )
 
@@ -132,6 +133,7 @@ RDP_GFX_EVENT_WEBP_TILE = 10
 RDP_GFX_EVENT_VIDEO_FRAME = 11
 RDP_GFX_EVENT_EVICT_CACHE = 12
 RDP_GFX_EVENT_RESET_GRAPHICS = 13
+RDP_GFX_EVENT_CAPS_CONFIRM = 14
 
 
 class RdpGfxEvent(Structure):
@@ -159,6 +161,9 @@ class RdpGfxEvent(Structure):
         ('nal_size', c_uint32),     # Size of NAL data
         ('chroma_nal_data', c_void_p), # Chroma NAL for AVC444
         ('chroma_nal_size', c_uint32), # Size of chroma NAL
+        # Capability confirmation (for CAPS_CONFIRM)
+        ('gfx_version', c_uint32),  # GFX version from CapsConfirm
+        ('gfx_flags', c_uint32),    # GFX flags from CapsConfirm
     ]
 
 
@@ -641,6 +646,11 @@ class RDPBridge:
             return build_reset_graphics(
                 event.width,
                 event.height
+            )
+        elif event.type == RDP_GFX_EVENT_CAPS_CONFIRM:
+            return build_caps_confirm(
+                event.gfx_version,
+                event.gfx_flags
             )
         elif event.type == RDP_GFX_EVENT_WEBP_TILE:
             # WebP tile with pre-encoded data from C

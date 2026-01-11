@@ -236,6 +236,18 @@ static struct {
 /* Mutex to protect the connect phase (g_audio_ctx handoff to plugin) */
 static pthread_mutex_t g_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Mutex for thread-safe logging to stderr */
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Thread-safe logging function - writes entire buffer atomically */
+static void log_stderr(const char* buffer)
+{
+    pthread_mutex_lock(&g_log_mutex);
+    fputs(buffer, stderr);
+    fflush(stderr);
+    pthread_mutex_unlock(&g_log_mutex);
+}
+
 /* ============================================================================
  * Session Registry for Multi-User Audio Isolation
  * 
@@ -425,6 +437,155 @@ void* rdp_get_session_audio_context(void* session_ptr)
 }
 
 /* ============================================================================
+ * GFX/Codec Capability Logging
+ * ============================================================================ */
+
+#define LOG_BUFFER_SIZE 4096
+
+static void log_settings(rdpSettings* settings, const char* phase)
+{
+    char buf[LOG_BUFFER_SIZE];
+    int pos = 0;
+    
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "┌──────────────────────────────────────────────────────────────┐\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ RDP Settings: %-46s │\n", phase);
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* Graphics Pipeline */
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ Graphics Pipeline                                            │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   SupportGraphicsPipeline: %-6s                            │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   ColorDepth:              %-6u                            │\n",
+            freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth));
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* H.264/AVC Codecs */
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ H.264/AVC Codecs                                             │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   GfxH264:      %-6s    GfxAVC444:     %-6s              │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxH264) ? "YES" : "NO",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   GfxAVC444v2:  %-6s                                       │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444v2) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* Progressive/RemoteFX */
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ Progressive/RemoteFX                                         │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   GfxProgressive:   %-6s  GfxProgressiveV2: %-6s         │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxProgressive) ? "YES" : "NO",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxProgressiveV2) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   RemoteFxCodec:    %-6s                                   │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* Other Codecs */
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ Other Codecs                                                 │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   NSCodec:    %-6s  JpegCodec:  %-6s  GfxPlanar: %-6s  │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_NSCodec) ? "YES" : "NO",
+            freerdp_settings_get_bool(settings, FreeRDP_JpegCodec) ? "YES" : "NO",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxPlanar) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* GFX Flags */
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ GFX Flags                                                    │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   SmallCache: %-6s  ThinClient: %-6s                     │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxSmallCache) ? "YES" : "NO",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxThinClient) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   SendQoeAck: %-6s  SuspendFrameAck: %-6s                │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxSendQoeAck) ? "YES" : "NO",
+            freerdp_settings_get_bool(settings, FreeRDP_GfxSuspendFrameAck) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   GfxCapsFilter: 0x%08X                                  │\n",
+            freerdp_settings_get_uint32(settings, FreeRDP_GfxCapsFilter));
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* Audio */
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ Audio                                                        │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   AudioPlayback:      %-6s                                 │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   AudioCapture:       %-6s                                 │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_AudioCapture) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   RemoteConsoleAudio: %-6s                                 │\n",
+            freerdp_settings_get_bool(settings, FreeRDP_RemoteConsoleAudio) ? "YES" : "NO");
+    
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "└──────────────────────────────────────────────────────────────┘\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "\n");
+    
+    log_stderr(buf);
+}
+
+static void log_caps_confirm(UINT32 version, UINT32 flags)
+{
+    char buf[LOG_BUFFER_SIZE];
+    int pos = 0;
+    
+    /* Decode version */
+    const char* version_str = "Unknown";
+    bool h264_supported = false;
+    switch (version) {
+        case RDPGFX_CAPVERSION_8:    version_str = "8.0"; break;
+        case RDPGFX_CAPVERSION_81:   version_str = "8.1"; break;
+        case RDPGFX_CAPVERSION_10:   version_str = "10.0"; h264_supported = true; break;
+        case RDPGFX_CAPVERSION_101:  version_str = "10.1"; h264_supported = true; break;
+        case RDPGFX_CAPVERSION_102:  version_str = "10.2"; h264_supported = true; break;
+        case RDPGFX_CAPVERSION_103:  version_str = "10.3"; h264_supported = true; break;
+        case RDPGFX_CAPVERSION_104:  version_str = "10.4"; h264_supported = true; break;
+        case RDPGFX_CAPVERSION_105:  version_str = "10.5"; h264_supported = true; break;
+        case RDPGFX_CAPVERSION_106:  version_str = "10.6"; h264_supported = true; break;
+        case RDPGFX_CAPVERSION_107:  version_str = "10.7"; h264_supported = true; break;
+    }
+    
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "┌──────────────────────────────────────────────────────────────┐\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ Server CapsConfirm                                           │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   Version: %-8s (0x%08X)                             │\n", version_str, version);
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   Flags:   0x%08X                                        │\n", flags);
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* Flag breakdown - meaningful descriptions for each flag */
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ Flag Breakdown                                               │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   Thin Client Mode:   %-8s  (limited graphics if Active) │\n",
+            (flags & RDPGFX_CAPS_FLAG_THINCLIENT) ? "Active" : "Inactive");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   Small Cache:        %-8s  (reduced tile cache)         │\n",
+            (flags & RDPGFX_CAPS_FLAG_SMALL_CACHE) ? "Active" : "Inactive");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   H.264 AVC420:       %-8s  (4:2:0 chroma subsampling)   │\n",
+            (flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) ? "Enabled" : "Disabled");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   H.264 Blocked:      %-8s  (AVC_DISABLED flag)          │\n",
+            (flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) ? "YES!" : "No");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   AVC Thin Client:    %-8s  (reduced H.264 quality)      │\n",
+            (flags & RDPGFX_CAPS_FLAG_AVC_THINCLIENT) ? "Active" : "Inactive");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+    
+    /* Codec availability - based on negotiated version */
+    bool progressive_supported = (version >= RDPGFX_CAPVERSION_81);  /* Progressive requires 8.1+ */
+    bool clearcodec_supported = (version >= RDPGFX_CAPVERSION_8);    /* ClearCodec available in all GFX versions */
+    
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│ Codec Availability                                           │\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   H.264/AVC:   %-6s   AVC420:      %-6s                  │\n",
+            (h264_supported && !(flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) ? "YES" : "NO",
+            (flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) ? "YES" : "NO");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   Progressive: %-6s   ClearCodec:  %-6s                  │\n",
+            progressive_supported ? "YES" : "NO",
+            clearcodec_supported ? "YES" : "NO");
+    
+    /* Warnings */
+    if (!h264_supported) {
+        pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+        pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   WARNING: GFX version < 10.0 - H.264 NOT available!         │\n");
+        pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   Server will use ClearCodec + Progressive only.             │\n");
+    }
+    if (flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) {
+        pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "├──────────────────────────────────────────────────────────────┤\n");
+        pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "│   WARNING: AVC_DISABLED flag set - H.264 explicitly off!     │\n");
+    }
+    
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "└──────────────────────────────────────────────────────────────┘\n");
+    pos += snprintf(buf + pos, LOG_BUFFER_SIZE - pos, "\n");
+    
+    log_stderr(buf);
+}
+
+/* ============================================================================
  * Session Lifecycle
  * ============================================================================ */
 
@@ -547,8 +708,8 @@ RdpSession* rdp_create(
      */
     if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE)) goto fail;
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, FALSE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE)) goto fail;
     
     /* Progressive codec: Enabled by default for optimal quality.
      * RemoteFX progressive tiles are passed through to browser for WASM decoding. */
@@ -564,7 +725,7 @@ RdpSession* rdp_create(
      * This avoids leftover artifacts when windows are de-maximized within the RDP session,
      * as the server won't rely on our client-side cache for desktop background repaints.
      * GfxThinClient = FALSE: Keep full AVC444/H.264 quality (ThinClient would reduce it). */
-    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, FALSE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxThinClient, FALSE)) goto fail;
     
     /* Audio playback - configure rdpsnd with our bridge device plugin.
@@ -575,6 +736,9 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, FALSE)) goto fail;
     
+    /* Log all settings for troubleshooting */
+    log_settings(settings, "rdp_create");
+
     /* Add rdpsnd to STATIC channel collection with sys:bridge */
     {
         ADDIN_ARGV* args = freerdp_addin_argv_new(2, (const char*[]){"rdpsnd", "sys:bridge"});
@@ -1714,20 +1878,15 @@ static UINT gfx_on_caps_confirm(RdpgfxClientContext* context, const RDPGFX_CAPS_
     UINT32 version = caps->capsSet->version;
     UINT32 flags = caps->capsSet->flags;
     
-    /* Decode version */
-    const char* version_str = "Unknown";
-    switch (version) {
-        case RDPGFX_CAPVERSION_8:    version_str = "8.0"; break;
-        case RDPGFX_CAPVERSION_81:   version_str = "8.1"; break;
-        case RDPGFX_CAPVERSION_10:   version_str = "10.0"; break;
-        case RDPGFX_CAPVERSION_101:  version_str = "10.1"; break;
-        case RDPGFX_CAPVERSION_102:  version_str = "10.2"; break;
-        case RDPGFX_CAPVERSION_103:  version_str = "10.3"; break;
-        case RDPGFX_CAPVERSION_104:  version_str = "10.4"; break;
-        case RDPGFX_CAPVERSION_105:  version_str = "10.5"; break;
-        case RDPGFX_CAPVERSION_106:  version_str = "10.6"; break;
-        case RDPGFX_CAPVERSION_107:  version_str = "10.7"; break;
-    }
+    /* Log the confirmed capabilities */
+    log_caps_confirm(version, flags);
+    
+    /* Queue CAPS_CONFIRM event for frontend */
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_CAPS_CONFIRM;
+    event.gfx_version = version;
+    event.gfx_flags = flags;
+    gfx_queue_event(bctx, &event);
     
     return CHANNEL_RC_OK;
 }
@@ -1786,6 +1945,16 @@ static UINT gfx_on_create_surface(RdpgfxClientContext* context, const RDPGFX_CRE
     /* PURE GFX MODE: Track surfaces ourselves, no GDI chaining */
     BridgeContext* bctx = (BridgeContext*)context->custom;
     if (!bctx) return ERROR_INVALID_PARAMETER;
+    
+    /* Log pixel format for debugging */
+    const char* format_str = "UNKNOWN";
+    switch (create->pixelFormat) {
+        case GFX_PIXEL_FORMAT_XRGB_8888: format_str = "XRGB_8888 (0x20)"; break;
+        case GFX_PIXEL_FORMAT_ARGB_8888: format_str = "ARGB_8888 (0x21)"; break;
+        default: break;
+    }
+    fprintf(stderr, "[GFX] CreateSurface: id=%u, %ux%u, pixelFormat=%s (0x%02X)\n",
+        create->surfaceId, create->width, create->height, format_str, create->pixelFormat);
     
     pthread_mutex_lock(&bctx->gfx_mutex);
     

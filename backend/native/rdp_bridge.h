@@ -105,6 +105,7 @@ typedef enum {
     RDP_GFX_EVENT_VIDEO_FRAME,      /* H.264/Progressive video frame (11) */
     RDP_GFX_EVENT_EVICT_CACHE,      /* Evict cache slot (12) */
     RDP_GFX_EVENT_RESET_GRAPHICS,   /* Reset graphics (13) - new dimensions */
+    RDP_GFX_EVENT_CAPS_CONFIRM,     /* Server capability confirmation (14) */
 } RdpGfxEventType;
 
 /* GFX event for Python consumption */
@@ -132,6 +133,9 @@ typedef struct {
     uint32_t nal_size;              /* Size of NAL/Progressive data */
     uint8_t* chroma_nal_data;       /* Chroma NAL for AVC444 (NULL for others) */
     uint32_t chroma_nal_size;       /* Size of chroma NAL (0 for non-AVC444) */
+    /* Capability confirmation (for CAPS_CONFIRM) */
+    uint32_t gfx_version;           /* GFX version from CapsConfirm */
+    uint32_t gfx_flags;             /* GFX flags from CapsConfirm */
 } RdpGfxEvent;
 
 /* Opaque session handle */

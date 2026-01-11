@@ -32,6 +32,7 @@ export const Magic = {
     S2CH: new Uint8Array([0x53, 0x32, 0x43, 0x48]),  // "S2CH" - surfaceToCache
     EVCT: new Uint8Array([0x45, 0x56, 0x43, 0x54]),  // "EVCT" - evictCache
     RSGR: new Uint8Array([0x52, 0x53, 0x47, 0x52]),  // "RSGR" - resetGraphics
+    CAPS: new Uint8Array([0x43, 0x41, 0x50, 0x53]),  // "CAPS" - capsConfirm
     
     // Video
     H264: new Uint8Array([0x48, 0x32, 0x36, 0x34]),  // "H264" - H.264 NAL
@@ -369,6 +370,19 @@ export function parseResetGraphics(data) {
 }
 
 /**
+ * Parse capsConfirm message
+ * Layout: CAPS(4) + version(4) + flags(4) = 12 bytes
+ */
+export function parseCapsConfirm(data) {
+    if (data.length < 12) return null;
+    return {
+        type: 'capsConfirm',
+        version: readU32LE(data, 4),
+        flags: readU32LE(data, 8),
+    };
+}
+
+/**
  * Parse H.264 video frame (legacy format from existing implementation)
  * Layout: H264(4) + frameId(4) + surfaceId(2) + codecId(2) + frameType(1) + 
  *         destX(2) + destY(2) + destW(2) + destH(2) + nalSize(4) + chromaNalSize(4) + data
@@ -451,6 +465,7 @@ export function parseMessage(data) {
         case 'S2CH': return parseSurfaceToCache(data);
         case 'EVCT': return parseEvictCache(data);
         case 'RSGR': return parseResetGraphics(data);
+        case 'CAPS': return parseCapsConfirm(data);
         case 'H264': return parseH264Frame(data);
         default: return null;
     }
