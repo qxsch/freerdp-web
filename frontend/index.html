@@ -218,6 +218,8 @@
                 <li><code>sendCtrlAltDel()</code> - Send Ctrl+Alt+Del</li>
                 <li><code>setTheme(config)</code> - Apply theme dynamically</li>
                 <li><code>getStatus()</code> - Get connection status</li>
+                <li><code>isConnected()</code> - Check if connected</li>
+                <li><code>getLatency()</code> - Get latency in ms</li>
                 <li><code>getMuted()</code> - Get audio mute state</li>
                 <li><code>setMuted(bool)</code> - Set audio mute</li>
                 <li><code>getResolution()</code> - Get current resolution</li>
@@ -243,6 +245,7 @@ client.setTheme({
                 <li><code>'connected'</code> - Session connected</li>
                 <li><code>'disconnected'</code> - Session ended</li>
                 <li><code>'resize'</code> - Resolution changed</li>
+                <li><code>'latency'</code> - Latency updated ({ latencyMs })</li>
                 <li><code>'error'</code> - Error occurred</li>
                 <li><code>'keyboardShow'</code> - Virtual keyboard shown</li>
                 <li><code>'keyboardHide'</code> - Virtual keyboard hidden</li>

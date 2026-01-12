@@ -29,6 +29,7 @@
  */
 
 import { resolveTheme, themeToCssVars, sanitizeTheme, fontsToCss, themes } from './rdp-themes.js';
+import { Magic, matchMagic } from './wire-format.js';
 
 // ============================================================
 // STYLES - Shadow DOM isolated styles (uses CSS custom properties for theming)
@@ -587,25 +588,6 @@ const TEMPLATE = `
 `;
 
 // ============================================================
-// CONSTANTS
-// ============================================================
-const OPUS_MAGIC = [0x4F, 0x50, 0x55, 0x53];  // "OPUS"
-const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x49]; // "AUDI"
-const H264_MAGIC = [0x48, 0x32, 0x36, 0x34];  // "H264"
-
-// New GFX event stream magic codes (4 bytes each)
-const SURF_MAGIC = [0x53, 0x55, 0x52, 0x46];  // "SURF" - createSurface
-const DELS_MAGIC = [0x44, 0x45, 0x4C, 0x53];  // "DELS" - deleteSurface
-const STFR_MAGIC = [0x53, 0x54, 0x46, 0x52];  // "STFR" - startFrame
-const ENFR_MAGIC = [0x45, 0x4E, 0x46, 0x52];  // "ENFR" - endFrame
-const PROG_MAGIC = [0x50, 0x52, 0x4F, 0x47];  // "PROG" - progressive tile
-const WEBP_MAGIC = [0x57, 0x45, 0x42, 0x50];  // "WEBP" - WebP tile
-const TILE_MAGIC = [0x54, 0x49, 0x4C, 0x45];  // "TILE" - raw RGBA tile
-const SFIL_MAGIC = [0x53, 0x46, 0x49, 0x4C];  // "SFIL" - solidFill
-const S2SF_MAGIC = [0x53, 0x32, 0x53, 0x46];  // "S2SF" - surfaceToSurface
-const C2SF_MAGIC = [0x43, 0x32, 0x53, 0x46];  // "C2SF" - cacheToSurface
-
-// ============================================================
 // RDP CLIENT CLASS
 // ============================================================
 export class RDPClient {
@@ -719,6 +701,7 @@ export class RDPClient {
         this._ctx = null;
         this._lastMouseSend = 0;
         this._pingStart = 0;
+        this._lastLatency = null;
         this._resizeTimeout = null;
         this._lastRequestedWidth = 0;
         this._lastRequestedHeight = 0;
@@ -1186,6 +1169,23 @@ export class RDPClient {
     }
 
     /**
+     * Check if connected to RDP server
+     * @returns {boolean} True if connected
+     */
+    isConnected() {
+        return this._isConnected;
+    }
+
+    /**
+     * Get current latency in milliseconds
+     * @returns {number|null} Latency in ms, or null if not yet measured
+     */
+    getLatency() {
+        if (!this._isConnected || this._pingStart === 0) return null;
+        return this._lastLatency || null;
+    }
+
+    /**
      * Capture a screenshot of the current remote desktop
      * @param {string} [type='png'] - Image type: 'png' or 'jpg'
      * @param {number} [quality=0.9] - JPEG quality (0-1), ignored for PNG
@@ -1383,11 +1383,11 @@ export class RDPClient {
             const bytes = new Uint8Array(event.data);
             
             // Audio - always handle on main thread
-            if (this._matchMagic(bytes, OPUS_MAGIC)) {
+            if (matchMagic(bytes, Magic.OPUS)) {
                 this._handleOpusFrame(bytes);
                 return;
             }
-            if (this._matchMagic(bytes, AUDIO_MAGIC)) {
+            if (matchMagic(bytes, Magic.AUDI)) {
                 this._handleAudioFrame(bytes);
                 return;
             }
@@ -1443,22 +1443,16 @@ export class RDPClient {
     _isGfxEventMessage(bytes) {
         if (bytes.length < 4) return false;
         
-        return this._matchMagic(bytes, SURF_MAGIC) ||
-               this._matchMagic(bytes, DELS_MAGIC) ||
-               this._matchMagic(bytes, STFR_MAGIC) ||
-               this._matchMagic(bytes, ENFR_MAGIC) ||
-               this._matchMagic(bytes, PROG_MAGIC) ||
-               this._matchMagic(bytes, WEBP_MAGIC) ||
-               this._matchMagic(bytes, TILE_MAGIC) ||
-               this._matchMagic(bytes, SFIL_MAGIC) ||
-               this._matchMagic(bytes, S2SF_MAGIC) ||
-               this._matchMagic(bytes, C2SF_MAGIC);
-    }
-
-    _matchMagic(bytes, magic) {
-        return bytes.length > 12 &&
-            bytes[0] === magic[0] && bytes[1] === magic[1] &&
-            bytes[2] === magic[2] && bytes[3] === magic[3];
+        return matchMagic(bytes, Magic.SURF) ||
+               matchMagic(bytes, Magic.DELS) ||
+               matchMagic(bytes, Magic.STFR) ||
+               matchMagic(bytes, Magic.ENFR) ||
+               matchMagic(bytes, Magic.PROG) ||
+               matchMagic(bytes, Magic.WEBP) ||
+               matchMagic(bytes, Magic.TILE) ||
+               matchMagic(bytes, Magic.SFIL) ||
+               matchMagic(bytes, Magic.S2SF) ||
+               matchMagic(bytes, Magic.C2SF);
     }
 
     _handleConnected(msg) {
@@ -1580,7 +1574,9 @@ export class RDPClient {
 
     _handlePong() {
         const latency = Math.round(performance.now() - this._pingStart);
+        this._lastLatency = latency;
         this._el.latency.textContent = `Latency: ${latency}ms`;
+        this._emit('latency', { latencyMs: latency });
     }
 
     // --------------------------------------------------

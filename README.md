@@ -351,6 +351,8 @@ document.body.style.background = themes.midnight.colors.background;
 | `isKeyboardVisible()` | Returns `true` if virtual keyboard is visible |
 | `setTheme(config)` | Apply a new theme configuration dynamically |
 | `getStatus()` | Returns `{ connected, resolution, muted }` |
+| `isConnected()` | Returns `true` if connected to RDP server |
+| `getLatency()` | Returns current latency in ms, or `null` if not measured |
 | `getMuted()` | Returns current mute state (boolean) |
 | `setMuted(bool)` | Set audio mute state |
 | `getResolution()` | Returns `{ width, height }` or `null` if not connected |
@@ -367,6 +369,7 @@ document.body.style.background = themes.midnight.colors.background;
 | `'connected'` | `{ width, height }` | RDP session established |
 | `'disconnected'` | - | Session ended |
 | `'resize'` | `{ width, height }` | Resolution changed |
+| `'latency'` | `{ latencyMs }` | Latency measurement updated (every 5 seconds) |
 | `'error'` | `{ message }` | Error occurred |
 | `'keyboardShow'` | - | Virtual keyboard was shown |
 | `'keyboardHide'` | - | Virtual keyboard was hidden |
