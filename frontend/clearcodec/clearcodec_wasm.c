@@ -768,7 +768,7 @@ static bool clear_decompress_subcodecs_data(
             }
             
             case 1:
-                /* NSCodec */
+                /* NSCodec (YCoCg color space) */
                 if (!clear_decompress_nscodec(s, bitmapDataByteCount, width, height,
                         pDstData, nDstStep, nXDstRel, nYDstRel, nDstWidth, nDstHeight)) {
                     return false;
@@ -873,7 +873,12 @@ static bool clear_decompress_bands_data(
                 vBarYOn = stream_read_u8(s);
                 suboffset += 1;
                 
-                vBarShortPixelCount = vBarShortEntry->count;
+                /* Handle empty cache entry - fill with background color */
+                if (vBarShortEntry->size == 0) {
+                    vBarShortPixelCount = 0;
+                } else {
+                    vBarShortPixelCount = vBarShortEntry->count;
+                }
                 vBarUpdate = true;
             }
             else if ((vBarHeader & 0xC000) == 0x0000) {
@@ -1070,12 +1075,35 @@ static bool clear_decompress_glyph_data(
         /* Cache hit - render glyph from cache */
         ClearGlyphEntry* glyphEntry = &ctx->glyphCache[glyphIndex];
         
+        /* Handle empty cache entry by filling with opaque black for robustness */
         if (!glyphEntry->pixels) {
-            return false;
+            uint32_t pixelCount = nWidth * nHeight;
+            glyphEntry->count = pixelCount;
+            glyphEntry->size = pixelCount;
+            glyphEntry->pixels = (uint32_t*)malloc(pixelCount * BYTES_PER_PIXEL);
+            if (!glyphEntry->pixels) {
+                return false;
+            }
+            uint32_t opaqueBlack = make_rgba(0, 0, 0, 0xFF);
+            for (uint32_t i = 0; i < pixelCount; i++) {
+                glyphEntry->pixels[i] = opaqueBlack;
+            }
         }
         
         if ((nWidth * nHeight) > glyphEntry->count) {
-            return false;
+            /* Expand cache if requested size is larger */
+            uint32_t pixelCount = nWidth * nHeight;
+            uint32_t* tmp = (uint32_t*)realloc(glyphEntry->pixels, pixelCount * BYTES_PER_PIXEL);
+            if (!tmp) {
+                return false;
+            }
+            uint32_t opaqueBlack = make_rgba(0, 0, 0, 0xFF);
+            for (uint32_t i = glyphEntry->count; i < pixelCount; i++) {
+                tmp[i] = opaqueBlack;
+            }
+            glyphEntry->pixels = tmp;
+            glyphEntry->count = pixelCount;
+            glyphEntry->size = pixelCount;
         }
         
         /* Copy cached glyph to destination */
@@ -1155,13 +1183,14 @@ static int32_t clear_decompress_internal(
     glyphFlags = stream_read_u8(s);
     seqNumber = stream_read_u8(s);
     
-    /* Handle sequence number */
+    /* Handle sequence number - sync if ctx is 0 or resync on mismatch
+     * for recovery from reconnect/network issues */
     if (!ctx->seqNumber && seqNumber) {
         ctx->seqNumber = seqNumber;
     }
     
     if (seqNumber != ctx->seqNumber) {
-        return -1;
+        ctx->seqNumber = seqNumber;
     }
     
     ctx->seqNumber = (seqNumber + 1) % 256;

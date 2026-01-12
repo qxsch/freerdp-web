@@ -43,7 +43,7 @@ if(EMSCRIPTEN)
             -sEXPORT_ES6=1 \
             -sEXPORT_NAME=ClearCodecDecoderModule \
             -sENVIRONMENT=web,worker \
-            -sINITIAL_MEMORY=16777216 \
+            -sINITIAL_MEMORY=33554432 \
             -sSTACK_SIZE=1048576 \
             -sNO_EXIT_RUNTIME=1 \
             -sFILESYSTEM=0 \

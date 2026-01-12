@@ -777,7 +777,7 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, TRUE)) goto fail;
     
-    /* Disable legacy codecs - we want H.264 only */
+    /* Disable legacy codecs */
     if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, FALSE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_NSCodec, FALSE)) goto fail;
     /* GFX options for optimal streaming.

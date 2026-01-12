@@ -72,19 +72,17 @@ void rfx_ycbcr_to_bgra(const int16_t* yData, const int16_t* cbData,
              *   G = Y - 0.343730 * Cb - 0.714401 * Cr
              *   B = Y + 1.769905 * Cb
              * 
-             * FreeRDP's yCbCrToRGB_16s16s_P3P3 uses:
-             *   g = cy - cb * ycbcr_constants[16][1] - cr * ycbcr_constants[16][2]
-             * where [1]=46819, [2]=22527. This swaps the usual Cb/Cr roles.
-             * We match FreeRDP exactly for compatibility.
+             * FreeRDP's ycbcr_constants[16] = { 91916, 46819, 22527, 115992 }
+             * Index mapping: [0]=CrR, [1]=CrG, [2]=CbG, [3]=CbB
              */
             int64_t Y_scaled = (int64_t)Y << 16;
-            int64_t CrR = (int64_t)Cr * 91916;   /* constant[0] = 1.402525 * 65536 */
-            int64_t CbG = (int64_t)Cb * 46819;   /* constant[1] - FreeRDP swaps this */
-            int64_t CrG = (int64_t)Cr * 22527;   /* constant[2] - FreeRDP swaps this */
-            int64_t CbB = (int64_t)Cb * 115992;  /* constant[3] = 1.769905 * 65536 */
+            int64_t CrR = (int64_t)Cr * 91916;   /* [0] = 1.402525 * 65536 */
+            int64_t CrG = (int64_t)Cr * 46819;   /* [1] = 0.714401 * 65536 */
+            int64_t CbG = (int64_t)Cb * 22527;   /* [2] = 0.343730 * 65536 */
+            int64_t CbB = (int64_t)Cb * 115992;  /* [3] = 1.769905 * 65536 */
             
             int R = (int)((Y_scaled + CrR) >> 21);  /* >> 16 + 5 combined */
-            int G = (int)((Y_scaled - CbG - CrG) >> 21);  /* Matches FreeRDP exactly */
+            int G = (int)((Y_scaled - CbG - CrG) >> 21);
             int B = (int)((Y_scaled + CbB) >> 21);
             
             /* Write BGRA */
@@ -119,22 +117,20 @@ void rfx_ycbcr_to_rgba(const int16_t* yData, const int16_t* cbData,
             /* 
              * Color conversion formula (ITU-R BT.601):
              *   R = Y + 1.402525 * Cr
-             *   G = Y - 0.343730 * Cb - 0.714401 * Cr  
+             *   G = Y - 0.343730 * Cb - 0.714401 * Cr
              *   B = Y + 1.769905 * Cb
              * 
-             * FreeRDP's yCbCrToRGB_16s16s_P3P3 uses:
-             *   g = cy - cb * ycbcr_constants[16][1] - cr * ycbcr_constants[16][2]
-             * where [1]=46819, [2]=22527. This swaps the usual Cb/Cr roles.
-             * We match FreeRDP exactly for compatibility.
+             * FreeRDP's ycbcr_constants[16] = { 91916, 46819, 22527, 115992 }
+             * Index mapping: [0]=CrR, [1]=CrG, [2]=CbG, [3]=CbB
              */
             int64_t Y_scaled = (int64_t)Y << 16;
-            int64_t CrR = (int64_t)Cr * 91916;   /* constant[0] = 1.402525 * 65536 */
-            int64_t CbG = (int64_t)Cb * 46819;   /* constant[1] - FreeRDP swaps this */
-            int64_t CrG = (int64_t)Cr * 22527;   /* constant[2] - FreeRDP swaps this */
-            int64_t CbB = (int64_t)Cb * 115992;  /* constant[3] = 1.769905 * 65536 */
+            int64_t CrR = (int64_t)Cr * 91916;   /* [0] = 1.402525 * 65536 */
+            int64_t CrG = (int64_t)Cr * 46819;   /* [1] = 0.714401 * 65536 */
+            int64_t CbG = (int64_t)Cb * 22527;   /* [2] = 0.343730 * 65536 */
+            int64_t CbB = (int64_t)Cb * 115992;  /* [3] = 1.769905 * 65536 */
             
             int R = (int)((Y_scaled + CrR) >> 21);  /* >> 16 + 5 combined */
-            int G = (int)((Y_scaled - CbG - CrG) >> 21);  /* Matches FreeRDP exactly */
+            int G = (int)((Y_scaled - CbG - CrG) >> 21);
             int B = (int)((Y_scaled + CbB) >> 21);
             
             /* Write RGBA */
