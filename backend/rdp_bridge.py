@@ -1115,7 +1115,12 @@ class RDPBridge:
         shift: bool = False, alt: bool = False,
         meta: bool = False
     ):
-        """Send keyboard event to VM"""
+        """Send keyboard event to VM
+        
+        Uses Unicode input for printable characters to support international
+        keyboard layouts (e.g., German QWERTZ). Falls back to scancodes for
+        special keys, modifiers, and key combinations.
+        """
         if not self.running:
             return
         
@@ -1123,21 +1128,38 @@ class RDPBridge:
             return
         
         try:
-            # Get scancode from mapping
-            scancode = SCANCODE_MAP.get(code)
-            
-            if scancode is None:
-                logger.debug(f"Unknown key code: {code}")
-                return
-            
             # Build flags
             flags = RDP_KBD_FLAG_DOWN if action == 'down' else RDP_KBD_FLAG_RELEASE
             
-            # Check if extended key
-            if code in EXTENDED_KEYS:
-                flags |= RDP_KBD_FLAG_EXTENDED
+            # Determine if we should use Unicode input:
+            # - Single printable character (not a special key name)
+            # - No modifier keys held (except Shift which is already reflected in key)
+            # - Not a special key code
+            use_unicode = (
+                len(key) == 1 and  # Single character
+                not ctrl and not alt and not meta and  # No modifiers (Shift is OK)
+                code not in EXTENDED_KEYS and  # Not an extended key
+                code not in ('Tab', 'Enter', 'Backspace', 'Escape', 'Space',
+                            'CapsLock', 'NumLock', 'ScrollLock')
+            )
             
-            self._lib.rdp_send_keyboard(self._session, flags, scancode)
+            if use_unicode:
+                # Use Unicode keyboard event for proper international layout support
+                unicode_char = ord(key)
+                self._lib.rdp_send_unicode(self._session, flags, unicode_char)
+            else:
+                # Use scancode for special keys and key combinations
+                scancode = SCANCODE_MAP.get(code)
+                
+                if scancode is None:
+                    logger.debug(f"Unknown key code: {code}")
+                    return
+                
+                # Check if extended key
+                if code in EXTENDED_KEYS:
+                    flags |= RDP_KBD_FLAG_EXTENDED
+                
+                self._lib.rdp_send_keyboard(self._session, flags, scancode)
             
         except Exception as e:
             logger.error(f"Key event error: {e}")

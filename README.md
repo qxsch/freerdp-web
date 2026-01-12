@@ -505,7 +505,10 @@ All binary messages use a 4-byte ASCII magic header for efficient parsing:
 | `MAPS` | mapSurfaceToOutput | Map surface to primary output |
 | `STFR` | startFrame | Begin frame composition |
 | `ENFR` | endFrame | End frame, commit to screen |
-| `H264` | H.264 frame | Encoded video NAL units |
+| `CAPS` | capsConfirm | Server capability confirmation (GFX version/flags) |
+| `INIT` | initSettings | RDP session settings (codec flags, color depth) |
+| `RSGR` | resetGraphics | Reset all GFX state (surfaces, cache, codec) |
+| `H264` | H.264 frame | Encoded video NAL units (AVC420/AVC444) |
 | `WEBP` | WebP tile | Compressed image tile |
 | `TILE` | Raw tile | Uncompressed RGBA pixels |
 | `PROG` | Progressive tile | RFX Progressive compressed (WASM decoded) |
@@ -515,7 +518,6 @@ All binary messages use a 4-byte ASCII magic header for efficient parsing:
 | `S2CH` | surfaceToCache | Store surface region in bitmap cache |
 | `C2SF` | cacheToSurface | Restore cached bitmap to surface |
 | `EVCT` | evictCache | Delete bitmap cache slot |
-| `RSGR` | resetGraphics | Reset all GFX state (surfaces, cache, codec) |
 | `OPUS` | Audio frame | Opus-encoded audio |
 | `AUDI` | PCM Audio | Raw PCM audio data |
 
@@ -629,41 +631,67 @@ All GFX events are encoded with a 4-byte ASCII magic header:
 
 #### Surface Management
 
-| Magic | Event | Payload (bytes) |
-|-------|-------|----------------|
-| `SURF` | createSurface | surfaceId(2) + width(2) + height(2) + format(2) = 8B |
-| `DELS` | deleteSurface | surfaceId(2) = 2B |
-| `MAPS` | mapSurfaceToOutput | surfaceId(2) + outputX(2) + outputY(2) = 6B |
-| `RSGR` | resetGraphics | width(2) + height(2) = 4B |
+| Magic | Event | Layout | Total Size |
+|-------|-------|--------|------------|
+| `SURF` | createSurface | magic(4) + surfaceId(2) + width(2) + height(2) + format(2) | 12 bytes |
+| `DELS` | deleteSurface | magic(4) + surfaceId(2) | 6 bytes |
+| `MAPS` | mapSurfaceToOutput | magic(4) + surfaceId(2) + outputX(2) + outputY(2) | 10 bytes |
+| `RSGR` | resetGraphics | magic(4) + width(2) + height(2) | 8 bytes |
+| `CAPS` | capsConfirm | magic(4) + version(4) + flags(4) | 12 bytes |
+| `INIT` | initSettings | magic(4) + colorDepth(4) + flagsLow(4) + flagsHigh(4) | 16 bytes |
 
 #### Frame Lifecycle
 
-| Magic | Event | Payload (bytes) |
-|-------|-------|----------------|
-| `STFR` | startFrame | frameId(4) = 4B |
-| `ENFR` | endFrame | frameId(4) = 4B |
-| `FACK` | frameAck | frameId(4) + totalFramesDecoded(4) = 8B |
-| `BPRS` | backpressure | level(1) = 1B |
+| Magic | Event | Layout | Total Size |
+|-------|-------|--------|------------|
+| `STFR` | startFrame | magic(4) + frameId(4) | 8 bytes |
+| `ENFR` | endFrame | magic(4) + frameId(4) | 8 bytes |
+| `FACK` | frameAck | magic(4) + frameId(4) + totalFramesDecoded(4) | 12 bytes |
+| `BPRS` | backpressure | magic(4) + level(1) | 5 bytes |
 
 #### Tile Codecs
 
-| Magic | Event | Payload (bytes) |
-|-------|-------|----------------|
-| `H264` | H.264 frame | frameId(4) + surfaceId(2) + codecId(2) + frameType(1) + x(2) + y(2) + w(2) + h(2) + nalSize(4) + chromaSize(4) + NAL data |
-| `PROG` | Progressive tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
-| `CLRC` | ClearCodec tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
-| `WEBP` | WebP tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
-| `TILE` | Raw RGBA tile | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data = 18B header |
+| Magic | Event | Layout | Header Size |
+|-------|-------|--------|-------------|
+| `H264` | H.264 frame | magic(4) + frameId(4) + surfaceId(2) + codecId(2) + frameType(1) + x(2) + y(2) + w(2) + h(2) + nalSize(4) + chromaSize(4) + NAL data | 29 bytes + data |
+| `PROG` | Progressive tile | magic(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data | 22 bytes + data |
+| `CLRC` | ClearCodec tile | magic(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data | 22 bytes + data |
+| `WEBP` | WebP tile | magic(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + dataSize(4) + data | 22 bytes + data |
+| `TILE` | Raw RGBA tile | magic(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + data (w×h×4 bytes) | 18 bytes + data |
 
 #### Surface Operations
 
-| Magic | Event | Payload (bytes) |
-|-------|-------|----------------|
-| `SFIL` | solidFill | frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + color(4) = 18B |
-| `S2SF` | surfaceToSurface | frameId(4) + srcId(2) + dstId(2) + srcX(2) + srcY(2) + srcW(2) + srcH(2) + dstX(2) + dstY(2) = 20B |
-| `S2CH` | surfaceToCache | frameId(4) + surfaceId(2) + cacheSlot(2) + x(2) + y(2) + w(2) + h(2) = 16B |
-| `C2SF` | cacheToSurface | frameId(4) + surfaceId(2) + cacheSlot(2) + dstX(2) + dstY(2) = 12B |
-| `EVCT` | evictCache | frameId(4) + cacheSlot(2) = 6B |
+| Magic | Event | Layout | Total Size |
+|-------|-------|--------|------------|
+| `SFIL` | solidFill | magic(4) + frameId(4) + surfaceId(2) + x(2) + y(2) + w(2) + h(2) + color(4) | 22 bytes |
+| `S2SF` | surfaceToSurface | magic(4) + frameId(4) + srcId(2) + dstId(2) + srcX(2) + srcY(2) + srcW(2) + srcH(2) + dstX(2) + dstY(2) | 24 bytes |
+| `S2CH` | surfaceToCache | magic(4) + frameId(4) + surfaceId(2) + cacheSlot(2) + x(2) + y(2) + w(2) + h(2) | 20 bytes |
+| `C2SF` | cacheToSurface | magic(4) + frameId(4) + surfaceId(2) + cacheSlot(2) + dstX(2) + dstY(2) | 16 bytes |
+| `EVCT` | evictCache | magic(4) + frameId(4) + cacheSlot(2) | 10 bytes |
+
+#### INIT Settings Flags
+
+The `INIT` message packs RDP session settings as bitfields for efficient transmission:
+
+| Bit | Setting | Description |
+|-----|---------|-------------|
+| 0 | SupportGraphicsPipeline | GFX pipeline enabled |
+| 1 | GfxH264 | H.264 codec support |
+| 2 | GfxAVC444 | AVC444 (4:4:4 chroma) support |
+| 3 | GfxAVC444v2 | AVC444 version 2 support |
+| 4 | GfxProgressive | Progressive codec support |
+| 5 | GfxProgressiveV2 | Progressive codec v2 support |
+| 6 | RemoteFxCodec | RemoteFX codec support |
+| 7 | NSCodec | NSCodec support |
+| 8 | JpegCodec | JPEG codec support |
+| 9 | GfxPlanar | Planar codec support |
+| 10 | GfxSmallCache | Small cache mode |
+| 11 | GfxThinClient | Thin client mode |
+| 12 | GfxSendQoeAck | Quality of Experience ACK |
+| 13 | GfxSuspendFrameAck | Suspend frame acknowledgments |
+| 14 | AudioPlayback | Audio playback enabled |
+| 15 | AudioCapture | Audio capture enabled |
+| 16 | RemoteConsoleAudio | Remote console audio enabled |
 
 ### GFX Worker Responsibilities
 

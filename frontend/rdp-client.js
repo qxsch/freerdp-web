@@ -993,6 +993,11 @@ export class RDPClient {
                 return;
             }
 
+            // Hide modal if it's open (e.g., when connect() is called via API)
+            if (this._el.modal.classList.contains('active')) {
+                this._el.modal.classList.remove('active');
+            }
+
             this._pendingConnect = { resolve, reject };
             this._updateStatus('connecting', 'Connecting...');
             this._el.loading.querySelector('p').textContent = 'Connecting...';
