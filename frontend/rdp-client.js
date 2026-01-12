@@ -466,18 +466,18 @@ const TEMPLATE = `
                     <!-- Row 2: Numbers -->
                     <div class="rdp-keyboard-row">
                         <button class="rdp-key" data-code="Backquote" data-key="\`" data-shift="~">\`</button>
-                        <button class="rdp-key" data-code="Digit1" data-key="1" data-shift="!">1</button>
-                        <button class="rdp-key" data-code="Digit2" data-key="2" data-shift="@">2</button>
-                        <button class="rdp-key" data-code="Digit3" data-key="3" data-shift="#">3</button>
-                        <button class="rdp-key" data-code="Digit4" data-key="4" data-shift="$">4</button>
-                        <button class="rdp-key" data-code="Digit5" data-key="5" data-shift="%">5</button>
-                        <button class="rdp-key" data-code="Digit6" data-key="6" data-shift="^">6</button>
-                        <button class="rdp-key" data-code="Digit7" data-key="7" data-shift="&">7</button>
-                        <button class="rdp-key" data-code="Digit8" data-key="8" data-shift="*">8</button>
-                        <button class="rdp-key" data-code="Digit9" data-key="9" data-shift="(">9</button>
-                        <button class="rdp-key" data-code="Digit0" data-key="0" data-shift=")">0</button>
-                        <button class="rdp-key" data-code="Minus" data-key="-" data-shift="_">-</button>
-                        <button class="rdp-key" data-code="Equal" data-key="=" data-shift="+">=</button>
+                        <button class="rdp-key" data-code="Digit1" data-key="1" data-shift="!" data-altgr="¡" data-shift-altgr="¹">1</button>
+                        <button class="rdp-key" data-code="Digit2" data-key="2" data-shift="@" data-altgr="²">2</button>
+                        <button class="rdp-key" data-code="Digit3" data-key="3" data-shift="#" data-altgr="³">3</button>
+                        <button class="rdp-key" data-code="Digit4" data-key="4" data-shift="$" data-altgr="¤" data-shift-altgr="£">4</button>
+                        <button class="rdp-key" data-code="Digit5" data-key="5" data-shift="%" data-altgr="€">5</button>
+                        <button class="rdp-key" data-code="Digit6" data-key="6" data-shift="^" data-altgr="¼">6</button>
+                        <button class="rdp-key" data-code="Digit7" data-key="7" data-shift="&" data-altgr="½">7</button>
+                        <button class="rdp-key" data-code="Digit8" data-key="8" data-shift="*" data-altgr="¾">8</button>
+                        <button class="rdp-key" data-code="Digit9" data-key="9" data-shift="(" data-altgr="'">9</button>
+                        <button class="rdp-key" data-code="Digit0" data-key="0" data-shift=")" data-altgr="'">0</button>
+                        <button class="rdp-key" data-code="Minus" data-key="-" data-shift="_" data-altgr="¥">-</button>
+                        <button class="rdp-key" data-code="Equal" data-key="=" data-shift="+" data-altgr="×" data-shift-altgr="÷">=</button>
                         <button class="rdp-key rdp-key-wider" data-code="Backspace">⌫</button>
                     </div>
                     <!-- Row 3: QWERTY top -->
@@ -500,32 +500,32 @@ const TEMPLATE = `
                     <!-- Row 4: ASDF middle -->
                     <div class="rdp-keyboard-row">
                         <button class="rdp-key rdp-key-wider" data-code="CapsLock">Caps</button>
-                        <button class="rdp-key" data-code="KeyA" data-key="a" data-shift="A">A</button>
-                        <button class="rdp-key" data-code="KeyS" data-key="s" data-shift="S">S</button>
-                        <button class="rdp-key" data-code="KeyD" data-key="d" data-shift="D">D</button>
+                        <button class="rdp-key" data-code="KeyA" data-key="a" data-shift="A" data-altgr="á" data-shift-altgr="Á">A</button>
+                        <button class="rdp-key" data-code="KeyS" data-key="s" data-shift="S" data-altgr="ß" data-shift-altgr="§">S</button>
+                        <button class="rdp-key" data-code="KeyD" data-key="d" data-shift="D" data-altgr="ð" data-shift-altgr="Ð">D</button>
                         <button class="rdp-key" data-code="KeyF" data-key="f" data-shift="F">F</button>
                         <button class="rdp-key" data-code="KeyG" data-key="g" data-shift="G">G</button>
                         <button class="rdp-key" data-code="KeyH" data-key="h" data-shift="H">H</button>
                         <button class="rdp-key" data-code="KeyJ" data-key="j" data-shift="J">J</button>
                         <button class="rdp-key" data-code="KeyK" data-key="k" data-shift="K">K</button>
-                        <button class="rdp-key" data-code="KeyL" data-key="l" data-shift="L">L</button>
-                        <button class="rdp-key" data-code="Semicolon" data-key=";" data-shift=":">;</button>
-                        <button class="rdp-key" data-code="Quote" data-key="'" data-shift='"'>'</button>
+                        <button class="rdp-key" data-code="KeyL" data-key="l" data-shift="L" data-altgr="ø" data-shift-altgr="Ø">L</button>
+                        <button class="rdp-key" data-code="Semicolon" data-key=";" data-shift=":" data-altgr="¶" data-shift-altgr="°">;</button>
+                        <button class="rdp-key" data-code="Quote" data-key="'" data-shift='"' data-altgr="´" data-shift-altgr="¨">'</button>
                         <button class="rdp-key rdp-key-widest" data-code="Enter">Enter</button>
                     </div>
                     <!-- Row 5: ZXCV bottom -->
                     <div class="rdp-keyboard-row">
                         <button class="rdp-key rdp-key-widest rdp-key-modifier" data-code="ShiftLeft" data-modifier="shift">Shift</button>
-                        <button class="rdp-key" data-code="KeyZ" data-key="z" data-shift="Z">Z</button>
+                        <button class="rdp-key" data-code="KeyZ" data-key="z" data-shift="Z" data-altgr="æ" data-shift-altgr="Æ">Z</button>
                         <button class="rdp-key" data-code="KeyX" data-key="x" data-shift="X">X</button>
-                        <button class="rdp-key" data-code="KeyC" data-key="c" data-shift="C">C</button>
+                        <button class="rdp-key" data-code="KeyC" data-key="c" data-shift="C" data-altgr="©" data-shift-altgr="¢">C</button>
                         <button class="rdp-key" data-code="KeyV" data-key="v" data-shift="V">V</button>
                         <button class="rdp-key" data-code="KeyB" data-key="b" data-shift="B">B</button>
-                        <button class="rdp-key" data-code="KeyN" data-key="n" data-shift="N">N</button>
-                        <button class="rdp-key" data-code="KeyM" data-key="m" data-shift="M">M</button>
-                        <button class="rdp-key" data-code="Comma" data-key="," data-shift="<">,</button>
+                        <button class="rdp-key" data-code="KeyN" data-key="n" data-shift="N" data-altgr="ñ" data-shift-altgr="Ñ">N</button>
+                        <button class="rdp-key" data-code="KeyM" data-key="m" data-shift="M" data-altgr="µ">M</button>
+                        <button class="rdp-key" data-code="Comma" data-key="," data-shift="<" data-altgr="ç" data-shift-altgr="Ç">,</button>
                         <button class="rdp-key" data-code="Period" data-key="." data-shift=">">.</button>
-                        <button class="rdp-key" data-code="Slash" data-key="/" data-shift="?">?</button>
+                        <button class="rdp-key" data-code="Slash" data-key="/" data-shift="?" data-altgr="¿">?</button>
                         <button class="rdp-key rdp-key-widest rdp-key-modifier" data-code="ShiftRight" data-modifier="shift">Shift</button>
                     </div>
                     <!-- Row 6: Bottom row -->
@@ -534,7 +534,7 @@ const TEMPLATE = `
                         <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="MetaLeft" data-modifier="meta">Win</button>
                         <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="AltLeft" data-modifier="alt">Alt</button>
                         <button class="rdp-key rdp-key-space" data-code="Space" data-key=" ">Space</button>
-                        <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="AltRight" data-modifier="alt">Alt</button>
+                        <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="AltRight" data-modifier="altgr">AltGr</button>
                         <button class="rdp-key rdp-key-wide rdp-key-modifier" data-code="ControlRight" data-modifier="ctrl">Ctrl</button>
                         <button class="rdp-key" data-code="ArrowLeft">←</button>
                         <button class="rdp-key" data-code="ArrowUp">↑</button>
@@ -749,7 +749,7 @@ export class RDPClient {
         
         // Virtual keyboard state
         this._keyboardVisible = false;
-        this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false };
+        this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false, altgr: false };
         this._keyboardDragging = false;
         this._keyboardResizing = false;
         this._keyboardDragOffset = { x: 0, y: 0 };
@@ -2086,9 +2086,39 @@ export class RDPClient {
      * Reset all keyboard modifiers
      */
     _resetKeyboardModifiers() {
-        this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false };
+        this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false, altgr: false };
         this._el.keyboardOverlay.querySelectorAll('.rdp-key-modifier').forEach(key => {
             key.classList.remove('pressed');
+        });
+        this._updateKeyboardKeyLabels();
+    }
+    
+    /**
+     * Update keyboard key labels based on active modifiers (shift, altgr, shift+altgr)
+     * Priority: shift+altgr > altgr > shift > normal
+     */
+    _updateKeyboardKeyLabels() {
+        const shiftActive = this._keyboardModifiers.shift;
+        const altgrActive = this._keyboardModifiers.altgr;
+        
+        this._el.keyboardOverlay.querySelectorAll('.rdp-key[data-key]').forEach(key => {
+            let label;
+            
+            if (shiftActive && altgrActive) {
+                // Shift+AltGr: use data-shift-altgr, fallback to data-altgr, then data-shift, then data-key
+                label = key.dataset.shiftAltgr || key.dataset.altgr || key.dataset.shift || key.dataset.key;
+            } else if (altgrActive) {
+                // AltGr only: use data-altgr, fallback to data-key
+                label = key.dataset.altgr || key.dataset.key;
+            } else if (shiftActive) {
+                // Shift only: use data-shift, fallback to data-key
+                label = key.dataset.shift || key.dataset.key;
+            } else {
+                // No modifiers: use data-key
+                label = key.dataset.key;
+            }
+            
+            key.textContent = label;
         });
     }
     
@@ -2121,6 +2151,10 @@ export class RDPClient {
             } else {
                 key.classList.remove('pressed');
             }
+            // Update key labels when shift or altgr state changes
+            if (modifier === 'shift' || modifier === 'altgr') {
+                this._updateKeyboardKeyLabels();
+            }
             return;
         }
         
@@ -2128,22 +2162,45 @@ export class RDPClient {
         this._keyboardActiveKey = key;
         key.classList.add('pressed');
         
-        // Get key name based on shift state
-        const keyName = this._keyboardModifiers.shift ? 
-            (key.dataset.shift || key.textContent) : 
-            (key.dataset.key || key.textContent);
+        // Get key name based on modifier state (priority: shift+altgr > altgr > shift > normal)
+        const shiftActive = this._keyboardModifiers.shift;
+        const altgrActive = this._keyboardModifiers.altgr;
+        let keyName;
+        let hasAltGrChar = false; // True if we have a dedicated AltGr character for this key
         
-        // Send modifier key down events first
-        this._sendActiveModifierDownEvents();
+        if (shiftActive && altgrActive) {
+            // Check if key has a dedicated shift+altgr character
+            hasAltGrChar = !!key.dataset.shiftAltgr || !!key.dataset.altgr;
+            keyName = key.dataset.shiftAltgr || key.dataset.altgr || key.dataset.shift || key.textContent;
+        } else if (altgrActive) {
+            // Check if key has a dedicated altgr character
+            hasAltGrChar = !!key.dataset.altgr;
+            keyName = key.dataset.altgr || key.dataset.key || key.textContent;
+        } else if (shiftActive) {
+            keyName = key.dataset.shift || key.textContent;
+        } else {
+            keyName = key.dataset.key || key.textContent;
+        }
         
-        // Send main key down with modifier flags
+        // If we have a dedicated AltGr character, send it directly without modifier events.
+        // The character itself (e.g., €, ñ, ß) is sent as Unicode, no Ctrl+Alt needed.
+        // Only send modifier events if we DON'T have a dedicated AltGr char.
+        if (!hasAltGrChar) {
+            this._sendActiveModifierDownEvents();
+        } else if (shiftActive && !altgrActive) {
+            // Only shift is active (no altgr), send shift
+            this._sendActiveModifierDownEvents();
+        }
+        
+        // Send main key - when hasAltGrChar is true, send without modifier flags
+        // so backend uses Unicode input for the special character
         this._sendMessage({
             type: 'key', action: 'down',
             key: keyName, code: code, keyCode: 0,
-            ctrlKey: this._keyboardModifiers.ctrl,
-            shiftKey: this._keyboardModifiers.shift,
-            altKey: this._keyboardModifiers.alt,
-            metaKey: this._keyboardModifiers.meta
+            ctrlKey: hasAltGrChar ? false : this._keyboardModifiers.ctrl,
+            shiftKey: hasAltGrChar ? false : this._keyboardModifiers.shift,
+            altKey: hasAltGrChar ? false : this._keyboardModifiers.alt,
+            metaKey: hasAltGrChar ? false : this._keyboardModifiers.meta
         });
     }
     
@@ -2151,19 +2208,33 @@ export class RDPClient {
      * Send key down events for all active modifiers
      */
     _sendActiveModifierDownEvents() {
-        if (this._keyboardModifiers.ctrl) {
+        // AltGr is equivalent to Ctrl+Alt on Windows
+        if (this._keyboardModifiers.altgr) {
             this._sendMessage({
                 type: 'key', action: 'down',
                 key: 'Control', code: 'ControlLeft', keyCode: 0,
                 ctrlKey: true, shiftKey: false, altKey: false, metaKey: false
             });
-        }
-        if (this._keyboardModifiers.alt) {
             this._sendMessage({
                 type: 'key', action: 'down',
-                key: 'Alt', code: 'AltLeft', keyCode: 0,
-                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: true, metaKey: false
+                key: 'Alt', code: 'AltRight', keyCode: 0,
+                ctrlKey: true, shiftKey: false, altKey: true, metaKey: false
             });
+        } else {
+            if (this._keyboardModifiers.ctrl) {
+                this._sendMessage({
+                    type: 'key', action: 'down',
+                    key: 'Control', code: 'ControlLeft', keyCode: 0,
+                    ctrlKey: true, shiftKey: false, altKey: false, metaKey: false
+                });
+            }
+            if (this._keyboardModifiers.alt) {
+                this._sendMessage({
+                    type: 'key', action: 'down',
+                    key: 'Alt', code: 'AltLeft', keyCode: 0,
+                    ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: true, metaKey: false
+                });
+            }
         }
         if (this._keyboardModifiers.shift) {
             this._sendMessage({
@@ -2199,19 +2270,33 @@ export class RDPClient {
                 ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: this._keyboardModifiers.alt, metaKey: false
             });
         }
-        if (this._keyboardModifiers.alt) {
+        // AltGr releases Ctrl+Alt in reverse order
+        if (this._keyboardModifiers.altgr) {
             this._sendMessage({
                 type: 'key', action: 'up',
-                key: 'Alt', code: 'AltLeft', keyCode: 0,
-                ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: false, metaKey: false
+                key: 'Alt', code: 'AltRight', keyCode: 0,
+                ctrlKey: true, shiftKey: false, altKey: false, metaKey: false
             });
-        }
-        if (this._keyboardModifiers.ctrl) {
             this._sendMessage({
                 type: 'key', action: 'up',
                 key: 'Control', code: 'ControlLeft', keyCode: 0,
                 ctrlKey: false, shiftKey: false, altKey: false, metaKey: false
             });
+        } else {
+            if (this._keyboardModifiers.alt) {
+                this._sendMessage({
+                    type: 'key', action: 'up',
+                    key: 'Alt', code: 'AltLeft', keyCode: 0,
+                    ctrlKey: this._keyboardModifiers.ctrl, shiftKey: false, altKey: false, metaKey: false
+                });
+            }
+            if (this._keyboardModifiers.ctrl) {
+                this._sendMessage({
+                    type: 'key', action: 'up',
+                    key: 'Control', code: 'ControlLeft', keyCode: 0,
+                    ctrlKey: false, shiftKey: false, altKey: false, metaKey: false
+                });
+            }
         }
     }
     
@@ -2234,22 +2319,41 @@ export class RDPClient {
         key.classList.remove('pressed');
         
         const code = key.dataset.code;
-        const keyName = this._keyboardModifiers.shift ? 
-            (key.dataset.shift || key.textContent) : 
-            (key.dataset.key || key.textContent);
         
-        // Send main key up
+        // Get key name based on modifier state (priority: shift+altgr > altgr > shift > normal)
+        const shiftActive = this._keyboardModifiers.shift;
+        const altGrActive = this._keyboardModifiers.altgr;
+        let keyName;
+        let hasAltGrChar = false; // True if we have a dedicated AltGr character
+        
+        if (shiftActive && altGrActive) {
+            hasAltGrChar = !!key.dataset.shiftAltgr || !!key.dataset.altgr;
+            keyName = key.dataset.shiftAltgr || key.dataset.altgr || key.dataset.shift || key.textContent;
+        } else if (altGrActive) {
+            hasAltGrChar = !!key.dataset.altgr;
+            keyName = key.dataset.altgr || key.dataset.key || key.textContent;
+        } else if (shiftActive) {
+            keyName = key.dataset.shift || key.textContent;
+        } else {
+            keyName = key.dataset.key || key.textContent;
+        }
+        
+        // Send main key up - when hasAltGrChar, send without modifier flags
         this._sendMessage({
             type: 'key', action: 'up',
             key: keyName, code: code, keyCode: 0,
-            ctrlKey: this._keyboardModifiers.ctrl,
-            shiftKey: this._keyboardModifiers.shift,
-            altKey: this._keyboardModifiers.alt,
-            metaKey: this._keyboardModifiers.meta
+            ctrlKey: hasAltGrChar ? false : this._keyboardModifiers.ctrl,
+            shiftKey: hasAltGrChar ? false : this._keyboardModifiers.shift,
+            altKey: hasAltGrChar ? false : this._keyboardModifiers.alt,
+            metaKey: hasAltGrChar ? false : this._keyboardModifiers.meta
         });
         
-        // Send modifier key up events
-        this._sendActiveModifierUpEvents();
+        // Send modifier key up events only if we sent them on key down
+        if (!hasAltGrChar) {
+            this._sendActiveModifierUpEvents();
+        } else if (shiftActive && !altGrActive) {
+            this._sendActiveModifierUpEvents();
+        }
         
         // Reset modifiers after non-modifier key press
         this._resetKeyboardModifiers();
