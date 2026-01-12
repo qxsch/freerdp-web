@@ -209,21 +209,19 @@ function createSurface(surfaceId, width, height, pixelFormat = GFX_PIXEL_FORMAT.
     const canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext('2d', { 
         alpha: false,
-        desynchronized: true,  // Reduce latency
-        willReadFrequently: true  // Optimize for SurfaceToCache getImageData calls
+        // NOTE: Do NOT use desynchronized:true on surfaces!
+        // It causes race conditions with getImageData() in S2S operations - 
+        // the async rendering pipeline may not have committed pixels yet,
+        // resulting in reading stale/black data.
+        willReadFrequently: true  // Optimize for SurfaceToCache/S2S getImageData calls
     });
     
-    // Per MS-RDPEGFX spec: compositor must use direct copy, no alpha blending
-    ctx.globalCompositeOperation = 'copy';
     ctx.imageSmoothingEnabled = false;
     
     // Fill with black initially
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, width, height);
-    
-    // Restore to source-over for normal drawing operations (tiles use putImageData anyway)
-    ctx.globalCompositeOperation = 'source-over';
-    
+        
     surfaces.set(surfaceId, {
         id: surfaceId,
         width,
@@ -240,10 +238,8 @@ function createSurface(surfaceId, width, height, pixelFormat = GFX_PIXEL_FORMAT.
         // Delete any existing WASM state (may exist from previous surface with same ID)
         wasmModule._prog_delete_surface(progCtx, surfaceId);
         wasmModule._prog_create_surface(progCtx, surfaceId, width, height);
-        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height}, pixelFormat=${getPixelFormatName(pixelFormat)} (fresh Progressive state)`);
-    } else {
-        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height}, pixelFormat=${getPixelFormatName(pixelFormat)}`);
     }
+    console.log(`[GFX] createSurface(${surfaceId}) ${width}x${height}`);
     
     // Clear the last deleted surface info (no longer needed for preservation logic)
     lastDeletedSurface = null;
@@ -258,6 +254,8 @@ function createSurface(surfaceId, width, height, pixelFormat = GFX_PIXEL_FORMAT.
 function deleteSurface(surfaceId) {
     const surface = surfaces.get(surfaceId);
     if (!surface) return;
+    
+    console.log(`[GFX] deleteSurface(${surfaceId})`);
     
     // Store info about deleted surface (for logging/debugging purposes only)
     lastDeletedSurface = {
@@ -286,14 +284,13 @@ function deleteSurface(surfaceId) {
     if (primarySurfaceId === surfaceId) {
         primarySurfaceId = null;
     }
-    
-    console.log(`[GFX Worker] Deleted surface ${surfaceId} (both JS canvas and WASM Progressive state cleared)`);
 }
 
 /**
  * Map surface to primary output
  */
 function mapSurfaceToPrimary(surfaceId) {
+    console.log(`[GFX] mapToPrimary(${surfaceId})`);
     primarySurfaceId = surfaceId;
 }
 
@@ -456,7 +453,7 @@ function decodeProgressiveTile(msg) {
     wasmModule._free(inputPtr);
     
     if (result !== 0) {
-        console.warn(`[GFX Worker] Progressive decompress failed: ${result}`);
+        console.error(`[PROG-WASM] decompress FAILED: result=${result} surface=${actualSurfaceId} frame=${msg.frameId} bytes=${payload.byteLength}`);
         return;
     }
     
@@ -466,7 +463,7 @@ function decodeProgressiveTile(msg) {
     // Use new batch tile tracking API for efficient iteration
     const updatedCount = wasmModule._prog_get_updated_tile_count(progCtx);
     
-    // Skip rendering if no tiles updated
+    // Skip if no tiles were updated
     if (updatedCount === 0) {
         return;
     }
@@ -523,10 +520,6 @@ function decodeProgressiveTile(msg) {
             surface.ctx.putImageData(imageData, tileX, tileY, 0, 0, tileW, tileH);
             
             tilesDrawn++;
-        }
-        
-        if (updatedCount > 0 && tilesDrawn === 0) {
-            console.warn(`[GFX Worker] Progressive: 0/${updatedCount} tiles drawn to surface ${msg.surfaceId}`);
         }
     } catch (e) {
         console.error(`[GFX Worker] Progressive tile loop error at tile ${tilesDrawn}:`, e);
@@ -628,8 +621,6 @@ async function decodeWebPTile(msg) {
         const blob = new Blob([msg.payload], { type: 'image/webp' });
         const bitmap = await createImageBitmap(blob);
         
-        // Ensure copy mode for WebP tiles
-        surface.ctx.globalCompositeOperation = 'copy';
         surface.ctx.drawImage(bitmap, msg.x, msg.y, msg.w, msg.h);
         bitmap.close();
         
@@ -677,7 +668,6 @@ async function drawLegacyFullFrame(bytes, mimeType) {
         const bitmap = await createImageBitmap(blob);
         
         // Ensure copy mode for legacy frames
-        primaryCtx.globalCompositeOperation = 'copy';
         primaryCtx.drawImage(bitmap, 0, 0, primaryCanvas.width, primaryCanvas.height);
         bitmap.close();
         
@@ -722,7 +712,6 @@ async function initH264(width, height) {
                 const meta = h264DecodeQueue.shift();
                 if (meta && primaryCtx) {
                     // Ensure copy mode for H.264 frames
-                    primaryCtx.globalCompositeOperation = 'copy';
                     primaryCtx.drawImage(frame, 
                         meta.destX, meta.destY, meta.destW, meta.destH,
                         meta.destX, meta.destY, meta.destW, meta.destH);
@@ -875,23 +864,35 @@ function applySolidFill(msg) {
 }
 
 /**
- * Surface-to-surface blit (for scrolling)
+ * Surface-to-surface blit (for scrolling/window moves)
+ * IMPORTANT: Self-blits (src === dst) with overlapping regions need special handling
+ * to avoid reading already-overwritten pixels.
  */
 function applySurfaceToSurface(msg) {
     const srcSurface = surfaces.get(msg.srcSurfaceId);
     const dstSurface = surfaces.get(msg.dstSurfaceId);
-    if (!srcSurface || !dstSurface) return;
+    if (!srcSurface || !dstSurface) {
+        console.warn(`[SURFACE] S2S MISSING src=${msg.srcSurfaceId}(${!!srcSurface}) dst=${msg.dstSurfaceId}(${!!dstSurface})`);
+        return;
+    }
     
     // Track that destination surface was updated in the current frame
     frameUpdatedSurfaces.add(msg.dstSurfaceId);
     
-    // Ensure copy mode for surface-to-surface blit
-    dstSurface.ctx.globalCompositeOperation = 'copy';
-    dstSurface.ctx.drawImage(
-        srcSurface.canvas,
-        msg.srcX, msg.srcY, msg.srcW, msg.srcH,
-        msg.dstX, msg.dstY, msg.srcW, msg.srcH
-    );
+    // Check for self-blit (same surface) with potentially overlapping regions
+    if (msg.srcSurfaceId === msg.dstSurfaceId) {
+        // For self-blits, we must use getImageData/putImageData to avoid
+        // reading from already-overwritten pixels during drawImage with 'copy' mode
+        const imageData = srcSurface.ctx.getImageData(msg.srcX, msg.srcY, msg.srcW, msg.srcH);
+        dstSurface.ctx.putImageData(imageData, msg.dstX, msg.dstY);
+    } else {
+        // Different surfaces - safe to use drawImage
+        dstSurface.ctx.drawImage(
+            srcSurface.canvas,
+            msg.srcX, msg.srcY, msg.srcW, msg.srcH,
+            msg.dstX, msg.dstY, msg.srcW, msg.srcH
+        );
+    }
 }
 
 /**
@@ -1006,13 +1007,12 @@ function applyResetGraphics(msg) {
         
         // Per MS-RDPEGFX spec: re-apply compositor settings after resize
         // (canvas resize clears the context state)
-        primaryCtx.globalCompositeOperation = 'copy';
         primaryCtx.imageSmoothingEnabled = false;
         primaryCtx.fillStyle = '#000000';
         primaryCtx.fillRect(0, 0, msg.width, msg.height);
     }
     
-    console.log(`[GFX Worker] ResetGraphics: cleared ${surfaceCount} surfaces, new size ${msg.width}x${msg.height}`);
+    console.log(`[GFX] resetGraphics ${surfaceCount} surfaces, new=${msg.width}x${msg.height}`);
 }
 
 // ============================================================================
@@ -1172,8 +1172,6 @@ function compositeSurfaceToPrimary(surfaceId) {
     const surface = surfaces.get(surfaceId);
     if (!surface) return;
     
-    // Ensure copy mode for surface-to-primary composition
-    primaryCtx.globalCompositeOperation = 'copy';
     // Draw the surface to the primary canvas
     primaryCtx.drawImage(surface.canvas, 0, 0);
 }
@@ -1189,15 +1187,13 @@ function startFrame(frameId) {
 /**
  * End frame and send acknowledgment
  */
-function endFrame(frameId) {
+async function endFrame(frameId) {
     if (currentFrameId !== frameId) {
         console.warn(`[GFX Worker] Frame mismatch: expected ${currentFrameId}, got ${frameId}`);
     }
     
     // Composite all surfaces that were updated in this frame to primary canvas
     if (primaryCanvas && primaryCtx) {
-        // Ensure copy mode for surface-to-primary composition (no alpha blending)
-        primaryCtx.globalCompositeOperation = 'copy';
         
         // First try primarySurfaceId if set and was updated
         if (primarySurfaceId !== null && frameUpdatedSurfaces.has(primarySurfaceId)) {
@@ -1212,8 +1208,6 @@ function endFrame(frameId) {
                 const surface = surfaces.get(surfaceId);
                 if (surface) {
                     primaryCtx.drawImage(surface.canvas, 0, 0);
-                } else {
-                    console.warn(`[GFX Worker] EndFrame: surface ${surfaceId} was updated but no longer exists`);
                 }
             }
         }
@@ -1300,7 +1294,6 @@ async function handleBinaryMessage(data) {
             break;
         
         case 'mapSurface':
-            console.log(`[GFX Worker] MapSurfaceToOutput: surfaceId=${msg.surfaceId}, outputX=${msg.outputX}, outputY=${msg.outputY}`);
             mapSurfaceToPrimary(msg.surfaceId);
             break;
             
@@ -1309,10 +1302,11 @@ async function handleBinaryMessage(data) {
             break;
             
         case 'endFrame':
-            endFrame(msg.frameId);
+            await endFrame(msg.frameId);
             break;
             
         case 'tile':
+            // Execute immediately in arrival order (strict ordering like FreeRDP)
             if (msg.codec === 'progressive') {
                 decodeProgressiveTile(msg);
             } else if (msg.codec === 'webp') {
@@ -1359,9 +1353,8 @@ async function handleBinaryMessage(data) {
             break;
             
         case 'videoFrame':
-            // Route by codec ID: Progressive goes to WASM decoder, H.264 to VideoDecoder
+            // Execute immediately in arrival order (strict ordering like FreeRDP)
             if (msg.codecId === CODEC_ID.PROGRESSIVE || msg.codecId === CODEC_ID.PROGRESSIVE_V2) {
-                // Progressive/RFX: synchronous WASM decode - strict ordering maintained
                 decodeProgressiveTile({
                     surfaceId: msg.surfaceId,
                     frameId: msg.frameId,
@@ -1369,14 +1362,11 @@ async function handleBinaryMessage(data) {
                     y: msg.destY,
                     w: msg.destW,
                     h: msg.destH,
-                    payload: msg.nalData,  // Progressive raw data passed as nalData
+                    payload: msg.nalData,
                 });
-                
-                // Track updated surface for endFrame composition
                 frameUpdatedSurfaces.add(msg.surfaceId);
                 currentFrameId = msg.frameId;
             } else {
-                // H.264/AVC420/AVC444 - decode in worker using VideoDecoder
                 await decodeH264Frame(msg);
             }
             break;
@@ -1411,7 +1401,6 @@ async function processMessage(event) {
             });
             
             // Per MS-RDPEGFX spec: compositor must use direct copy for final output
-            primaryCtx.globalCompositeOperation = 'copy';
             primaryCtx.imageSmoothingEnabled = false;
             
             // Fill with black initially
@@ -1448,7 +1437,6 @@ async function processMessage(event) {
                     
                     // Per MS-RDPEGFX spec: re-apply compositor settings after resize
                     // (canvas resize clears the context state)
-                    primaryCtx.globalCompositeOperation = 'copy';
                     primaryCtx.imageSmoothingEnabled = false;
                     primaryCtx.fillStyle = '#000000';
                     primaryCtx.fillRect(0, 0, data.width, data.height);
