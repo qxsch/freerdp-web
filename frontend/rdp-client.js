@@ -425,6 +425,7 @@ const TEMPLATE = `
             <button class="rdp-btn rdp-btn-disconnect" disabled>Disconnect</button>
             <button class="rdp-btn rdp-btn-keyboard" disabled title="Toggle Virtual Keyboard">⌨️</button>
             <button class="rdp-btn rdp-btn-mute" disabled title="Toggle Audio">🔊</button>
+            <button class="rdp-btn rdp-btn-screenshot" disabled title="Take Screenshot">📷</button>
             <button class="rdp-btn rdp-btn-fullscreen">⛶</button>
         </div>
     </div>
@@ -742,6 +743,10 @@ export class RDPClient {
         this._pendingGfxMessages = [];
         this._wasmAvailable = false;  // Set by GFX worker on load
         
+        // Screenshot pending requests
+        this._screenshotRequests = new Map();
+        this._screenshotRequestId = 0;
+        
         // Virtual keyboard state
         this._keyboardVisible = false;
         this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false };
@@ -770,6 +775,7 @@ export class RDPClient {
             btnConnect: $('.rdp-btn-connect'),
             btnDisconnect: $('.rdp-btn-disconnect'),
             btnMute: $('.rdp-btn-mute'),
+            btnScreenshot: $('.rdp-btn-screenshot'),
             btnFullscreen: $('.rdp-btn-fullscreen'),
             modal: $('.rdp-modal'),
             modalConnect: $('.rdp-modal-connect'),
@@ -873,6 +879,23 @@ export class RDPClient {
                     this._handleFrameUpdate(msg.data);
                 }
                 break;
+                
+            case 'screenshotResult':
+                // Resolve pending screenshot request
+                const pending = this._screenshotRequests.get(msg.requestId);
+                if (pending) {
+                    this._screenshotRequests.delete(msg.requestId);
+                    if (msg.error) {
+                        pending.reject(new Error(msg.error));
+                    } else {
+                        pending.resolve({
+                            blob: msg.blob,
+                            width: msg.width,
+                            height: msg.height
+                        });
+                    }
+                }
+                break;
         }
     }
     
@@ -927,6 +950,7 @@ export class RDPClient {
         this._el.btnDisconnect.addEventListener('click', () => this.disconnect());
         this._el.btnMute.addEventListener('click', () => this._toggleMute());
         this._el.btnKeyboard.addEventListener('click', () => this._toggleKeyboard());
+        this._el.btnScreenshot.addEventListener('click', () => this._handleScreenshotClick());
         this._el.btnFullscreen.addEventListener('click', () => this._toggleFullscreen());
         
         // Loading area - click to open modal if not connected/connecting
@@ -1162,6 +1186,85 @@ export class RDPClient {
     }
 
     /**
+     * Capture a screenshot of the current remote desktop
+     * @param {string} [type='png'] - Image type: 'png' or 'jpg'
+     * @param {number} [quality=0.9] - JPEG quality (0-1), ignored for PNG
+     * @returns {Promise<{blob: Blob, width: number, height: number}>} Screenshot data
+     * @throws {Error} If not connected or screenshot fails
+     * @example
+     * const { blob, width, height } = await client.getScreenshot();
+     * const url = URL.createObjectURL(blob);
+     */
+    getScreenshot(type = 'png', quality = 0.9) {
+        return new Promise((resolve, reject) => {
+            if (!this._isConnected) {
+                reject(new Error('Not connected'));
+                return;
+            }
+            
+            if (!this._gfxWorker || !this._gfxWorkerReady) {
+                reject(new Error('GFX Worker not ready'));
+                return;
+            }
+            
+            const requestId = ++this._screenshotRequestId;
+            const mimeType = type === 'jpg' || type === 'jpeg' ? 'image/jpeg' : 'image/png';
+            if (typeof quality !== 'number' || quality < 0 || quality > 1) {
+                quality = 0.9;
+            }
+            
+            this._screenshotRequests.set(requestId, { resolve, reject });
+            
+            this._gfxWorker.postMessage({
+                type: 'screenshot',
+                data: { requestId, mimeType, quality }
+            });
+            
+            // Timeout after 5 seconds
+            setTimeout(() => {
+                if (this._screenshotRequests.has(requestId)) {
+                    this._screenshotRequests.delete(requestId);
+                    reject(new Error('Screenshot timeout'));
+                }
+            }, 5000);
+        });
+    }
+
+    /**
+     * Capture and download a screenshot of the remote desktop
+     * @param {string} [type='png'] - Image type: 'png' or 'jpg'
+     * @param {number} [quality=0.9] - JPEG quality (0-1), ignored for PNG
+     * @returns {Promise<void>} Resolves when download starts
+     * @example
+     * // Downloads as 'screenshot-2026-01-12--14-30.png'
+     * await client.downloadScreenshot();
+     * 
+     * // Download as JPEG
+     * await client.downloadScreenshot('jpg');
+     */
+    async downloadScreenshot(type = 'png', quality = 0.9) {
+        const { blob } = await this.getScreenshot(type, quality);
+        
+        // Generate filename with timestamp: screenshot-YYYY-mm-dd--hh-mm.ext
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}--${pad(now.getHours())}-${pad(now.getMinutes())}`;
+        const ext = (type === 'jpg' || type === 'jpeg') ? 'jpg' : 'png';
+        const filename = `screenshot-${timestamp}.${ext}`;
+        
+        // Create download link and trigger
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    /**
      * Register an event handler
      * @param {string} event - Event name ('connected', 'disconnected', 'error')
      * @param {Function} handler - Callback function
@@ -1247,6 +1350,14 @@ export class RDPClient {
 
     _toggleMute() {
         this.setMuted(!this._isMuted);
+    }
+
+    async _handleScreenshotClick() {
+        try {
+            await this.downloadScreenshot();
+        } catch (err) {
+            console.error('[RDPClient] Screenshot failed:', err);
+        }
     }
 
     _toggleFullscreen() {
@@ -1359,6 +1470,7 @@ export class RDPClient {
         this._el.btnDisconnect.disabled = false;
         this._el.btnKeyboard.disabled = false;
         this._el.btnMute.disabled = false;
+        this._el.btnScreenshot.disabled = false;
         this._canvas.focus();
         
         this._initAudio();
@@ -1396,6 +1508,7 @@ export class RDPClient {
         this._el.btnDisconnect.disabled = true;
         this._el.btnKeyboard.disabled = true;
         this._el.btnMute.disabled = true;
+        this._el.btnScreenshot.disabled = true;
         
         // Hide virtual keyboard on disconnect
         this.hideKeyboard();

@@ -33,9 +33,10 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 🎨 **ClearCodec WASM decoder** - Clear codec tiles decoded in WebAssembly
 - 🔊 Native audio streaming with Opus encoding (per-session isolation)
 - ⌨️ Full keyboard support with scan code translation
-- � **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
-- �🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
+- ⌨️ **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
+- 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
 - 📺 Fullscreen mode with dynamic resolution
+- 📸 **Screenshot capture** - Save the current remote desktop view as an image
 - 🎨 **Customizable theming** - Built-in presets (dark, light, midnight, high-contrast) with full color/typography control
 - 📊 Latency monitoring (ping/pong)
 - 🩺 Health check endpoint (`/health`)
@@ -43,6 +44,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 👥 Multi-user support (isolated RDP sessions per WebSocket connection)
 
 ## Todo (Best Effort)
+- sometimes h.264 frames get overpainted by tiles - under investigation
 - Clipboard support (copy/paste)
 - File transfer support
 - NVENC/VAAPI hardware transcoding (currently software FFmpeg)
@@ -352,6 +354,8 @@ document.body.style.background = themes.midnight.colors.background;
 | `getMuted()` | Returns current mute state (boolean) |
 | `setMuted(bool)` | Set audio mute state |
 | `getResolution()` | Returns `{ width, height }` or `null` if not connected |
+| `getScreenshot(type, quality)` | Capture screenshot. Returns `Promise<{ blob, width, height }>`. Type: `'png'` or `'jpg'` |
+| `downloadScreenshot(type, quality)` | Capture and download screenshot as `screenshot-YYYY-mm-dd--hh-mm.(png|jpg)` |
 | `on(event, handler)` | Register an event handler |
 | `off(event, handler)` | Remove an event handler |
 | `destroy()` | Clean up resources and remove from DOM |

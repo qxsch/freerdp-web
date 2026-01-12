@@ -1467,6 +1467,40 @@ async function processMessage(event) {
             console.log('[GFX Worker] Session reset complete');
             break;
             
+        case 'screenshot':
+            // Capture current canvas content and return as blob
+            if (primaryCanvas) {
+                const requestId = data.requestId;
+                const mimeType = data.mimeType || 'image/png';
+                const quality = data.quality || 0.92;
+                
+                primaryCanvas.convertToBlob({ type: mimeType, quality })
+                    .then(blob => {
+                        self.postMessage({
+                            type: 'screenshotResult',
+                            requestId,
+                            blob,
+                            width: primaryCanvas.width,
+                            height: primaryCanvas.height
+                        });
+                    })
+                    .catch(err => {
+                        console.error('[GFX Worker] Screenshot failed:', err);
+                        self.postMessage({
+                            type: 'screenshotResult',
+                            requestId,
+                            error: err.message
+                        });
+                    });
+            } else {
+                self.postMessage({
+                    type: 'screenshotResult',
+                    requestId: data.requestId,
+                    error: 'No canvas available'
+                });
+            }
+            break;
+            
         default:
             console.warn('[GFX Worker] Unknown message type:', type);
     }
