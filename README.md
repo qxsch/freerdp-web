@@ -44,7 +44,6 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 👥 Multi-user support (isolated RDP sessions per WebSocket connection)
 
 ## Todo (Best Effort)
-- sometimes h.264 frames get overpainted by tiles - under investigation
 - Clipboard support (copy/paste)
 - File transfer support
 - NVENC/VAAPI hardware transcoding (currently software FFmpeg)

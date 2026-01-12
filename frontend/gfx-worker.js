@@ -1396,7 +1396,7 @@ async function processMessage(event) {
             primaryCanvas = data.canvas;
             primaryCtx = primaryCanvas.getContext('2d', { 
                 alpha: false,
-                desynchronized: true,
+                desynchronized: false,    // slower performance, but no weird flicker effects when h.264 is active (gets overpainted)
                 willReadFrequently: true  // For getImageData operations
             });
             
