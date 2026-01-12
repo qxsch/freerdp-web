@@ -355,7 +355,7 @@ document.body.style.background = themes.midnight.colors.background;
 | `setMuted(bool)` | Set audio mute state |
 | `getResolution()` | Returns `{ width, height }` or `null` if not connected |
 | `getScreenshot(type, quality)` | Capture screenshot. Returns `Promise<{ blob, width, height }>`. Type: `'png'` or `'jpg'` |
-| `downloadScreenshot(type, quality)` | Capture and download screenshot as `screenshot-YYYY-mm-dd--hh-mm.(png|jpg)` |
+| `downloadScreenshot(type, quality)` | Capture and download screenshot as `screenshot-YYYY-mm-dd--hh-mm.(png\|jpg)` |
 | `on(event, handler)` | Register an event handler |
 | `off(event, handler)` | Remove an event handler |
 | `destroy()` | Clean up resources and remove from DOM |
