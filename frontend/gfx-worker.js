@@ -1104,6 +1104,61 @@ function applyCapsConfirm(msg) {
 }
 
 // ============================================================================
+// Initialization Settings (equivalent to log_settings in backend)
+// ============================================================================
+
+/**
+ * Log RDP session settings in a formatted box (mirrors backend log_settings)
+ * This provides visibility into the FreeRDP settings received from the backend.
+ * 
+ * @param {Object} settings - Parsed initSettings message from wire format
+ */
+function logSettings(settings) {
+    const yesNo = (val) => val ? 'YES' : 'NO';
+    
+    console.log(`
+┌──────────────────────────────────────────────────────────────┐
+│ RDP Settings (Frontend)                                      │
+├──────────────────────────────────────────────────────────────┤
+│ Graphics Pipeline                                            │
+│   SupportGraphicsPipeline: ${yesNo(settings.SupportGraphicsPipeline).padEnd(6)}                            │
+│   ColorDepth:              ${String(settings.colorDepth).padEnd(6)}                            │
+├──────────────────────────────────────────────────────────────┤
+│ H.264/AVC Codecs                                             │
+│   GfxH264:      ${yesNo(settings.GfxH264).padEnd(6)}    GfxAVC444:     ${yesNo(settings.GfxAVC444).padEnd(6)}              │
+│   GfxAVC444v2:  ${yesNo(settings.GfxAVC444v2).padEnd(6)}                                       │
+├──────────────────────────────────────────────────────────────┤
+│ Progressive/RemoteFX                                         │
+│   GfxProgressive:   ${yesNo(settings.GfxProgressive).padEnd(6)}  GfxProgressiveV2: ${yesNo(settings.GfxProgressiveV2).padEnd(6)}         │
+│   RemoteFxCodec:    ${yesNo(settings.RemoteFxCodec).padEnd(6)}                                   │
+├──────────────────────────────────────────────────────────────┤
+│ Other Codecs                                                 │
+│   NSCodec:    ${yesNo(settings.NSCodec).padEnd(6)}  JpegCodec:  ${yesNo(settings.JpegCodec).padEnd(6)}  GfxPlanar: ${yesNo(settings.GfxPlanar).padEnd(6)}  │
+├──────────────────────────────────────────────────────────────┤
+│ GFX Flags                                                    │
+│   SmallCache: ${yesNo(settings.GfxSmallCache).padEnd(6)}  ThinClient: ${yesNo(settings.GfxThinClient).padEnd(6)}                     │
+│   SendQoeAck: ${yesNo(settings.GfxSendQoeAck).padEnd(6)}  SuspendFrameAck: ${yesNo(settings.GfxSuspendFrameAck).padEnd(6)}                │
+├──────────────────────────────────────────────────────────────┤
+│ Audio                                                        │
+│   AudioPlayback:      ${yesNo(settings.AudioPlayback).padEnd(6)}                                 │
+│   AudioCapture:       ${yesNo(settings.AudioCapture).padEnd(6)}                                 │
+│   RemoteConsoleAudio: ${yesNo(settings.RemoteConsoleAudio).padEnd(6)}                                 │
+└──────────────────────────────────────────────────────────────┘
+`);
+    
+    // Store for potential future use
+    self.rdpSettings = settings;
+}
+
+/**
+ * Handle initSettings message from backend
+ * Called when the backend sends RDP session configuration
+ */
+function applyInitSettings(msg) {
+    logSettings(msg);
+}
+
+// ============================================================================
 // Frame lifecycle
 // ============================================================================
 
@@ -1297,6 +1352,10 @@ async function handleBinaryMessage(data) {
             
         case 'capsConfirm':
             applyCapsConfirm(msg);
+            break;
+            
+        case 'initSettings':
+            applyInitSettings(msg);
             break;
             
         case 'videoFrame':

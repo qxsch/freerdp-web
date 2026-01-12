@@ -44,6 +44,9 @@ export const Magic = {
     // Audio
     OPUS: new Uint8Array([0x4F, 0x50, 0x55, 0x53]),  // "OPUS" - Opus audio
     AUDI: new Uint8Array([0x41, 0x55, 0x44, 0x49]),  // "AUDI" - raw audio
+    
+    // Initialization
+    INIT: new Uint8Array([0x49, 0x4E, 0x49, 0x54]),  // "INIT" - initSettings
 };
 
 // ============================================================================
@@ -383,6 +386,64 @@ export function parseCapsConfirm(data) {
 }
 
 /**
+ * Parse initSettings message
+ * Layout: INIT(4) + colorDepth(4) + flagsLow(4) + flagsHigh(4) = 16 bytes
+ * 
+ * Decodes RDP session settings from the backend's freerdp_settings_get_bool calls.
+ * 
+ * flagsLow bit mapping:
+ *   bit 0:  SupportGraphicsPipeline
+ *   bit 1:  GfxH264
+ *   bit 2:  GfxAVC444
+ *   bit 3:  GfxAVC444v2
+ *   bit 4:  GfxProgressive
+ *   bit 5:  GfxProgressiveV2
+ *   bit 6:  RemoteFxCodec
+ *   bit 7:  NSCodec
+ *   bit 8:  JpegCodec
+ *   bit 9:  GfxPlanar
+ *   bit 10: GfxSmallCache
+ *   bit 11: GfxThinClient
+ *   bit 12: GfxSendQoeAck
+ *   bit 13: GfxSuspendFrameAck
+ *   bit 14: AudioPlayback
+ *   bit 15: AudioCapture
+ *   bit 16: RemoteConsoleAudio
+ */
+export function parseInitSettings(data) {
+    if (data.length < 16) return null;
+    
+    const colorDepth = readU32LE(data, 4);
+    const flagsLow = readU32LE(data, 8);
+    const flagsHigh = readU32LE(data, 12);
+    
+    return {
+        type: 'initSettings',
+        colorDepth: colorDepth,
+        flagsLow: flagsLow,
+        flagsHigh: flagsHigh,
+        // Decoded boolean settings
+        SupportGraphicsPipeline: !!(flagsLow & (1 << 0)),
+        GfxH264:                 !!(flagsLow & (1 << 1)),
+        GfxAVC444:               !!(flagsLow & (1 << 2)),
+        GfxAVC444v2:             !!(flagsLow & (1 << 3)),
+        GfxProgressive:          !!(flagsLow & (1 << 4)),
+        GfxProgressiveV2:        !!(flagsLow & (1 << 5)),
+        RemoteFxCodec:           !!(flagsLow & (1 << 6)),
+        NSCodec:                 !!(flagsLow & (1 << 7)),
+        JpegCodec:               !!(flagsLow & (1 << 8)),
+        GfxPlanar:               !!(flagsLow & (1 << 9)),
+        GfxSmallCache:           !!(flagsLow & (1 << 10)),
+        GfxThinClient:           !!(flagsLow & (1 << 11)),
+        GfxSendQoeAck:           !!(flagsLow & (1 << 12)),
+        GfxSuspendFrameAck:      !!(flagsLow & (1 << 13)),
+        AudioPlayback:           !!(flagsLow & (1 << 14)),
+        AudioCapture:            !!(flagsLow & (1 << 15)),
+        RemoteConsoleAudio:      !!(flagsLow & (1 << 16)),
+    };
+}
+
+/**
  * Parse H.264 video frame (legacy format from existing implementation)
  * Layout: H264(4) + frameId(4) + surfaceId(2) + codecId(2) + frameType(1) + 
  *         destX(2) + destY(2) + destW(2) + destH(2) + nalSize(4) + chromaNalSize(4) + data
@@ -466,6 +527,7 @@ export function parseMessage(data) {
         case 'EVCT': return parseEvictCache(data);
         case 'RSGR': return parseResetGraphics(data);
         case 'CAPS': return parseCapsConfirm(data);
+        case 'INIT': return parseInitSettings(data);
         case 'H264': return parseH264Frame(data);
         default: return null;
     }

@@ -513,6 +513,67 @@ static void log_settings(rdpSettings* settings, const char* phase)
     log_stderr(buf);
 }
 
+/**
+ * Queue init settings event for frontend (mirrors log_settings)
+ * 
+ * Packs boolean settings from freerdp_settings_get_bool into bitfields
+ * and queues them as RDP_GFX_EVENT_INIT_SETTINGS for the Python bridge.
+ * 
+ * flagsLow bit mapping:
+ *   bit 0:  SupportGraphicsPipeline
+ *   bit 1:  GfxH264
+ *   bit 2:  GfxAVC444
+ *   bit 3:  GfxAVC444v2
+ *   bit 4:  GfxProgressive
+ *   bit 5:  GfxProgressiveV2
+ *   bit 6:  RemoteFxCodec
+ *   bit 7:  NSCodec
+ *   bit 8:  JpegCodec
+ *   bit 9:  GfxPlanar
+ *   bit 10: GfxSmallCache
+ *   bit 11: GfxThinClient
+ *   bit 12: GfxSendQoeAck
+ *   bit 13: GfxSuspendFrameAck
+ *   bit 14: AudioPlayback
+ *   bit 15: AudioCapture
+ *   bit 16: RemoteConsoleAudio
+ */
+static void queue_init_settings(BridgeContext* ctx, rdpSettings* settings)
+{
+    uint32_t color_depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
+    uint32_t flags_low = 0;
+    
+    /* Pack boolean settings into bitfield */
+    if (freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline)) flags_low |= (1 << 0);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxH264))                  flags_low |= (1 << 1);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444))                flags_low |= (1 << 2);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444v2))              flags_low |= (1 << 3);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxProgressive))           flags_low |= (1 << 4);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxProgressiveV2))         flags_low |= (1 << 5);
+    if (freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec))            flags_low |= (1 << 6);
+    if (freerdp_settings_get_bool(settings, FreeRDP_NSCodec))                  flags_low |= (1 << 7);
+    if (freerdp_settings_get_bool(settings, FreeRDP_JpegCodec))                flags_low |= (1 << 8);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxPlanar))                flags_low |= (1 << 9);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxSmallCache))            flags_low |= (1 << 10);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxThinClient))            flags_low |= (1 << 11);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxSendQoeAck))            flags_low |= (1 << 12);
+    if (freerdp_settings_get_bool(settings, FreeRDP_GfxSuspendFrameAck))       flags_low |= (1 << 13);
+    if (freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback))            flags_low |= (1 << 14);
+    if (freerdp_settings_get_bool(settings, FreeRDP_AudioCapture))             flags_low |= (1 << 15);
+    if (freerdp_settings_get_bool(settings, FreeRDP_RemoteConsoleAudio))       flags_low |= (1 << 16);
+    
+    /* Queue event for Python bridge */
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_INIT_SETTINGS;
+    event.init_color_depth = color_depth;
+    event.init_flags_low = flags_low;
+    event.init_flags_high = 0;  /* Reserved for future use */
+    gfx_queue_event(ctx, &event);
+    
+    fprintf(stderr, "[rdp_bridge] Queued INIT_SETTINGS: colorDepth=%u, flagsLow=0x%08X\n",
+            color_depth, flags_low);
+}
+
 static void log_caps_confirm(UINT32 version, UINT32 flags)
 {
     char buf[LOG_BUFFER_SIZE];
@@ -1291,6 +1352,9 @@ static BOOL bridge_post_connect(freerdp* instance)
     
     /* WIRE-THROUGH MODE: No need to set needs_full_frame - GFX events will flow
      * after the GFX DVC connects and sends CreateSurface/StartFrame etc. */
+    
+    /* Queue init settings for frontend (mirrors log_settings output) */
+    queue_init_settings(ctx, settings);
     
     return TRUE;
 }

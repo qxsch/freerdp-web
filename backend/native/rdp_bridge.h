@@ -106,6 +106,7 @@ typedef enum {
     RDP_GFX_EVENT_EVICT_CACHE,      /* Evict cache slot (12) */
     RDP_GFX_EVENT_RESET_GRAPHICS,   /* Reset graphics (13) - new dimensions */
     RDP_GFX_EVENT_CAPS_CONFIRM,     /* Server capability confirmation (14) */
+    RDP_GFX_EVENT_INIT_SETTINGS,    /* Initialization settings from FreeRDP (15) */
 } RdpGfxEventType;
 
 /* GFX event for Python consumption */
@@ -136,6 +137,10 @@ typedef struct {
     /* Capability confirmation (for CAPS_CONFIRM) */
     uint32_t gfx_version;           /* GFX version from CapsConfirm */
     uint32_t gfx_flags;             /* GFX flags from CapsConfirm */
+    /* Initialization settings (for INIT_SETTINGS) */
+    uint32_t init_color_depth;      /* ColorDepth setting */
+    uint32_t init_flags_low;        /* Boolean settings packed as bitfield (bits 0-31) */
+    uint32_t init_flags_high;       /* Reserved for future settings (bits 32-63) */
 } RdpGfxEvent;
 
 /* Opaque session handle */

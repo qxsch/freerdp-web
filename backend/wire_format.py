@@ -51,6 +51,9 @@ class Magic:
     # Audio
     OPUS = b'OPUS'  # Opus audio
     AUDI = b'AUDI'  # raw audio
+    
+    # Initialization
+    INIT = b'INIT'  # initSettings (RDP session settings from freerdp_settings_get_bool)
 
 
 # ============================================================================
@@ -309,6 +312,95 @@ def build_caps_confirm(version: int, flags: int) -> bytes:
                        Magic.CAPS,
                        version,
                        flags)
+
+
+def build_init_settings(settings: dict) -> bytes:
+    """
+    Build initSettings message with RDP session configuration.
+    
+    Sends initialization-related settings from freerdp_settings_get_bool to the frontend,
+    allowing the frontend to display the same settings as log_settings() in the backend.
+    
+    Layout: INIT(4) + colorDepth(4) + flagsLow(4) + flagsHigh(4) = 16 bytes
+    
+    Flags are packed as bitfields:
+      flagsLow (bits 0-31):
+        bit 0:  SupportGraphicsPipeline
+        bit 1:  GfxH264
+        bit 2:  GfxAVC444
+        bit 3:  GfxAVC444v2
+        bit 4:  GfxProgressive
+        bit 5:  GfxProgressiveV2
+        bit 6:  RemoteFxCodec
+        bit 7:  NSCodec
+        bit 8:  JpegCodec
+        bit 9:  GfxPlanar
+        bit 10: GfxSmallCache
+        bit 11: GfxThinClient
+        bit 12: GfxSendQoeAck
+        bit 13: GfxSuspendFrameAck
+        bit 14: AudioPlayback
+        bit 15: AudioCapture
+        bit 16: RemoteConsoleAudio
+      
+      flagsHigh: Reserved for future settings
+    
+    Args:
+        settings: Dictionary with boolean settings and colorDepth
+            {
+                'colorDepth': int,
+                'SupportGraphicsPipeline': bool,
+                'GfxH264': bool,
+                'GfxAVC444': bool,
+                'GfxAVC444v2': bool,
+                'GfxProgressive': bool,
+                'GfxProgressiveV2': bool,
+                'RemoteFxCodec': bool,
+                'NSCodec': bool,
+                'JpegCodec': bool,
+                'GfxPlanar': bool,
+                'GfxSmallCache': bool,
+                'GfxThinClient': bool,
+                'GfxSendQoeAck': bool,
+                'GfxSuspendFrameAck': bool,
+                'AudioPlayback': bool,
+                'AudioCapture': bool,
+                'RemoteConsoleAudio': bool,
+            }
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    color_depth = settings.get('colorDepth', 32)
+    
+    # Pack boolean settings into flagsLow
+    flags_low = 0
+    if settings.get('SupportGraphicsPipeline', False): flags_low |= (1 << 0)
+    if settings.get('GfxH264', False):                 flags_low |= (1 << 1)
+    if settings.get('GfxAVC444', False):               flags_low |= (1 << 2)
+    if settings.get('GfxAVC444v2', False):             flags_low |= (1 << 3)
+    if settings.get('GfxProgressive', False):          flags_low |= (1 << 4)
+    if settings.get('GfxProgressiveV2', False):        flags_low |= (1 << 5)
+    if settings.get('RemoteFxCodec', False):           flags_low |= (1 << 6)
+    if settings.get('NSCodec', False):                 flags_low |= (1 << 7)
+    if settings.get('JpegCodec', False):               flags_low |= (1 << 8)
+    if settings.get('GfxPlanar', False):               flags_low |= (1 << 9)
+    if settings.get('GfxSmallCache', False):           flags_low |= (1 << 10)
+    if settings.get('GfxThinClient', False):           flags_low |= (1 << 11)
+    if settings.get('GfxSendQoeAck', False):           flags_low |= (1 << 12)
+    if settings.get('GfxSuspendFrameAck', False):      flags_low |= (1 << 13)
+    if settings.get('AudioPlayback', False):           flags_low |= (1 << 14)
+    if settings.get('AudioCapture', False):            flags_low |= (1 << 15)
+    if settings.get('RemoteConsoleAudio', False):      flags_low |= (1 << 16)
+    
+    # Reserved for future use
+    flags_high = 0
+    
+    return struct.pack('<4sIII',
+                       Magic.INIT,
+                       color_depth,
+                       flags_low,
+                       flags_high)
 
 
 def build_clearcodec_tile(frame_id: int, surface_id: int,

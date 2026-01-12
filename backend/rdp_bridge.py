@@ -29,7 +29,7 @@ from wire_format import (
     build_surface_to_cache, build_cache_to_surface, build_evict_cache,
     build_map_surface_to_output, build_webp_tile, build_h264_frame,
     build_reset_graphics, parse_frame_ack, parse_backpressure, get_message_type,
-    build_caps_confirm,
+    build_caps_confirm, build_init_settings,
     build_clearcodec_tile
 )
 
@@ -134,6 +134,7 @@ RDP_GFX_EVENT_VIDEO_FRAME = 11
 RDP_GFX_EVENT_EVICT_CACHE = 12
 RDP_GFX_EVENT_RESET_GRAPHICS = 13
 RDP_GFX_EVENT_CAPS_CONFIRM = 14
+RDP_GFX_EVENT_INIT_SETTINGS = 15
 
 
 class RdpGfxEvent(Structure):
@@ -164,6 +165,10 @@ class RdpGfxEvent(Structure):
         # Capability confirmation (for CAPS_CONFIRM)
         ('gfx_version', c_uint32),  # GFX version from CapsConfirm
         ('gfx_flags', c_uint32),    # GFX flags from CapsConfirm
+        # Initialization settings (for INIT_SETTINGS)
+        ('init_color_depth', c_uint32),  # ColorDepth setting
+        ('init_flags_low', c_uint32),    # Boolean settings packed as bitfield (bits 0-31)
+        ('init_flags_high', c_uint32),   # Reserved for future settings (bits 32-63)
     ]
 
 
@@ -652,6 +657,29 @@ class RDPBridge:
                 event.gfx_version,
                 event.gfx_flags
             )
+        elif event.type == RDP_GFX_EVENT_INIT_SETTINGS:
+            # Build init settings dict from packed flags
+            settings = {
+                'colorDepth': event.init_color_depth,
+                'SupportGraphicsPipeline': bool(event.init_flags_low & (1 << 0)),
+                'GfxH264':                 bool(event.init_flags_low & (1 << 1)),
+                'GfxAVC444':               bool(event.init_flags_low & (1 << 2)),
+                'GfxAVC444v2':             bool(event.init_flags_low & (1 << 3)),
+                'GfxProgressive':          bool(event.init_flags_low & (1 << 4)),
+                'GfxProgressiveV2':        bool(event.init_flags_low & (1 << 5)),
+                'RemoteFxCodec':           bool(event.init_flags_low & (1 << 6)),
+                'NSCodec':                 bool(event.init_flags_low & (1 << 7)),
+                'JpegCodec':               bool(event.init_flags_low & (1 << 8)),
+                'GfxPlanar':               bool(event.init_flags_low & (1 << 9)),
+                'GfxSmallCache':           bool(event.init_flags_low & (1 << 10)),
+                'GfxThinClient':           bool(event.init_flags_low & (1 << 11)),
+                'GfxSendQoeAck':           bool(event.init_flags_low & (1 << 12)),
+                'GfxSuspendFrameAck':      bool(event.init_flags_low & (1 << 13)),
+                'AudioPlayback':           bool(event.init_flags_low & (1 << 14)),
+                'AudioCapture':            bool(event.init_flags_low & (1 << 15)),
+                'RemoteConsoleAudio':      bool(event.init_flags_low & (1 << 16)),
+            }
+            return build_init_settings(settings)
         elif event.type == RDP_GFX_EVENT_WEBP_TILE:
             # WebP tile with pre-encoded data from C
             if event.bitmap_data and event.bitmap_size > 0:
