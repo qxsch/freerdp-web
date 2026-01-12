@@ -790,7 +790,8 @@ flowchart TB
             ClearWasm["ClearCodec<br/>WASM Decoder"]
             TileDecoder["Tile Decoder<br/>(WebP/RGBA)"]
             Compositor["Frame<br/>Compositor"]
-            OffscreenCanvas["OffscreenCanvas"]
+            OffscreenCanvases["OffscreenCanvases (Surfaces)"]
+            PrimaryCanvas["PrimaryCanvas"]
         end
     end
 
@@ -858,7 +859,8 @@ flowchart TB
     TileDecoder --> Compositor
     SurfaceMgr --> Compositor
     BitmapCache --> Compositor
-    Compositor --> OffscreenCanvas
+    Compositor --> OffscreenCanvases
+    OffscreenCanvases --> PrimaryCanvas
 
     %% Audio flow (main thread)
     FreeRDP --> Bridge
