@@ -121,7 +121,15 @@ docker run --rm -it -p 8000:8000 rdp-frontend
 
 The RDP client is available as a reusable ES module with Shadow DOM isolation, making it easy to integrate into any web application.
 
-### Required HTTP Headers
+### Required HTTP Headers (when building your own web server)
+
+Generate the WASM decoder and javascript files by running the included PowerShell script:
+```pwsh
+# the below script will build all files and but it into the 'wasmbuild' folder
+justbuildwasm.ps1
+# copy the contents of the 'wasmbuild' folder to your web server's static file directory
+cp -r wasmbuild/* /path/to/your/webserver/
+```
 
 The frontend requires cross-origin isolation headers for SharedArrayBuffer support (used by WASM pthreads). Your web server must include these headers:
 
