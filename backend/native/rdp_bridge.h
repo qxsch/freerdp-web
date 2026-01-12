@@ -18,7 +18,7 @@ extern "C" {
 
 /* GFX pipeline constants */
 #define RDP_MAX_GFX_SURFACES 256
-#define RDP_MAX_GFX_EVENTS 4096  /* Max pending GFX lifecycle events */
+#define RDP_MAX_GFX_EVENTS 16384  /* Max pending GFX lifecycle events - larger to prevent overflow */
 
 /* Session registry limits (compile-time defaults, runtime configurable) */
 #define RDP_MAX_SESSIONS_DEFAULT 100

@@ -93,6 +93,9 @@ let primarySurfaceId = null;
 /** @type {number|null} Current frame being processed */
 let currentFrameId = null;
 
+/** @type {number|null} Last completed frame ID for skip detection */
+let lastCompletedFrameId = null;
+
 /** @type {Set<number>} Surfaces updated in the current frame */
 let frameUpdatedSurfaces = new Set();
 
@@ -169,11 +172,35 @@ let h264NeedsKeyframe = true;
 let lastDeletedSurface = null;
 
 /**
+ * GFX Pixel Format constants (MS-RDPEGFX 2.2.3.1)
+ */
+const GFX_PIXEL_FORMAT = {
+    XRGB_8888: 0x20,  // 32bpp RGB, no alpha
+    ARGB_8888: 0x21,  // 32bpp ARGB, with alpha
+};
+
+/**
+ * Get the name of a pixel format constant
+ * 
+ * @param {number} pixelFormat - Pixel format (0x20=XRGB_8888, 0x21=ARGB_8888)
+ */
+function getPixelFormatName(value) {
+    return Object.keys(GFX_PIXEL_FORMAT).find(
+        key => GFX_PIXEL_FORMAT[key] === value
+    );
+}
+
+/**
  * Create a new surface
  * Per RFX/GFX protocol: Surface create always starts with fresh progressive state.
  * The server will send new TILE_FIRST data for any tiles it wants to render.
+ * 
+ * @param {number} surfaceId - Surface identifier
+ * @param {number} width - Surface width in pixels
+ * @param {number} height - Surface height in pixels  
+ * @param {number} pixelFormat - Pixel format (0x20=XRGB_8888, 0x21=ARGB_8888)
  */
-function createSurface(surfaceId, width, height) {
+function createSurface(surfaceId, width, height, pixelFormat = GFX_PIXEL_FORMAT.XRGB_8888) {
     // Delete existing if present
     if (surfaces.has(surfaceId)) {
         deleteSurface(surfaceId);
@@ -186,14 +213,22 @@ function createSurface(surfaceId, width, height) {
         willReadFrequently: true  // Optimize for SurfaceToCache getImageData calls
     });
     
+    // Per MS-RDPEGFX spec: compositor must use direct copy, no alpha blending
+    ctx.globalCompositeOperation = 'copy';
+    ctx.imageSmoothingEnabled = false;
+    
     // Fill with black initially
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, width, height);
+    
+    // Restore to source-over for normal drawing operations (tiles use putImageData anyway)
+    ctx.globalCompositeOperation = 'source-over';
     
     surfaces.set(surfaceId, {
         id: surfaceId,
         width,
         height,
+        pixelFormat,  // Store for potential ClearCodec processing
         canvas,
         ctx
     });
@@ -205,9 +240,9 @@ function createSurface(surfaceId, width, height) {
         // Delete any existing WASM state (may exist from previous surface with same ID)
         wasmModule._prog_delete_surface(progCtx, surfaceId);
         wasmModule._prog_create_surface(progCtx, surfaceId, width, height);
-        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height} (fresh Progressive state)`);
+        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height}, pixelFormat=${getPixelFormatName(pixelFormat)} (fresh Progressive state)`);
     } else {
-        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height}`);
+        console.log(`[GFX Worker] Created surface ${surfaceId}: ${width}x${height}, pixelFormat=${getPixelFormatName(pixelFormat)}`);
     }
     
     // Clear the last deleted surface info (no longer needed for preservation logic)
@@ -486,6 +521,7 @@ function decodeProgressiveTile(msg) {
             
             // Draw tile to surface
             surface.ctx.putImageData(imageData, tileX, tileY, 0, 0, tileW, tileH);
+            
             tilesDrawn++;
         }
         
@@ -570,6 +606,7 @@ function decodeClearCodecTile(msg) {
     // Create ImageData and draw to surface
     const imageData = new ImageData(copiedData, w, h);
     surface.ctx.putImageData(imageData, msg.x, msg.y);
+    
 }
 
 /**
@@ -591,6 +628,8 @@ async function decodeWebPTile(msg) {
         const blob = new Blob([msg.payload], { type: 'image/webp' });
         const bitmap = await createImageBitmap(blob);
         
+        // Ensure copy mode for WebP tiles
+        surface.ctx.globalCompositeOperation = 'copy';
         surface.ctx.drawImage(bitmap, msg.x, msg.y, msg.w, msg.h);
         bitmap.close();
         
@@ -618,6 +657,7 @@ function drawRawTile(msg) {
     );
     
     surface.ctx.putImageData(imageData, msg.x, msg.y);
+    
 }
 
 /**
@@ -636,6 +676,8 @@ async function drawLegacyFullFrame(bytes, mimeType) {
         const blob = new Blob([bytes], { type: mimeType });
         const bitmap = await createImageBitmap(blob);
         
+        // Ensure copy mode for legacy frames
+        primaryCtx.globalCompositeOperation = 'copy';
         primaryCtx.drawImage(bitmap, 0, 0, primaryCanvas.width, primaryCanvas.height);
         bitmap.close();
         
@@ -679,6 +721,8 @@ async function initH264(width, height) {
             output: (frame) => {
                 const meta = h264DecodeQueue.shift();
                 if (meta && primaryCtx) {
+                    // Ensure copy mode for H.264 frames
+                    primaryCtx.globalCompositeOperation = 'copy';
                     primaryCtx.drawImage(frame, 
                         meta.destX, meta.destY, meta.destW, meta.destH,
                         meta.destX, meta.destY, meta.destW, meta.destH);
@@ -841,6 +885,8 @@ function applySurfaceToSurface(msg) {
     // Track that destination surface was updated in the current frame
     frameUpdatedSurfaces.add(msg.dstSurfaceId);
     
+    // Ensure copy mode for surface-to-surface blit
+    dstSurface.ctx.globalCompositeOperation = 'copy';
     dstSurface.ctx.drawImage(
         srcSurface.canvas,
         msg.srcX, msg.srcY, msg.srcW, msg.srcH,
@@ -957,9 +1003,104 @@ function applyResetGraphics(msg) {
     if (primaryCanvas && (primaryCanvas.width !== msg.width || primaryCanvas.height !== msg.height)) {
         primaryCanvas.width = msg.width;
         primaryCanvas.height = msg.height;
+        
+        // Per MS-RDPEGFX spec: re-apply compositor settings after resize
+        // (canvas resize clears the context state)
+        primaryCtx.globalCompositeOperation = 'copy';
+        primaryCtx.imageSmoothingEnabled = false;
+        primaryCtx.fillStyle = '#000000';
+        primaryCtx.fillRect(0, 0, msg.width, msg.height);
     }
     
     console.log(`[GFX Worker] ResetGraphics: cleared ${surfaceCount} surfaces, new size ${msg.width}x${msg.height}`);
+}
+
+// ============================================================================
+// Capability Confirmation
+// ============================================================================
+
+// GFX Version constants (MS-RDPEGFX 2.2.3.1)
+const RDPGFX_CAPVERSION = {
+    8:    0x00080004,   // Version 8.0
+    81:   0x00080105,   // Version 8.1
+    10:   0x000A0002,   // Version 10.0
+    101:  0x000A0100,   // Version 10.1
+    102:  0x000A0200,   // Version 10.2
+    103:  0x000A0301,   // Version 10.3
+    104:  0x000A0400,   // Version 10.4
+    105:  0x000A0502,   // Version 10.5
+    106:  0x000A0600,   // Version 10.6
+    107:  0x000A0701,   // Version 10.7
+};
+
+// GFX Capability flags (MS-RDPEGFX 2.2.3.1)
+const RDPGFX_CAPS_FLAG = {
+    THINCLIENT:      0x00000001,
+    SMALL_CACHE:     0x00000002,
+    AVC420_ENABLED:  0x00000010,
+    AVC_DISABLED:    0x00000020,
+    AVC_THINCLIENT:  0x00000040,
+};
+
+/**
+ * Handle capsConfirm from server
+ * Log the negotiated GFX capabilities in a human-readable format
+ */
+function applyCapsConfirm(msg) {
+    const version = msg.version;
+    const flags = msg.flags;
+    
+    // Decode version to string
+    let versionStr = 'Unknown';
+    let h264Supported = false;
+    switch (version) {
+        case RDPGFX_CAPVERSION[8]:   versionStr = '8.0'; break;
+        case RDPGFX_CAPVERSION[81]:  versionStr = '8.1'; break;
+        case RDPGFX_CAPVERSION[10]:  versionStr = '10.0'; h264Supported = true; break;
+        case RDPGFX_CAPVERSION[101]: versionStr = '10.1'; h264Supported = true; break;
+        case RDPGFX_CAPVERSION[102]: versionStr = '10.2'; h264Supported = true; break;
+        case RDPGFX_CAPVERSION[103]: versionStr = '10.3'; h264Supported = true; break;
+        case RDPGFX_CAPVERSION[104]: versionStr = '10.4'; h264Supported = true; break;
+        case RDPGFX_CAPVERSION[105]: versionStr = '10.5'; h264Supported = true; break;
+        case RDPGFX_CAPVERSION[106]: versionStr = '10.6'; h264Supported = true; break;
+        case RDPGFX_CAPVERSION[107]: versionStr = '10.7'; h264Supported = true; break;
+    }
+    
+    // Decode flags
+    const thinClient = (flags & RDPGFX_CAPS_FLAG.THINCLIENT) ? 'Active' : 'Inactive';
+    const smallCache = (flags & RDPGFX_CAPS_FLAG.SMALL_CACHE) ? 'Active' : 'Inactive';
+    const avc420Enabled = (flags & RDPGFX_CAPS_FLAG.AVC420_ENABLED) ? 'Enabled' : 'Disabled';
+    const avcDisabled = (flags & RDPGFX_CAPS_FLAG.AVC_DISABLED) ? 'YES!' : 'No';
+    const avcThinClient = (flags & RDPGFX_CAPS_FLAG.AVC_THINCLIENT) ? 'Active' : 'Inactive';
+    
+    // Codec availability
+    const progressiveSupported = version >= RDPGFX_CAPVERSION[81];
+    const clearCodecSupported = version >= RDPGFX_CAPVERSION[8];
+    const h264Available = h264Supported && !(flags & RDPGFX_CAPS_FLAG.AVC_DISABLED);
+    
+    // Log in box format similar to backend
+    console.log(`
+┌──────────────────────────────────────────────────────────────┐
+│ Server CapsConfirm (Frontend)                                │
+├──────────────────────────────────────────────────────────────┤
+│   Version: ${versionStr.padEnd(8)} (0x${version.toString(16).padStart(8, '0').toUpperCase()})                             │
+│   Flags:   0x${flags.toString(16).padStart(8, '0').toUpperCase()}                                        │
+├──────────────────────────────────────────────────────────────┤
+│ Flag Breakdown                                               │
+│   Thin Client Mode:   ${thinClient.padEnd(8)}  (limited graphics if Active) │
+│   Small Cache:        ${smallCache.padEnd(8)}  (reduced tile cache)         │
+│   H.264 AVC420:       ${avc420Enabled.padEnd(8)}  (4:2:0 chroma subsampling)   │
+│   H.264 Blocked:      ${avcDisabled.padEnd(8)}  (AVC_DISABLED flag)          │
+│   AVC Thin Client:    ${avcThinClient.padEnd(8)}  (reduced H.264 quality)      │
+├──────────────────────────────────────────────────────────────┤
+│ Codec Availability                                           │
+│   H.264/AVC:   ${(h264Available ? 'YES' : 'NO').padEnd(6)}   AVC420:      ${(flags & RDPGFX_CAPS_FLAG.AVC420_ENABLED ? 'YES' : 'NO').padEnd(6)}                  │
+│   Progressive: ${(progressiveSupported ? 'YES' : 'NO').padEnd(6)}   ClearCodec:  ${(clearCodecSupported ? 'YES' : 'NO').padEnd(6)}                  │
+└──────────────────────────────────────────────────────────────┘
+`);
+    
+    // Store for potential future use
+    self.gfxCaps = { version, versionStr, flags, h264Supported, h264Available, progressiveSupported, clearCodecSupported };
 }
 
 // ============================================================================
@@ -976,6 +1117,8 @@ function compositeSurfaceToPrimary(surfaceId) {
     const surface = surfaces.get(surfaceId);
     if (!surface) return;
     
+    // Ensure copy mode for surface-to-primary composition
+    primaryCtx.globalCompositeOperation = 'copy';
     // Draw the surface to the primary canvas
     primaryCtx.drawImage(surface.canvas, 0, 0);
 }
@@ -998,6 +1141,9 @@ function endFrame(frameId) {
     
     // Composite all surfaces that were updated in this frame to primary canvas
     if (primaryCanvas && primaryCtx) {
+        // Ensure copy mode for surface-to-primary composition (no alpha blending)
+        primaryCtx.globalCompositeOperation = 'copy';
+        
         // First try primarySurfaceId if set and was updated
         if (primarySurfaceId !== null && frameUpdatedSurfaces.has(primarySurfaceId)) {
             const surface = surfaces.get(primarySurfaceId);
@@ -1019,6 +1165,9 @@ function endFrame(frameId) {
     } else {
         console.warn(`[GFX Worker] EndFrame: No primary canvas! primaryCanvas=${!!primaryCanvas} primaryCtx=${!!primaryCtx}`);
     }
+    
+    // Track last completed frame for skip detection
+    lastCompletedFrameId = frameId;
     
     currentFrameId = null;
     frameUpdatedSurfaces.clear();
@@ -1088,7 +1237,7 @@ async function handleBinaryMessage(data) {
     
     switch (msg.type) {
         case 'createSurface':
-            createSurface(msg.surfaceId, msg.width, msg.height);
+            createSurface(msg.surfaceId, msg.width, msg.height, msg.format);
             break;
             
         case 'deleteSurface':
@@ -1117,6 +1266,8 @@ async function handleBinaryMessage(data) {
                 drawRawTile(msg);
             } else if (msg.codec === 'clearcodec') {
                 decodeClearCodecTile(msg);
+            } else {
+                console.warn(`[GFX Worker] Unknown tile codec: "${msg.codec}", surfaceId=${msg.surfaceId}, x=${msg.x}, y=${msg.y}`);
             }
             break;
             
@@ -1142,6 +1293,10 @@ async function handleBinaryMessage(data) {
             
         case 'resetGraphics':
             applyResetGraphics(msg);
+            break;
+            
+        case 'capsConfirm':
+            applyCapsConfirm(msg);
             break;
             
         case 'videoFrame':
@@ -1196,6 +1351,14 @@ async function processMessage(event) {
                 willReadFrequently: true  // For getImageData operations
             });
             
+            // Per MS-RDPEGFX spec: compositor must use direct copy for final output
+            primaryCtx.globalCompositeOperation = 'copy';
+            primaryCtx.imageSmoothingEnabled = false;
+            
+            // Fill with black initially
+            primaryCtx.fillStyle = '#000000';
+            primaryCtx.fillRect(0, 0, primaryCanvas.width, primaryCanvas.height);
+            
             // Don't pre-create surface 0 here - let the server create surfaces
             // via CreateSurface messages. Pre-creating causes conflicts when 
             // server sends its own CreateSurface(0) which then gets deleted.
@@ -1223,6 +1386,14 @@ async function processMessage(event) {
                 if (primaryCanvas.width !== data.width || primaryCanvas.height !== data.height) {
                     primaryCanvas.width = data.width;
                     primaryCanvas.height = data.height;
+                    
+                    // Per MS-RDPEGFX spec: re-apply compositor settings after resize
+                    // (canvas resize clears the context state)
+                    primaryCtx.globalCompositeOperation = 'copy';
+                    primaryCtx.imageSmoothingEnabled = false;
+                    primaryCtx.fillStyle = '#000000';
+                    primaryCtx.fillRect(0, 0, data.width, data.height);
+                    
                     console.log(`[GFX Worker] Primary canvas resized to ${data.width}x${data.height}`);
                 }
             }
