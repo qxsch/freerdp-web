@@ -13,6 +13,47 @@ Without a security policy, users can connect to **any** RDP host. A security pol
 - Enforce port restrictions
 - Block connections to unauthorized destinations
 
+## How It Works
+
+## Architecture
+
+Filtering is supported on both the frontend (in the browser) and backend (server-side).
+The frontend policy provides immediate feedback to users, while the backend policy enforces security (since it proxies connections to the destination hosts).
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Client Browser                          │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    RDPClient Instance                     │  │
+│  │  ┌─────────────────────────────────────────────────────┐  │  │
+│  │  │  RDPSecurityPolicy (Frontend - rdp-security.js)     │  │  │
+│  │  │  • Deep frozen policy object                        │  │  │
+│  │  │  • Pre-compiled regex patterns                      │  │  │
+│  │  │  • validate(host, port) → {allowed, reason}         │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                  │
+│                    Connection Request                           │
+└──────────────────────────────┼──────────────────────────────────┘
+                               │ WebSocket
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Backend Server                             │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                     RDPBridge                             │  │
+│  │  ┌─────────────────────────────────────────────────────┐  │  │
+│  │  │  RDPSecurityPolicy (Backend - rdp_security.py)      │  │  │
+│  │  │  • Loads from JSON file                             │  │  │
+│  │  │  • Singleton pattern                                │  │  │
+│  │  │  • validate(host, port) → ValidationResult          │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │ If Allowed                       │
+│                              ▼                                  │
+│              Native FreeRDP3 Connection                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## Quick Start
