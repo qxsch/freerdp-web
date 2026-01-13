@@ -48,7 +48,6 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ## Todo (Best Effort)
 - Clipboard support (copy/paste)
 - File transfer support
-- NVENC/VAAPI hardware transcoding (currently software FFmpeg)
 
 ## Tech Stack
 
