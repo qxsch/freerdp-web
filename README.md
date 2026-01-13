@@ -1086,12 +1086,6 @@ flowchart TB
             CursorMgr["Cursor Manager<br/>(CSS cursor)"]
         end
         
-        subgraph AudioThread["AudioWorklet Thread"]
-            AudioWorklet["AudioWorklet<br/>Processor"]
-            RingBuffer["Ring Buffer<br/>(SharedArrayBuffer)"]
-            AudioOut["Audio Output<br/>(128 samples/frame)"]
-        end
-        
         subgraph GFXWorker["GFX Worker Thread"]
             WireParser["Wire Format<br/>Parser"]
             SurfaceMgr["Surface<br/>Manager"]
@@ -1103,6 +1097,12 @@ flowchart TB
             Compositor["Frame<br/>Compositor"]
             OffscreenCanvases["OffscreenCanvases (Surfaces)"]
             PrimaryCanvas["PrimaryCanvas"]
+        end
+
+        subgraph AudioThread["AudioWorklet Thread"]
+            AudioWorklet["AudioWorklet<br/>Processor"]
+            RingBuffer["Ring Buffer<br/>(SharedArrayBuffer)"]
+            AudioOut["Audio Output<br/>(128 samples/frame)"]
         end
     end
 
