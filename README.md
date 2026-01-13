@@ -807,6 +807,7 @@ flowchart TB
             AudioDecoder["WebCodecs<br/>AudioDecoder"]
             AudioCtx["AudioContext<br/>+ Speakers"]
             Input["Keyboard/Mouse<br/>Events"]
+            CursorMgr["Cursor Manager<br/>(CSS cursor)"]
         end
         
         subgraph GFXWorker["GFX Worker (Dedicated Thread)"]
@@ -839,6 +840,10 @@ flowchart TB
                 SurfaceOps["Surface Ops<br/>(Fill/Copy/Cache)"]
             end
             
+            subgraph Pointer["Pointer Channel"]
+                PointerCB["Pointer Callbacks<br/>(New/Set/Free)"]
+            end
+            
             subgraph Audio["RDPSND Channel"]
                 Bridge["rdpsnd-bridge"]
                 Opus["Opus Encoder"]
@@ -852,27 +857,30 @@ flowchart TB
     end
 
     %% RDP connection
-    Desktop -->|"Screen/Audio"| RDP
-    RDP -->|"RDPGFX + RDPSND"| FreeRDP
+    Desktop -->|"Screen/Audio/Cursor"| RDP
+    RDP -->|"RDPGFX + RDPSND + Pointer"| FreeRDP
     
     %% GFX event processing
     FreeRDP --> H264Codecs
     FreeRDP --> TileCodecs
     FreeRDP --> ProgCodec
     FreeRDP --> SurfaceOps
+    FreeRDP --> PointerCB
     H264Codecs --> FFmpeg
     FFmpeg --> GFXQueue
     TileCodecs --> GFXQueue
     ProgCodec --> GFXQueue
     SurfaceOps --> GFXQueue
+    PointerCB --> GFXQueue
     
     %% Wire format encoding
     GFXQueue --> WireFormat
-    WireFormat -->|"SURF/H264/PROG/CLRC/..."| WS_Server
+    WireFormat -->|"SURF/H264/PROG/CLRC/PSET/..."| WS_Server
     
     %% WebSocket to browser
     WS_Server -->|"Binary Messages"| WS_Client
     WS_Client -->|"postMessage"| WireParser
+    WS_Client -->|"PPOS/PSYS/PSET"| CursorMgr
     
     %% GFX Worker processing
     WireParser --> SurfaceMgr
@@ -916,6 +924,7 @@ flowchart TB
     style GFXWorker fill:#c8e6c9
     style GFX fill:#fff59d
     style Audio fill:#b3e5fc
+    style Pointer fill:#f8bbd9
 ```
 
 ### Data Flow Summary
