@@ -30,6 +30,7 @@
 
 import { resolveTheme, themeToCssVars, sanitizeTheme, fontsToCss, themes } from './rdp-themes.js';
 import { Magic, matchMagic, parsePointerPosition, parsePointerSystem, parsePointerSet } from './wire-format.js';
+import { RDPSecurityPolicy } from './rdp-security.js';
 
 // ============================================================
 // STYLES - Shadow DOM isolated styles (uses CSS custom properties for theming)
@@ -598,6 +599,9 @@ const TEMPLATE = `
 // RDP CLIENT CLASS
 // ============================================================
 export class RDPClient {
+    /** @type {RDPSecurityPolicy} */
+    #securityPolicy;
+    
     /**
      * Create an RDP Client instance
      * @param {HTMLElement} container - Container element to attach to
@@ -610,8 +614,12 @@ export class RDPClient {
      * @param {number} [options.minWidth=0] - Minimum canvas width in pixels (0 = no minimum, scrollbar appears if container is smaller)
      * @param {number} [options.minHeight=0] - Minimum canvas height in pixels (0 = no minimum, scrollbar appears if container is smaller)
      * @param {import('./rdp-themes.js').RDPTheme} [options.theme] - Theme configuration
+     * @param {import('./rdp-security.js').SecurityPolicy} [options.securityPolicy] - Security policy for connection restrictions
      */
     constructor(container, options = {}) {
+        // Extract security policy before spreading options (we don't store it in this.options)
+        const { securityPolicy, ...restOptions } = options;
+        
         this.options = {
             wsUrl: 'ws://localhost:8765',
             showTopBar: true,
@@ -623,8 +631,12 @@ export class RDPClient {
             minWidth: 0,    // Minimum canvas width (0 = no minimum, scrollbar appears if container is smaller)
             minHeight: 0,   // Minimum canvas height (0 = no minimum, scrollbar appears if container is smaller)
             theme: null,
-            ...options
+            ...restOptions
         };
+        
+        // Initialize security policy as private frozen field
+        // Deep frozen by default to prevent tampering
+        this.#securityPolicy = new RDPSecurityPolicy(securityPolicy || {}, true);
 
         this._container = container;
         this._initShadowDOM();
@@ -1080,6 +1092,14 @@ export class RDPClient {
                 reject(new Error('Missing required connection fields: host, user, pass'));
                 return;
             }
+            
+            // Validate connection against security policy
+            const port = credentials.port || 3389;
+            const policyResult = this.#securityPolicy.validate(credentials.host, port);
+            if (!policyResult.allowed) {
+                reject(new Error(policyResult.reason || 'Connection blocked by security policy'));
+                return;
+            }
 
             // Hide modal if it's open (e.g., when connect() is called via API)
             if (this._el.modal.classList.contains('active')) {
@@ -1264,6 +1284,25 @@ export class RDPClient {
     getLatency() {
         if (!this._isConnected || this._pingStart === 0) return null;
         return this._lastLatency || null;
+    }
+
+    /**
+     * Get the security policy configuration (read-only)
+     * The returned object is frozen and cannot be modified
+     * @returns {import('./rdp-security.js').SecurityPolicy} Security policy
+     */
+    getSecurityPolicy() {
+        return this.#securityPolicy.getPolicy();
+    }
+
+    /**
+     * Check if a destination would be allowed by the security policy
+     * @param {string} host - Hostname or IP address
+     * @param {number} [port=3389] - Port number
+     * @returns {{allowed: boolean, reason?: string}} Validation result
+     */
+    validateDestination(host, port = 3389) {
+        return this.#securityPolicy.validate(host, port);
     }
 
     /**
@@ -1669,6 +1708,20 @@ export class RDPClient {
         console.error('[RDPClient] Error:', message);
         this._updateStatus('error', 'Error');
         this._emit('error', { message });
+        
+        // If we have a pending connect promise (connection attempt failed),
+        // reject it and close the WebSocket to allow retry
+        if (this._pendingConnect) {
+            this._pendingConnect.reject(new Error(message));
+            this._pendingConnect = null;
+            
+            // Close the WebSocket to allow reconnection attempts
+            if (this._ws) {
+                this._ws.close();
+                // Note: _handleDisconnect will be called by onclose handler
+            }
+        }
+        // If already connected, just emit the error - don't force disconnect
     }
 
     _sendPing() {
@@ -2655,9 +2708,18 @@ export class RDPClient {
         const rect = this._el.screen.getBoundingClientRect();
         let width = Math.floor(rect.width - 4);
         let height = Math.floor(rect.height - 4);
+
+        // do never send resize below RDP server minimums or above maximums
+        const minRdpServerDimensions = { width: 640, height: 480 };
+        const maxRdpServerDimensions = { width: 4096, height: 2304 };
         
-        width = Math.max(640, Math.min(width, 4096));
-        height = Math.max(480, Math.min(height, 2160));
+        // Respect user-defined minWidth/minHeight (never send resize below these values)
+        // But still honor minimums of rdp server
+        const minW = Math.max(minRdpServerDimensions.width, this.options.minWidth || 0);
+        const minH = Math.max(minRdpServerDimensions.height, this.options.minHeight || 0);
+        // But still honor maximumof rdp server
+        width = Math.max(minW, Math.min(width, maxRdpServerDimensions.width));
+        height = Math.max(minH, Math.min(height, maxRdpServerDimensions.height));
         width = Math.floor(width / 2) * 2;
         height = Math.floor(height / 2) * 2;
         

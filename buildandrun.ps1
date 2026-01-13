@@ -73,7 +73,9 @@ elseif($image -eq "backend") {
             Set-Location $scriptDir
         }
     }
-    docker run --rm -it -p 8765:8765 --name rdp-backend rdp-backend
+    # to test the security policy
+    # docker run --rm -it -p 8765:8765 --name rdp-backend  -v "$scriptDir\backend\security:/app/security"  rdp-backend
+    docker run --rm -it -p 8765:8765 --name rdp-backend  -v "$scriptDir\backend\security:/app/security"  rdp-backend
 }
 else {
     Write-Host "Please specify an image to build and run: -image frontend or -image backend"

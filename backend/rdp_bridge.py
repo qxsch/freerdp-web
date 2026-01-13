@@ -34,6 +34,9 @@ from wire_format import (
     build_pointer_position, build_pointer_system, build_pointer_set
 )
 
+# Import security policy for connection validation
+from rdp_security import get_security_policy
+
 logger = logging.getLogger('rdp-bridge')
 
 
@@ -493,6 +496,28 @@ class RDPBridge:
     async def connect(self) -> bool:
         """Connect to the RDP server"""
         try:
+            # Validate connection against security policy
+            security_policy = get_security_policy()
+            validation_result = security_policy.validate(self.config.host, self.config.port)
+            
+            if not validation_result.allowed:
+                logger.warning(
+                    f"Security policy blocked connection to {self.config.host}:{self.config.port} - "
+                    f"{validation_result.reason}"
+                )
+                # Send error to client if websocket is available
+                if self.websocket:
+                    try:
+                        import json
+                        await self.websocket.send(json.dumps({
+                            'type': 'error',
+                            'error': 'security_policy_violation',
+                            'message': validation_result.reason
+                        }))
+                    except Exception:
+                        pass
+                return False            
+            
             # Load native library
             try:
                 self._lib = NativeLibrary()

@@ -186,6 +186,163 @@ await client.connect({
 | `minWidth` | number | `0` | Minimum canvas width in pixels (0 = no minimum, scrollbar appears if container is smaller) |
 | `minHeight` | number | `0` | Minimum canvas height in pixels (0 = no minimum, scrollbar appears if container is smaller) |
 | `theme` | object | `null` | Theme configuration (see Theming section) |
+| `securityPolicy` | object | `null` | Security policy for connection restrictions (see Security Policy section) |
+
+### Security Policy
+
+The RDP client supports a security policy to restrict which destinations users can connect to. This is useful for enterprise deployments where you want to limit connections to approved hosts only.
+
+The security policy is **immutable by design** - it uses JavaScript private class fields and deep freezing to prevent tampering after initialization.
+
+#### Quick Start
+
+```javascript
+const client = new RDPClient(container, {
+    wsUrl: 'ws://localhost:8765',
+    securityPolicy: {
+        allowedHostnames: ['*.internal.corp', 'rdp.example.com'],
+        allowedIpv4Cidrs: ['10.0.0.0/8', '192.168.1.0/24'],
+        allowedDestinationRegex: ['^prod-server-\\d+:3389$']
+    }
+});
+```
+
+#### Security Policy Options
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `allowedHostnames` | `string[]` | Glob patterns for allowed hostnames (IPs are ignored) |
+| `allowedIpv4Cidrs` | `string[]` | CIDR ranges for allowed IPv4 addresses (non-IPs are ignored) |
+| `allowedDestinationRegex` | `string[]` | Regex patterns matched against `host:port` strings (does not matter if ip or hostname) |
+
+> **Note**: If no security policy is provided, or if all arrays are empty, all connections are allowed. When at least one rule is defined, only destinations matching at least one rule will be permitted.
+
+#### Hostname Glob Patterns
+
+The `allowedHostnames` option supports full glob pattern matching:
+
+| Pattern | Description | Example Matches |
+|---------|-------------|-----------------|
+| `*` | Matches any sequence of characters | `*.example.com` matches `server.example.com`, `db.example.com` |
+| `?` | Matches exactly one character | `web?.prod` matches `web1.prod`, `webA.prod` |
+| `[abc]` | Matches any character in the set | `server[123].corp` matches `server1.corp`, `server2.corp` |
+| `[!abc]` | Matches any character NOT in the set | `db[!0].prod` matches `db1.prod`, `dbA.prod` but not `db0.prod` |
+
+Hostname matching is **case-insensitive**.
+
+```javascript
+securityPolicy: {
+    allowedHostnames: [
+        '*.internal.corp',           // All subdomains of internal.corp
+        'rdp-server-??.prod',        // rdp-server-01.prod through rdp-server-99.prod
+        'web[123].example.com',      // web1, web2, or web3.example.com
+        'dev-*',                     // Anything starting with "dev-"
+        'exact-host.mycompany.com',  // Exact match only
+    ]
+}
+```
+
+#### IPv4 CIDR Ranges
+
+The `allowedIpv4Cidrs` option accepts standard CIDR notation:
+
+```javascript
+securityPolicy: {
+    allowedIpv4Cidrs: [
+        '10.0.0.0/8',        // All 10.x.x.x addresses (Class A private)
+        '172.16.0.0/12',     // 172.16.x.x - 172.31.x.x (Class B private)
+        '192.168.1.0/24',    // 192.168.1.0 - 192.168.1.255
+        '192.168.100.50/32', // Single IP: 192.168.100.50 only
+    ]
+}
+```
+
+| CIDR | Range | Host Count |
+|------|-------|------------|
+| `/32` | Single IP | 1 |
+| `/24` | x.x.x.0 - x.x.x.255 | 256 |
+| `/16` | x.x.0.0 - x.x.255.255 | 65,536 |
+| `/8` | x.0.0.0 - x.255.255.255 | 16,777,216 |
+
+#### Destination Regex Patterns
+
+The `allowedDestinationRegex` option matches against the full `host:port` string, allowing complex rules that consider both hostname/IP and port:
+
+```javascript
+securityPolicy: {
+    allowedDestinationRegex: [
+        '^.*:3389$',                    // Any host, but only port 3389
+        '^prod-server-\\d+:3389$',      // prod-server-01:3389, prod-server-99:3389, etc.
+        '^192\\.168\\.1\\.\\d+:33[89]\\d$', // 192.168.1.x on ports 3380-3399
+        '^(web|app|db)\\.corp:3389$',   // web.corp, app.corp, or db.corp on 3389
+    ]
+}
+```
+
+> **Note**: Regex patterns are applied to both hostnames and IP addresses. Remember to escape special regex characters like `.` and `\`.
+
+#### Combining Rules (OR Logic)
+
+When multiple rule types are defined, a connection is allowed if it matches **any** rule:
+
+```javascript
+securityPolicy: {
+    // Connection allowed if it matches ANY of these:
+    allowedHostnames: ['*.internal.corp'],           // OR any internal.corp subdomain
+    allowedIpv4Cidrs: ['10.0.0.0/8'],                // OR any 10.x.x.x IP
+    allowedDestinationRegex: ['^backup-server:3390$'] // OR backup-server on port 3390
+}
+```
+
+#### Validation API
+
+You can check if a destination would be allowed before attempting to connect:
+
+```javascript
+// Check a destination
+const result = client.validateDestination('192.168.1.50', 3389);
+if (result.allowed) {
+    console.log('Connection would be allowed');
+} else {
+    console.log('Blocked:', result.reason);
+}
+
+// Get the current policy (read-only, frozen)
+const policy = client.getSecurityPolicy();
+console.log(policy.allowedHostnames);  // Cannot be modified
+```
+
+#### Enterprise Example
+
+```javascript
+const client = new RDPClient(container, {
+    wsUrl: 'wss://rdp-proxy.mycompany.com',
+    keepConnectionModalOpen: true,
+    securityPolicy: {
+        // Allow corporate hostnames
+        allowedHostnames: [
+            '*.internal.mycompany.com',
+            '*.prod.mycompany.com',
+            '*.dev.mycompany.com',
+        ],
+        // Allow corporate IP ranges
+        allowedIpv4Cidrs: [
+            '10.0.0.0/8',       // Corporate network
+            '172.16.0.0/12',    // VPN ranges
+        ],
+        // Special cases with port restrictions
+        allowedDestinationRegex: [
+            '^jumpbox\\.dmz\\.mycompany\\.com:3389$',
+        ]
+    },
+    theme: { preset: 'light' }
+});
+
+// User attempts to connect - automatically validated
+client.connect({ host: '10.50.100.25', user: 'admin', pass: 'secret' })
+    .then(() => console.log('Connected!'))
+    .catch(err => console.error('Blocked:', err.message));
+```
 
 ### Theming
 
@@ -367,6 +524,8 @@ document.body.style.background = themes.midnight.colors.background;
 | `getMuted()` | Returns current mute state (boolean) |
 | `setMuted(bool)` | Set audio mute state |
 | `getResolution()` | Returns `{ width, height }` or `null` if not connected |
+| `getSecurityPolicy()` | Returns the frozen security policy object (read-only) |
+| `validateDestination(host, port)` | Check if destination is allowed. Returns `{ allowed, reason? }` |
 | `getScreenshot(type, quality)` | Capture screenshot. Returns `Promise<{ blob, width, height }>`. Type: `'png'` or `'jpg'` |
 | `downloadScreenshot(type, quality)` | Capture and download screenshot as `screenshot-YYYY-mm-dd--hh-mm.(png\|jpg)` |
 | `on(event, handler)` | Register an event handler |
@@ -556,6 +715,111 @@ All binary messages use a 4-byte ASCII magic header for efficient parsing:
 | `WS_PORT` | `8765` | WebSocket port |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 | `RDP_MAX_SESSIONS` | `100` | Maximum concurrent RDP sessions (range: 2-1000) |
+| `RDP_BRIDGE_SECURITY_POLICY_PATH` | `/app/security/rdp-bridge-policy.json` | Path to the security policy JSON file |
+
+### Backend Security Policy
+
+The backend supports an optional security policy to restrict which RDP destinations users can connect to. This provides **server-side enforcement** in addition to (or instead of) the frontend security policy.
+
+> **Note**: The backend security policy uses the **same format and logic** as the frontend security policy. You can use the same JSON configuration for both.
+
+#### Policy File Format
+
+Create a JSON file with the following structure:
+
+```json
+{
+    "allowedHostnames": ["*.internal.corp", "rdp.example.com"],
+    "allowedIpv4Cidrs": ["10.0.0.0/8", "192.168.1.0/24"],
+    "allowedDestinationRegex": ["^prod-server-\\d+:3389$"]
+}
+```
+
+See the [Security Policy](#security-policy) section above for detailed documentation on each rule type.
+
+#### Integration Option 1: Mount a Local Directory
+
+Mount a local directory containing your policy file into the container:
+
+```bash
+# Create a local policy file
+mkdir -p ./security
+cat > ./security/rdp-bridge-policy.json << 'EOF'
+{
+    "allowedHostnames": ["*.internal.corp"],
+    "allowedIpv4Cidrs": ["10.0.0.0/8", "192.168.1.0/24"]
+}
+EOF
+
+# Run with volume mount
+docker run -d \
+    -p 8765:8765 \
+    -v $(pwd)/security:/app/security:ro \
+    qxsch/freerdpwebbackend:latest
+```
+
+Or in `docker-compose.yml`:
+
+```yaml
+services:
+  backend:
+    image: qxsch/freerdpwebbackend:latest
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./security:/app/security:ro
+```
+
+You can also use a custom path with the environment variable:
+
+```yaml
+services:
+  backend:
+    image: qxsch/freerdpwebbackend:latest
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./my-policies:/etc/rdp-policies:ro
+    environment:
+      - RDP_BRIDGE_SECURITY_POLICY_PATH=/etc/rdp-policies/production-policy.json
+```
+
+#### Integration Option 2: Custom Dockerfile
+
+Create a custom Docker image with the policy baked in:
+
+```dockerfile
+FROM qxsch/freerdpwebbackend:latest
+
+RUN mkdir -p /app/security/
+COPY rdp-bridge-policy.json /app/security/
+```
+
+Build and run:
+
+```bash
+# Create your policy file
+cat > rdp-bridge-policy.json << 'EOF'
+{
+    "allowedHostnames": ["*.mycompany.com"],
+    "allowedIpv4Cidrs": ["172.16.0.0/12"],
+    "allowedDestinationRegex": ["^jumpbox:3389$"]
+}
+EOF
+
+# Build custom image
+docker build -t my-rdp-backend .
+
+# Run
+docker run -d -p 8765:8765 my-rdp-backend
+```
+
+#### Behavior
+
+- If no policy file exists at the configured path, **all connections are allowed** (open policy)
+- If the policy file exists but contains no rules (empty arrays), **all connections are allowed**
+- If at least one rule is defined, only destinations matching at least one rule will be permitted
+- Blocked connections return an error to the client with `type: 'error'` and `error: 'security_policy_violation'`
 
 ### Frontend Configuration (rdp-client.js)
 
