@@ -1090,32 +1090,41 @@ class RDPBridge:
                 }
                 flags = button_map.get(button, RDP_MOUSE_FLAG_BUTTON1)
             elif action == 'wheel':
-                # Wheel delta: positive deltaY = scroll down, negative = scroll up
-                delta = int(delta_y) if delta_y else 0
-                if delta == 0:
-                    return  # No wheel movement, skip
-                
+                # Wheel events: deltaY for vertical, deltaX for horizontal
                 # RDP wheel encoding per MS-RDPBCGR 2.2.8.1.1.3.1.1.3:
                 # - PTR_FLAGS_WHEEL (0x0200) = vertical wheel event
+                # - PTR_FLAGS_HWHEEL (0x0400) = horizontal wheel event
                 # - WheelRotationMask (0x01FF) = 9-bit TWO'S COMPLEMENT signed value
-                # - PTR_FLAGS_WHEEL_NEGATIVE (0x0100) = bit 8 of the rotation value
                 #
                 # The lower 9 bits form a signed value. Server sign-extends from 9 to 16 bits.
-                # Positive = scroll up (away from user), Negative = scroll down (toward user)
-                # Browser: deltaY > 0 = scroll down, deltaY < 0 = scroll up
-                # So we need to NEGATE the browser delta for RDP encoding.
+                # Browser: deltaY > 0 = scroll down, deltaX > 0 = scroll right
+                # RDP: Positive = scroll up/left, Negative = scroll down/right
+                # So we NEGATE browser deltas for RDP encoding.
                 
-                # Clamp to 9-bit signed range: -256 to +255
-                rotation = max(-256, min(255, -delta))  # Negate: browser down -> RDP negative
+                v_delta = int(delta_y) if delta_y else 0
+                h_delta = int(delta_x) if delta_x else 0
                 
-                # Encode as 9-bit two's complement in lower 9 bits
-                if rotation < 0:
-                    # Two's complement: negative value in 9 bits
-                    rotation_bits = rotation & 0x1FF  # Mask to 9 bits (auto two's complement)
-                else:
-                    rotation_bits = rotation & 0xFF   # Positive: just lower 8 bits
+                # Handle vertical wheel
+                if v_delta != 0:
+                    rotation = max(-256, min(255, -v_delta))
+                    if rotation < 0:
+                        rotation_bits = rotation & 0x1FF
+                    else:
+                        rotation_bits = rotation & 0xFF
+                    flags = RDP_MOUSE_FLAG_WHEEL | rotation_bits
+                    self._lib.rdp_send_mouse(self._session, flags, x, y)
                 
-                flags = RDP_MOUSE_FLAG_WHEEL | rotation_bits                
+                # Handle horizontal wheel (separate event per RDP spec)
+                if h_delta != 0:
+                    rotation = max(-256, min(255, -h_delta))
+                    if rotation < 0:
+                        rotation_bits = rotation & 0x1FF
+                    else:
+                        rotation_bits = rotation & 0xFF
+                    flags = RDP_MOUSE_FLAG_HWHEEL | rotation_bits
+                    self._lib.rdp_send_mouse(self._session, flags, x, y)
+                
+                return  # Already sent mouse events above                
             
             self._lib.rdp_send_mouse(self._session, flags, x, y)
             
