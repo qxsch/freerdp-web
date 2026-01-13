@@ -677,11 +677,19 @@ async function initH264(width, height) {
         videoDecoder = new VideoDecoder({
             output: (frame) => {
                 const meta = h264DecodeQueue.shift();
-                if (meta && primaryCtx) {
-                    // Ensure copy mode for H.264 frames
-                    primaryCtx.drawImage(frame, 
-                        meta.destX, meta.destY, meta.destW, meta.destH,
-                        meta.destX, meta.destY, meta.destW, meta.destH);
+                if (meta) {
+                    // Look up the target surface
+                    const surface = surfaces.get(meta.surfaceId);
+                    if (surface) {
+                        // Draw to the surface's OffscreenCanvas
+                        surface.ctx.drawImage(frame, 
+                            meta.destX, meta.destY, meta.destW, meta.destH,
+                            meta.destX, meta.destY, meta.destW, meta.destH);
+                        // Track that this surface was updated
+                        frameUpdatedSurfaces.add(meta.surfaceId);
+                    } else {
+                        console.warn(`[GFX Worker] H.264: Unknown surface ${meta.surfaceId}`);
+                    }
                     // Resolve the promise to signal decode complete
                     if (meta.resolve) meta.resolve();
                 }
@@ -719,13 +727,15 @@ async function initH264(width, height) {
  * Decode H.264 video frame
  */
 async function decodeH264Frame(msg) {
-    if (!primaryCtx) {
-        console.warn('[GFX Worker] No primary context for H.264');
+    // Validate surface exists
+    const surface = surfaces.get(msg.surfaceId);
+    if (!surface) {
+        console.warn(`[GFX Worker] H.264: Unknown surface ${msg.surfaceId}`);
         return;
     }
     
-    const width = primaryCanvas?.width || 1920;
-    const height = primaryCanvas?.height || 1080;
+    const width = surface.canvas.width;
+    const height = surface.canvas.height;
     
     // Initialize decoder if needed
     if (!h264Initialized) {
@@ -776,6 +786,7 @@ async function decodeH264Frame(msg) {
     // Create a promise that resolves when this specific frame is decoded
     const decodePromise = new Promise((resolve, reject) => {
         h264DecodeQueue.push({
+            surfaceId: msg.surfaceId,
             destX: msg.destX,
             destY: msg.destY,
             destW: msg.destW,
