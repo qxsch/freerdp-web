@@ -14,7 +14,7 @@
  */
 
 const BUILD_VERSION = '__BUILD_TIME__';
-console.log(`[GFX-WORKER] ===== BUILD ${BUILD_VERSION} =====`);
+console.log(`[GFX Worker] ===== BUILD ${BUILD_VERSION} =====`);
 
 import {
     Magic, matchMagic, parseMessage,
@@ -239,7 +239,6 @@ function createSurface(surfaceId, width, height, pixelFormat = GFX_PIXEL_FORMAT.
         wasmModule._prog_delete_surface(progCtx, surfaceId);
         wasmModule._prog_create_surface(progCtx, surfaceId, width, height);
     }
-    console.log(`[GFX] createSurface(${surfaceId}) ${width}x${height}`);
     
     // Clear the last deleted surface info (no longer needed for preservation logic)
     lastDeletedSurface = null;
@@ -254,9 +253,7 @@ function createSurface(surfaceId, width, height, pixelFormat = GFX_PIXEL_FORMAT.
 function deleteSurface(surfaceId) {
     const surface = surfaces.get(surfaceId);
     if (!surface) return;
-    
-    console.log(`[GFX] deleteSurface(${surfaceId})`);
-    
+       
     // Store info about deleted surface (for logging/debugging purposes only)
     lastDeletedSurface = {
         id: surfaceId,
@@ -290,7 +287,6 @@ function deleteSurface(surfaceId) {
  * Map surface to primary output
  */
 function mapSurfaceToPrimary(surfaceId) {
-    console.log(`[GFX] mapToPrimary(${surfaceId})`);
     primarySurfaceId = surfaceId;
 }
 
@@ -980,9 +976,7 @@ function applyResetGraphics(msg) {
         primaryCtx.imageSmoothingEnabled = false;
         primaryCtx.fillStyle = '#000000';
         primaryCtx.fillRect(0, 0, msg.width, msg.height);
-    }
-    
-    console.log(`[GFX] resetGraphics ${surfaceCount} surfaces, new=${msg.width}x${msg.height}`);
+    }    
 }
 
 // ============================================================================
