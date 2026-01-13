@@ -1130,7 +1130,7 @@ export class RDPClient {
                     height
                 });
                 
-                console.log('[RDPClient] Connect request');
+                console.log('[RDPClient] Connect request to', credentials.host + ':' + (credentials.port || 3389));
             };
 
             this._ws.onmessage = (e) => this._handleMessage(e);
