@@ -72,11 +72,9 @@ typedef struct {
     RdpState state;
     char error_msg[MAX_ERROR_LEN];
     
-    /* Frame buffer (GDI fallback) */
-    uint8_t* frame_buffer;
+    /* Frame dimensions (tracked for resize detection) */
     int frame_width;
     int frame_height;
-    int frame_stride;
     
     /* Resize pending */
     bool resize_pending;
@@ -91,18 +89,8 @@ typedef struct {
     bool gfx_active;                /* GFX pipeline successfully initialized */
     bool gfx_disconnecting;         /* Connection is being torn down - don't call GDI */
     RdpGfxCodecId gfx_codec;        /* Negotiated codec */
-    bool gfx_pipeline_needs_init;   /* Deferred GDI pipeline init flag */
-    bool gfx_pipeline_ready;        /* GDI pipeline initialized for decoding */
-    rdpGdi* gdi;                    /* GDI pointer for chaining to GDI handlers */
-    
-    /* Saved GDI pipeline callbacks for chaining */
-    pcRdpgfxSurfaceCommand gdi_surface_command;
-    pcRdpgfxResetGraphics gdi_reset_graphics;
-    pcRdpgfxCreateSurface gdi_create_surface;
-    pcRdpgfxDeleteSurface gdi_delete_surface;
-    pcRdpgfxMapSurfaceToOutput gdi_map_surface;
-    pcRdpgfxStartFrame gdi_start_frame;
-    pcRdpgfxEndFrame gdi_end_frame;
+    bool gfx_pipeline_needs_init;   /* Deferred GFX pipeline init flag */
+    bool gfx_pipeline_ready;        /* GFX pipeline ready for events */
     
     /* GFX surfaces */
     RdpGfxSurface surfaces[RDP_MAX_GFX_SURFACES];
@@ -165,8 +153,6 @@ typedef struct {
 static BOOL bridge_pre_connect(freerdp* instance);
 static BOOL bridge_post_connect(freerdp* instance);
 static void bridge_post_disconnect(freerdp* instance);
-static BOOL bridge_begin_paint(rdpContext* context);
-static BOOL bridge_end_paint(rdpContext* context);
 static BOOL bridge_desktop_resize(rdpContext* context);
 static void bridge_on_channel_connected(void* ctx, const ChannelConnectedEventArgs* e);
 static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedEventArgs* e);
@@ -1046,7 +1032,6 @@ static void maybe_init_gfx_pipeline(BridgeContext* bctx)
      */
     
     pthread_mutex_lock(&bctx->gfx_mutex);
-    bctx->gdi = gdi;
     bctx->gfx_pipeline_needs_init = false;
     bctx->gfx_pipeline_ready = true;
     pthread_mutex_unlock(&bctx->gfx_mutex);
@@ -1305,7 +1290,23 @@ static BOOL bridge_post_connect(freerdp* instance)
         fprintf(stderr, "[rdp_bridge] WARNING: Channels object is NULL!\n");
     }
     
-    /* Initialize GDI for software rendering */
+    /* GDI Initialization Notes:
+     * 
+     * gdi_init() is called here but is NOT strictly required for GFX DVC channel
+     * operation. The RDPGFX channel connects independently through drdynvc.
+     * 
+     * We call gdi_init() currently because:
+     * 1. It provides convenient frame dimension tracking (gdi->width/height)
+     * 2. FreeRDP's GDI layer handles some internal state management
+     * 3. gdi_free() is called on disconnect, so init must be called for cleanup
+     * 
+     * ALTERNATIVE: Use FreeRDP_DeactivateClientDecoding setting to skip GDI
+     * codec registration entirely. We could then track dimensions solely from
+     * ResetGraphics PDU (already doing this in gfx_on_reset_graphics).
+     * 
+     * In wire-through mode, we don't use the GDI framebuffer or pixel data -
+     * all graphics flow via GFX events streamed to the browser frontend.
+     */
     if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) {
         snprintf(ctx->error_msg, MAX_ERROR_LEN, "GDI initialization failed");
         return FALSE;
@@ -1335,16 +1336,12 @@ static BOOL bridge_post_connect(freerdp* instance)
      * with GFX pipeline enabled in settings - the actual pipeline init happens
      * in bridge_on_channel_connected when RDPGFX channel connects. */
     
-    /* Set up our paint callbacks */
-    context->update->BeginPaint = bridge_begin_paint;
-    context->update->EndPaint = bridge_end_paint;
+    /* Set up desktop resize callback (needed for GFX ResetGraphics) */
     context->update->DesktopResize = bridge_desktop_resize;
     
-    /* Store frame dimensions */
+    /* Store frame dimensions for resize tracking */
     ctx->frame_width = gdi->width;
     ctx->frame_height = gdi->height;
-    ctx->frame_stride = gdi->stride;
-    ctx->frame_buffer = gdi->primary_buffer;
     
     /* Note: Channel event subscription happens in pre_connect (required for static channels).
      * DVCs (like RDPGFX) connect later when drdynvc capability exchange completes.
@@ -1406,7 +1403,6 @@ static void bridge_post_disconnect(freerdp* instance)
     ctx->gfx = NULL;
     ctx->rdpsnd = NULL;
     ctx->state = RDP_STATE_DISCONNECTED;
-    ctx->frame_buffer = NULL;
     
     /* Free codec decoder */
     if (ctx->planar_decoder) {
@@ -1539,57 +1535,14 @@ static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedE
     }
 }
 
-static BOOL bridge_begin_paint(rdpContext* context)
-{
-    rdpGdi* gdi = context->gdi;
-    
-    if (!gdi || !gdi->primary || !gdi->primary->hdc) {
-        return FALSE;
-    }
-    
-    /* Clear the invalid region before painting */
-    HGDI_WND hwnd = gdi->primary->hdc->hwnd;
-    if (hwnd) {
-        hwnd->invalid->null = TRUE;
-        hwnd->ninvalid = 0;
-    }
-    
-    return TRUE;
-}
-
-static BOOL bridge_end_paint(rdpContext* context)
-{
-    BridgeContext* ctx = (BridgeContext*)context;
-    rdpGdi* gdi = context->gdi;
-    
-    if (!gdi || !gdi->primary || !gdi->primary->hdc) {
-        return FALSE;
-    }
-    
-    HGDI_WND hwnd = gdi->primary->hdc->hwnd;
-    if (!hwnd || hwnd->invalid->null) {
-        return TRUE; /* No invalid region */
-    }
-    
-    /* Wire-through mode: GDI updates are not used - GFX events
-     * are streamed directly to the frontend. */
-    
-    return TRUE;
-}
-
 static BOOL bridge_desktop_resize(rdpContext* context)
 {
     BridgeContext* ctx = (BridgeContext*)context;
     rdpGdi* gdi = context->gdi;
     
-    /* NOTE: When called from gdi_ResetGraphics (GFX Reset PDU), the GDI layer
-     * handles its own resize internally. We must NOT call gdi_free/gdi_init here
-     * as that would corrupt the GDI state that gdi_ResetGraphics is still using.
-     * 
-     * When called from standard DesktopResize update (non-GFX), gdi_resize() 
-     * should be used instead of gdi_free/gdi_init.
-     * 
-     * For now, we just update our cached dimensions from the current GDI state. */
+    /* In wire-through GFX mode, dimension updates come from ResetGraphics PDU.
+     * This callback is called by FreeRDP's GDI layer during resize operations.
+     * We just track the dimensions for resize detection. */
     
     if (!gdi) {
         fprintf(stderr, "[rdp_bridge] DesktopResize: GDI not available\n");
@@ -1599,8 +1552,6 @@ static BOOL bridge_desktop_resize(rdpContext* context)
     /* Update stored dimensions from current GDI state */
     ctx->frame_width = gdi->width;
     ctx->frame_height = gdi->height;
-    ctx->frame_stride = gdi->stride;
-    ctx->frame_buffer = gdi->primary_buffer;
     
     /* In wire-through mode, the server will send ResetGraphics and fresh
      * surfaces after resize. No dirty rect tracking needed. */
@@ -2846,9 +2797,10 @@ uint16_t rdp_gfx_get_primary_surface(RdpSession* session)
  * @param session              RDP session handle
  * @param frame_id             Frame ID to acknowledge (from EndFrame PDU / FACK message)
  * @param total_frames_decoded Running count of frames decoded by browser
+ * @param queue_depth          Number of unprocessed frames in browser decode queue
  * @return                     0 on success, -1 on error
  */
-int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t total_frames_decoded)
+int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t total_frames_decoded, uint32_t queue_depth)
 {
     if (!session) return -1;
     
@@ -2875,10 +2827,8 @@ int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t tota
     ack.frameId = frame_id;
     ack.totalFramesDecoded = total_frames_decoded;
     
-    /* Queue depth: Use QUEUE_DEPTH_UNAVAILABLE (0) for now.
-     * Could be enhanced with actual browser queue depth from BPRS messages
-     * to enable adaptive server-side rate control. */
-    ack.queueDepth = QUEUE_DEPTH_UNAVAILABLE;
+    /* Use actual browser queue depth for adaptive server-side rate control */
+    ack.queueDepth = queue_depth;
     
     /* Update our tracking */
     pthread_mutex_lock(&ctx->gfx_mutex);

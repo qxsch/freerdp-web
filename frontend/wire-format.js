@@ -39,7 +39,6 @@ export const Magic = {
     
     // Backchannel (browser → server)
     FACK: new Uint8Array([0x46, 0x41, 0x43, 0x4B]),  // "FACK" - frameAck
-    BPRS: new Uint8Array([0x42, 0x50, 0x52, 0x53]),  // "BPRS" - backpressure
     
     // Audio
     OPUS: new Uint8Array([0x4F, 0x50, 0x55, 0x53]),  // "OPUS" - Opus audio
@@ -476,25 +475,20 @@ export function parseH264Frame(data) {
 // ============================================================================
 
 /**
- * Build frameAck message
- * Layout: FACK(4) + frameId(4) + totalFramesDecoded(4) = 12 bytes
+ * Build frameAck message (MS-RDPEGFX 2.2.3.3 compliant)
+ * Layout: FACK(4) + frameId(4) + totalFramesDecoded(4) + queueDepth(4) = 16 bytes
+ * 
+ * queueDepth values per spec:
+ *   0x00000000: QUEUE_DEPTH_UNAVAILABLE - queue depth not known
+ *   0xFFFFFFFF: SUSPEND_FRAME_ACKNOWLEDGEMENT - server should suspend
+ *   Other: Actual number of unprocessed frames in client queue
  */
-export function buildFrameAck(frameId, totalFramesDecoded) {
-    const data = new Uint8Array(12);
+export function buildFrameAck(frameId, totalFramesDecoded, queueDepth = 0) {
+    const data = new Uint8Array(16);
     data.set(Magic.FACK, 0);
     writeU32LE(data, 4, frameId);
     writeU32LE(data, 8, totalFramesDecoded);
-    return data;
-}
-
-/**
- * Build backpressure message
- * Layout: BPRS(4) + level(1) = 5 bytes
- */
-export function buildBackpressure(level) {
-    const data = new Uint8Array(5);
-    data.set(Magic.BPRS, 0);
-    data[4] = level;
+    writeU32LE(data, 12, queueDepth);
     return data;
 }
 

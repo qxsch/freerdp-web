@@ -18,7 +18,7 @@ console.log(`[GFX-WORKER] ===== BUILD ${BUILD_VERSION} =====`);
 
 import {
     Magic, matchMagic, parseMessage,
-    readU16LE, readU32LE, buildFrameAck, buildBackpressure
+    readU16LE, readU32LE, buildFrameAck
 } from './wire-format.js';
 
 // ============================================================================
@@ -102,10 +102,10 @@ let frameUpdatedSurfaces = new Set();
 /** @type {boolean} Whether WASM is ready */
 let wasmReady = false;
 
-/** @type {number} Pending operations count for backpressure */
+/** @type {number} Pending operations count - sent as queueDepth in FACK for server-side rate control */
 let pendingOps = 0;
 
-/** @type {number} Max pending ops before backpressure */
+/** @type {number} Max pending ops (not currently enforced, just tracking) */
 const MAX_PENDING_OPS = 64;
 
 /** @type {number} Total frames decoded - sent in FACK for MS-RDPEGFX compliance */
@@ -629,7 +629,6 @@ async function decodeWebPTile(msg) {
     }
     
     pendingOps--;
-    checkBackpressure();
 }
 
 /**
@@ -649,34 +648,6 @@ function drawRawTile(msg) {
     
     surface.ctx.putImageData(imageData, msg.x, msg.y);
     
-}
-
-/**
- * Draw a legacy full-frame image (WebP or JPEG without wire format wrapper)
- * Used for backwards compatibility with older backend messages
- */
-async function drawLegacyFullFrame(bytes, mimeType) {
-    if (!primaryCanvas || !primaryCtx) {
-        console.warn('[GFX Worker] No primary canvas for legacy frame');
-        return;
-    }
-    
-    pendingOps++;
-    
-    try {
-        const blob = new Blob([bytes], { type: mimeType });
-        const bitmap = await createImageBitmap(blob);
-        
-        // Ensure copy mode for legacy frames
-        primaryCtx.drawImage(bitmap, 0, 0, primaryCanvas.width, primaryCanvas.height);
-        bitmap.close();
-        
-    } catch (err) {
-        console.warn('[GFX Worker] Legacy frame decode failed:', err);
-    }
-    
-    pendingOps--;
-    checkBackpressure();
 }
 
 // ============================================================================
@@ -721,7 +692,6 @@ async function initH264(width, height) {
                 frame.close();
                 h264DecoderError = false;
                 pendingOps--;
-                checkBackpressure();
             },
             error: (e) => {
                 console.error('[GFX Worker] H.264 decoder error callback:', e);
@@ -1221,33 +1191,12 @@ async function endFrame(frameId) {
     currentFrameId = null;
     frameUpdatedSurfaces.clear();
     
-    // Increment decoded counter and send frame acknowledgment
+    // Increment decoded counter and send frame acknowledgment with queue depth
+    // queueDepth = pendingOps (number of unprocessed decode operations)
+    // Per MS-RDPEGFX 2.2.3.3, this enables server-side adaptive rate control
     totalFramesDecoded++;
-    const ackMsg = buildFrameAck(frameId, totalFramesDecoded);
-    self.postMessage({ type: 'frameAck', frameId, totalFramesDecoded, data: ackMsg.buffer }, [ackMsg.buffer]);
-}
-
-// ============================================================================
-// Backpressure management
-// ============================================================================
-
-let lastBackpressureLevel = 0;
-
-function checkBackpressure() {
-    let level = 0;
-    
-    if (pendingOps > MAX_PENDING_OPS / 2) {
-        level = 1;
-    }
-    if (pendingOps > MAX_PENDING_OPS) {
-        level = 2;
-    }
-    
-    if (level !== lastBackpressureLevel) {
-        lastBackpressureLevel = level;
-        const msg = buildBackpressure(level);
-        self.postMessage({ type: 'backpressure', level, data: msg.buffer }, [msg.buffer]);
-    }
+    const ackMsg = buildFrameAck(frameId, totalFramesDecoded, pendingOps);
+    self.postMessage({ type: 'frameAck', frameId, totalFramesDecoded, queueDepth: pendingOps, data: ackMsg.buffer }, [ackMsg.buffer]);
 }
 
 // ============================================================================
@@ -1262,27 +1211,11 @@ async function handleBinaryMessage(data) {
     const msg = parseMessage(bytes);
     
     if (!msg) {
-        // Unknown message type - check for legacy WebP/JPEG full frame
-        // WebP starts with RIFF, JPEG starts with FFD8
-        if (bytes.length > 12) {
-            const isWebP = bytes[0] === 0x52 && bytes[1] === 0x49 && 
-                           bytes[2] === 0x46 && bytes[3] === 0x46; // "RIFF"
-            const isJpeg = bytes[0] === 0xFF && bytes[1] === 0xD8;
-            
-            if (isWebP || isJpeg) {
-                await drawLegacyFullFrame(bytes, isWebP ? 'image/webp' : 'image/jpeg');
-                return true;
-            }
-        }
-        // Debug: log unknown message magic
+        // Unknown message type - log for debugging
         const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
         console.warn(`[GFX Worker] Unknown message magic: "${magic}" (${bytes[0].toString(16)} ${bytes[1].toString(16)} ${bytes[2].toString(16)} ${bytes[3].toString(16)})`);
         return false;
     }
-    
-    // Frame lifecycle is now tracked internally - no per-frame logging needed
-    
-    // Cache operations are now logged in applySurfaceToCache/applyCacheToSurface with enhanced debugging
     
     switch (msg.type) {
         case 'createSurface':

@@ -16,7 +16,7 @@ from websockets.http11 import Response
 from websockets.datastructures import Headers
 
 from rdp_bridge import RDPBridge, RDPConfig, NativeLibrary
-from wire_format import parse_frame_ack, parse_backpressure, get_message_type, Magic
+from wire_format import parse_frame_ack, get_message_type, Magic
 
 # Load environment variables
 load_dotenv()
@@ -171,7 +171,7 @@ def process_request(connection, request):
 
 
 async def handle_binary_message(data: bytes, rdp_bridge: Optional[RDPBridge], client_id: int):
-    """Handle binary backchannel messages from browser (FACK, BPRS)
+    """Handle binary backchannel messages from browser (FACK)
     
     Args:
         data: Binary message data
@@ -191,24 +191,22 @@ async def handle_binary_message(data: bytes, rdp_bridge: Optional[RDPBridge], cl
         # sends FrameAcknowledge to the RDP server. This tells the server we're
         # ready for more frames - if the browser is slow, ACKs are delayed and
         # the server throttles its frame rate.
+        #
+        # Per MS-RDPEGFX 2.2.3.3, queueDepth enables adaptive server-side rate control:
+        #   0x00000000: QUEUE_DEPTH_UNAVAILABLE
+        #   0xFFFFFFFF: SUSPEND_FRAME_ACKNOWLEDGEMENT
+        #   Other: Actual unprocessed frames in browser decode queue
         parsed = parse_frame_ack(data)
         if parsed and rdp_bridge:
             frame_id = parsed['frame_id']
             total_decoded = parsed['total_frames_decoded']
-            if rdp_bridge.send_frame_ack(frame_id, total_decoded):
-                logger.debug(f"Client {client_id}: Forwarded frame ACK for frame {frame_id} (total decoded: {total_decoded})")
+            queue_depth = parsed['queue_depth']
+            if rdp_bridge.send_frame_ack(frame_id, total_decoded, queue_depth):
+                logger.debug(f"Client {client_id}: Forwarded frame ACK for frame {frame_id} (total decoded: {total_decoded}, queue depth: {queue_depth})")
             else:
                 logger.warning(f"Client {client_id}: Failed to forward frame ACK for frame {frame_id}")
         elif not rdp_bridge:
             logger.warning(f"Client {client_id}: Frame ACK received but no RDP bridge active")
-            
-    elif msg_type == 'backpressure':
-        # Backpressure signal from browser - queue is getting full
-        parsed = parse_backpressure(data)
-        if parsed:
-            queue_depth = parsed['queue_depth']
-            # TODO: Implement adaptive bitrate/frame rate based on backpressure
-            logger.debug(f"Client {client_id}: Backpressure signal, queue_depth={queue_depth}")
             
     else:
         # Unknown binary message
@@ -226,7 +224,7 @@ async def handle_client(websocket: ServerConnection):
     try:
         async for message in websocket:
             try:
-                # Handle binary messages (backchannel: FACK, BPRS)
+                # Handle binary messages (backchannel: FACK)
                 if isinstance(message, bytes):
                     await handle_binary_message(message, rdp_bridge, client_id)
                     continue

@@ -46,7 +46,6 @@ class Magic:
     
     # Backchannel (browser → server)
     FACK = b'FACK'  # frameAck
-    BPRS = b'BPRS'  # backpressure
     
     # Audio
     OPUS = b'OPUS'  # Opus audio
@@ -561,9 +560,14 @@ def build_h264_frame(frame_id: int, surface_id: int, codec_id: int,
 
 def parse_frame_ack(data: bytes) -> Optional[dict]:
     """
-    Parse frameAck message from browser.
+    Parse frameAck message from browser (MS-RDPEGFX 2.2.3.3 compliant).
     
-    Layout: FACK(4) + frameId(4) + totalFramesDecoded(4) = 12 bytes
+    Layout: FACK(4) + frameId(4) + totalFramesDecoded(4) + queueDepth(4) = 16 bytes
+    
+    queueDepth values per spec:
+      0x00000000 (QUEUE_DEPTH_UNAVAILABLE): Queue depth not available
+      0xFFFFFFFF (SUSPEND_FRAME_ACKNOWLEDGEMENT): Suspend frame sending
+      Other: Actual number of unprocessed frames in client queue
     
     Args:
         data: Binary message from WebSocket
@@ -571,39 +575,16 @@ def parse_frame_ack(data: bytes) -> Optional[dict]:
     Returns:
         Parsed message dict or None if invalid
     """
-    if len(data) < 12:
+    if len(data) < 16:
         return None
     if data[:4] != Magic.FACK:
         return None
     
-    frame_id, total_decoded = struct.unpack('<II', data[4:12])
+    frame_id, total_decoded, queue_depth = struct.unpack('<III', data[4:16])
     return {
         'type': 'frameAck',
         'frame_id': frame_id,
-        'total_frames_decoded': total_decoded
-    }
-
-
-def parse_backpressure(data: bytes) -> Optional[dict]:
-    """
-    Parse backpressure message from browser.
-    
-    Layout: BPRS(4) + queueDepth(4) = 8 bytes
-    
-    Args:
-        data: Binary message from WebSocket
-    
-    Returns:
-        Parsed message dict or None if invalid
-    """
-    if len(data) < 8:
-        return None
-    if data[:4] != Magic.BPRS:
-        return None
-    
-    queue_depth = struct.unpack('<I', data[4:8])[0]
-    return {
-        'type': 'backpressure',
+        'total_frames_decoded': total_decoded,
         'queue_depth': queue_depth
     }
 
@@ -637,7 +618,6 @@ def get_message_type(data: bytes) -> Optional[str]:
         Magic.C2SF: 'cacheToSurface',
         Magic.H264: 'h264Frame',
         Magic.FACK: 'frameAck',
-        Magic.BPRS: 'backpressure',
         Magic.OPUS: 'opusAudio',
         Magic.AUDI: 'rawAudio',
     }

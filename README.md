@@ -539,8 +539,7 @@ All binary messages use a 4-byte ASCII magic header for efficient parsing:
 
 | Magic | Type | Description |
 |-------|------|-------------|
-| `FACK` | frameAck | Acknowledge frame completion |
-| `BPRS` | backpressure | Signal decode queue pressure |
+| `FACK` | frameAck | Acknowledge frame completion (with queue depth) |
 
 
 ## Configuration
@@ -624,7 +623,7 @@ The RDPGFX channel (MS-RDPEGFX) provides a client-side compositor with off-main-
 │  │      Main Thread      │ ─────────────────────────────► │       GFX Worker          │    │
 │  │  • WebSocket receive  │                                │  • Wire format parsing    │    │
 │  │  • Audio decode/play  │ ◄───────────────────────────── │  • Surface management     │    │
-│  │  • Keyboard/mouse     │        frameAck/backpressure   │  • H.264 VideoDecoder     │    │
+│  │  • Keyboard/mouse     │              frameAck          │  • H.264 VideoDecoder     │    │
 │  │  • UI events          │                                │  • Tile decoding          │    │
 │  └───────────────────────┘                                │  • Frame composition      │    │
 │                                                           │  • OffscreenCanvas render │    │
@@ -660,8 +659,7 @@ All GFX events are encoded with a 4-byte ASCII magic header:
 |-------|-------|--------|------------|
 | `STFR` | startFrame | magic(4) + frameId(4) | 8 bytes |
 | `ENFR` | endFrame | magic(4) + frameId(4) | 8 bytes |
-| `FACK` | frameAck | magic(4) + frameId(4) + totalFramesDecoded(4) | 12 bytes |
-| `BPRS` | backpressure | magic(4) + level(1) | 5 bytes |
+| `FACK` | frameAck | magic(4) + frameId(4) + totalFramesDecoded(4) + queueDepth(4) | 16 bytes |
 
 #### Tile Codecs
 
@@ -718,7 +716,7 @@ The GFX Worker handles all rendering on a dedicated thread:
 5. **Tile Decoding**: WebP via createImageBitmap, raw RGBA via ImageData
 6. **Bitmap Cache**: Store/restore surface regions for efficient updates
 7. **Frame Composition**: startFrame → tiles/H.264 → endFrame → commit
-8. **Flow Control**: Frame acknowledgments (FACK) and backpressure signals (BPRS)
+8. **Flow Control**: Frame acknowledgments (FACK) with MS-RDPEGFX compliant queueDepth
 
 ## Audio Architecture
 
@@ -919,6 +917,5 @@ flowchart TB
 | Reset graphics | `RSGR` | GFX Worker | Full state reset |
 | Start frame | `STFR` | GFX Worker Compositor | Begin batch |
 | End frame | `ENFR` | GFX Worker Compositor | Commit + ack |
-| Frame ack | `FACK` | Backend (from browser) | Flow control |
-| Backpressure | `BPRS` | Backend (from browser) | Throttle output |
+| Frame ack | `FACK` | Backend (from browser) | Flow control (with queue depth) |
 | Audio | `OPUS` | Main Thread AudioDecoder | Speakers |

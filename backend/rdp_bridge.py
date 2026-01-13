@@ -28,7 +28,7 @@ from wire_format import (
     build_end_frame, build_solid_fill, build_surface_to_surface,
     build_surface_to_cache, build_cache_to_surface, build_evict_cache,
     build_map_surface_to_output, build_webp_tile, build_h264_frame,
-    build_reset_graphics, parse_frame_ack, parse_backpressure, get_message_type,
+    build_reset_graphics, parse_frame_ack, get_message_type,
     build_caps_confirm, build_init_settings,
     build_clearcodec_tile
 )
@@ -371,7 +371,7 @@ class NativeLibrary:
         lib.rdp_gfx_get_primary_surface.restype = c_uint16
         
         # rdp_gfx_send_frame_ack - send browser frame acknowledgment to server
-        lib.rdp_gfx_send_frame_ack.argtypes = [c_void_p, c_uint32, c_uint32]
+        lib.rdp_gfx_send_frame_ack.argtypes = [c_void_p, c_uint32, c_uint32, c_uint32]
         lib.rdp_gfx_send_frame_ack.restype = c_int
         
         # GFX event queue API (for wire format streaming)
@@ -557,16 +557,22 @@ class RDPBridge:
             logger.error(f"Resize error: {e}")
             return False
     
-    def send_frame_ack(self, frame_id: int, total_frames_decoded: int) -> bool:
+    def send_frame_ack(self, frame_id: int, total_frames_decoded: int, queue_depth: int = 0) -> bool:
         """Send a frame acknowledgment to the RDP server.
         
         This forwards the browser's FACK message to FreeRDP, providing proper
         backpressure. The server uses these ACKs to control its frame rate -
         if ACKs are delayed (browser is slow to decode), the server slows down.
         
+        Per MS-RDPEGFX 2.2.3.3, queueDepth enables adaptive server-side rate control:
+          0x00000000 (QUEUE_DEPTH_UNAVAILABLE): Queue depth not available
+          0xFFFFFFFF (SUSPEND_FRAME_ACKNOWLEDGEMENT): Suspend frame sending
+          Other: Actual number of unprocessed frames in client queue
+        
         Args:
             frame_id: Frame ID to acknowledge (from END_FRAME event / browser FACK)
             total_frames_decoded: Running count of frames decoded by browser
+            queue_depth: Number of unprocessed frames in browser decode queue
             
         Returns:
             True on success, False on error
@@ -576,7 +582,7 @@ class RDPBridge:
             return False
         
         try:
-            result = self._lib.rdp_gfx_send_frame_ack(self._session, frame_id, total_frames_decoded)
+            result = self._lib.rdp_gfx_send_frame_ack(self._session, frame_id, total_frames_decoded, queue_depth)
             return result == 0
         except Exception as e:
             logger.error(f"Frame ACK error: {e}")
@@ -1089,20 +1095,27 @@ class RDPBridge:
                 if delta == 0:
                     return  # No wheel movement, skip
                 
-                # RDP wheel encoding:
-                # - Lower 9 bits (0x01FF) = wheel rotation mask
-                # - Bit 8 (0x0100) = negative flag (scroll up)
-                # - Bits 0-7 = absolute rotation value (clamped to 0-255)
-                # Standard wheel click = 120 units
-                # Browser: positive deltaY = scroll down, negative = scroll up
-                # RDP: negative flag = scroll UP (opposite direction)
-                rotation = min(255, abs(delta))
-                flags = RDP_MOUSE_FLAG_WHEEL
-                if delta > 0:
-                    # Scroll down in browser = scroll up in RDP (inverted)
-                    flags |= RDP_MOUSE_FLAG_NEGATIVE
-                # Encode rotation in lower bits (0xFF mask, not 0x1FF since bit 8 is negative flag)
-                flags |= (rotation & 0xFF)
+                # RDP wheel encoding per MS-RDPBCGR 2.2.8.1.1.3.1.1.3:
+                # - PTR_FLAGS_WHEEL (0x0200) = vertical wheel event
+                # - WheelRotationMask (0x01FF) = 9-bit TWO'S COMPLEMENT signed value
+                # - PTR_FLAGS_WHEEL_NEGATIVE (0x0100) = bit 8 of the rotation value
+                #
+                # The lower 9 bits form a signed value. Server sign-extends from 9 to 16 bits.
+                # Positive = scroll up (away from user), Negative = scroll down (toward user)
+                # Browser: deltaY > 0 = scroll down, deltaY < 0 = scroll up
+                # So we need to NEGATE the browser delta for RDP encoding.
+                
+                # Clamp to 9-bit signed range: -256 to +255
+                rotation = max(-256, min(255, -delta))  # Negate: browser down -> RDP negative
+                
+                # Encode as 9-bit two's complement in lower 9 bits
+                if rotation < 0:
+                    # Two's complement: negative value in 9 bits
+                    rotation_bits = rotation & 0x1FF  # Mask to 9 bits (auto two's complement)
+                else:
+                    rotation_bits = rotation & 0xFF   # Positive: just lower 8 bits
+                
+                flags = RDP_MOUSE_FLAG_WHEEL | rotation_bits                
             
             self._lib.rdp_send_mouse(self._session, flags, x, y)
             

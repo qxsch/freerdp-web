@@ -849,13 +849,6 @@ export class RDPClient {
                 }
                 break;
                 
-            case 'backpressure':
-                // Send backpressure signal to server
-                if (this._ws && this._ws.readyState === WebSocket.OPEN && msg.data) {
-                    this._ws.send(msg.data);
-                }
-                break;
-                
             case 'unhandled':
                 // Unhandled message from worker - process on main thread
                 if (msg.data) {
@@ -1589,7 +1582,7 @@ export class RDPClient {
      */
     _handleFrameUpdate(data) {
         // This should not be reached - all frames go to GFX worker
-        console.warn('[RDPClient] Unexpected frame on main thread - GFX worker should handle all frames');
+        console.error('[RDPClient] Unexpected frame on main thread - GFX worker should handle all frames');
     }
 
     // --------------------------------------------------

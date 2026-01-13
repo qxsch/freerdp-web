@@ -466,12 +466,18 @@ uint16_t rdp_gfx_get_primary_surface(RdpSession* session);
  * Call this when the browser sends a FACK (frame ack) message after compositing
  * a frame received via the GFX event stream.
  * 
+ * Per MS-RDPEGFX 2.2.3.3, queueDepth enables adaptive server-side rate control:
+ *   0x00000000 (QUEUE_DEPTH_UNAVAILABLE): Queue depth not available
+ *   0xFFFFFFFF (SUSPEND_FRAME_ACKNOWLEDGEMENT): Suspend frame sending
+ *   Other: Actual number of unprocessed frames in client queue
+ * 
  * @param session              Session handle
  * @param frame_id             Frame ID to acknowledge (from END_FRAME event / browser FACK)
  * @param total_frames_decoded Running count of frames decoded by browser
+ * @param queue_depth          Number of unprocessed frames in browser decode queue
  * @return                     0 on success, -1 on error
  */
-int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t total_frames_decoded);
+int rdp_gfx_send_frame_ack(RdpSession* session, uint32_t frame_id, uint32_t total_frames_decoded, uint32_t queue_depth);
 
 /* ============================================================================
  * GFX Event Queue API (for wire format streaming)
