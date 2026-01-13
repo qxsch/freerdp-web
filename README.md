@@ -76,9 +76,11 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - **nginx:alpine** for static file serving
 
 ### Browser Requirements
+- **Chrome 94+** or **Edge 94+** or **Safari 26+** or **Firefox 130+**
 - **OffscreenCanvas** support (REQUIRED - no fallback)
-- **SharedArrayBuffer** support (REQUIRED for low-latency audio via AudioWorklet)
-- **Chrome 94+** or **Edge 94+** or **Safari 26+** or **Firefox 130+** (OffscreenCanvas + WebCodecs)
+- **WebCodecs** support (REQUIRED - no fallback)
+- **SharedArrayBuffer** support (REQUIRED - no fallback)
+- **AudioWorklet** support (REQUIRED - no fallback)
 
 > **Note**: SharedArrayBuffer requires CORS isolation headers (`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`). These are already configured in the included `nginx.conf`.
 
