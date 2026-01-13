@@ -810,7 +810,7 @@ flowchart TB
             CursorMgr["Cursor Manager<br/>(CSS cursor)"]
         end
         
-        subgraph GFXWorker["GFX Worker (Dedicated Thread)"]
+        subgraph GFXWorker["GFX Worker<br />(Dedicated Thread)"]
             WireParser["Wire Format<br/>Parser"]
             SurfaceMgr["Surface<br/>Manager"]
             BitmapCache["Bitmap<br/>Cache"]
