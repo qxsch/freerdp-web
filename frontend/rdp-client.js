@@ -148,7 +148,9 @@ const STYLES = `
     align-items: stretch;
     padding: 8px;
     min-height: 0;
-    overflow: hidden;
+    /* Scrolling controlled via CSS custom properties - only scroll when needed */
+    overflow-x: var(--rdp-overflow-x, hidden);
+    overflow-y: var(--rdp-overflow-y, hidden);
 }
 
 .rdp-screen {
@@ -162,10 +164,15 @@ const STYLES = `
     display: flex;
     justify-content: center;
     align-items: center;
+    /* Minimum dimensions from options (0 = auto) */
+    min-width: var(--rdp-screen-min-width, 0);
 }
 
 .rdp-screen canvas {
     display: block;
+    /* When min dimensions are set, canvas respects them; otherwise scales to fit */
+    min-width: var(--rdp-canvas-min-width, 0);
+    min-height: var(--rdp-canvas-min-height, 0);
     max-width: 100%;
     max-height: 100%;
 }
@@ -600,6 +607,8 @@ export class RDPClient {
      * @param {boolean} [options.showBottomBar=true] - Show bottom status bar
      * @param {number} [options.reconnectDelay=3000] - Reconnection delay in ms
      * @param {boolean} [options.keepConnectionModalOpen=false] - Keep connection modal open when disconnected (cannot be closed)
+     * @param {number} [options.minWidth=0] - Minimum canvas width in pixels (0 = no minimum, scrollbar appears if container is smaller)
+     * @param {number} [options.minHeight=0] - Minimum canvas height in pixels (0 = no minimum, scrollbar appears if container is smaller)
      * @param {import('./rdp-themes.js').RDPTheme} [options.theme] - Theme configuration
      */
     constructor(container, options = {}) {
@@ -611,6 +620,8 @@ export class RDPClient {
             mouseThrottleMs: 16,
             resizeDebounceMs: 2000,
             keepConnectionModalOpen: false,
+            minWidth: 0,    // Minimum canvas width (0 = no minimum, scrollbar appears if container is smaller)
+            minHeight: 0,   // Minimum canvas height (0 = no minimum, scrollbar appears if container is smaller)
             theme: null,
             ...options
         };
@@ -618,6 +629,7 @@ export class RDPClient {
         this._container = container;
         this._initShadowDOM();
         this._applyTheme(this.options.theme);
+        this._applyMinDimensions();  // Apply min dimension CSS vars
         this._initState();
         this._bindElements();
         this._setupEventListeners();
@@ -692,6 +704,35 @@ export class RDPClient {
     setTheme(themeConfig) {
         this.options.theme = themeConfig;
         this._applyTheme(themeConfig);
+    }
+    
+    /**
+     * Apply minimum dimension constraints
+     * Sets CSS custom properties to control canvas min size and scrollbar visibility
+     */
+    _applyMinDimensions() {
+        const { minWidth, minHeight } = this.options;
+        const host = this._shadow.host;
+        
+        // Set canvas minimum dimensions (0 means no constraint)
+        host.style.setProperty('--rdp-canvas-min-width', minWidth > 0 ? `${minWidth}px` : '0');
+        host.style.setProperty('--rdp-canvas-min-height', minHeight > 0 ? `${minHeight}px` : '0');
+        host.style.setProperty('--rdp-screen-min-width', minWidth > 0 ? `${minWidth + 4}px` : '0');  // +4 for border
+        
+        // Enable scrollbars only when min dimensions are set
+        host.style.setProperty('--rdp-overflow-x', minWidth > 0 ? 'auto' : 'hidden');
+        host.style.setProperty('--rdp-overflow-y', minHeight > 0 ? 'auto' : 'hidden');
+    }
+    
+    /**
+     * Set minimum dimensions dynamically
+     * @param {number} minWidth - Minimum canvas width in pixels (0 = no minimum)
+     * @param {number} minHeight - Minimum canvas height in pixels (0 = no minimum)
+     */
+    setMinDimensions(minWidth, minHeight) {
+        this.options.minWidth = minWidth || 0;
+        this.options.minHeight = minHeight || 0;
+        this._applyMinDimensions();
     }
 
     _initState() {

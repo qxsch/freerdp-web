@@ -183,6 +183,8 @@ await client.connect({
 | `mouseThrottleMs` | number | `16` | Mouse move event throttle (~60fps) |
 | `resizeDebounceMs` | number | `2000` | Resize debounce delay |
 | `keepConnectionModalOpen` | boolean | `false` | Keep connection modal open when not connected |
+| `minWidth` | number | `0` | Minimum canvas width in pixels (0 = no minimum, scrollbar appears if container is smaller) |
+| `minHeight` | number | `0` | Minimum canvas height in pixels (0 = no minimum, scrollbar appears if container is smaller) |
 | `theme` | object | `null` | Theme configuration (see Theming section) |
 
 ### Theming
@@ -358,6 +360,7 @@ document.body.style.background = themes.midnight.colors.background;
 | `hideKeyboard()` | Hide the virtual on-screen keyboard |
 | `isKeyboardVisible()` | Returns `true` if virtual keyboard is visible |
 | `setTheme(config)` | Apply a new theme configuration dynamically |
+| `setMinDimensions(w, h)` | Set minimum canvas dimensions (0 = no minimum, scrollbars appear if container is smaller) |
 | `getStatus()` | Returns `{ connected, resolution, muted }` |
 | `isConnected()` | Returns `true` if connected to RDP server |
 | `getLatency()` | Returns current latency in ms, or `null` if not measured |
