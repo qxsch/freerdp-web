@@ -29,7 +29,7 @@
  */
 
 import { resolveTheme, themeToCssVars, sanitizeTheme, fontsToCss, themes } from './rdp-themes.js';
-import { Magic, matchMagic } from './wire-format.js';
+import { Magic, matchMagic, parsePointerPosition, parsePointerSystem, parsePointerSet } from './wire-format.js';
 
 // ============================================================
 // STYLES - Shadow DOM isolated styles (uses CSS custom properties for theming)
@@ -876,6 +876,53 @@ export class RDPClient {
     }
     
     /**
+     * Set a custom cursor from server-provided BGRA bitmap data
+     * Uses CSS cursor with data URL for cursors up to 128x128 (browser limit)
+     * @param {number} width - Cursor width in pixels
+     * @param {number} height - Cursor height in pixels
+     * @param {number} hotspotX - Hotspot X offset
+     * @param {number} hotspotY - Hotspot Y offset
+     * @param {Uint8Array} bgraData - BGRA pixel data (4 bytes per pixel)
+     */
+    _setCustomCursor(width, height, hotspotX, hotspotY, bgraData) {
+        try {
+            // Create temporary canvas to convert BGRA to image
+            const cursorCanvas = document.createElement('canvas');
+            cursorCanvas.width = width;
+            cursorCanvas.height = height;
+            const ctx = cursorCanvas.getContext('2d');
+            
+            // Create ImageData and convert BGRA to RGBA
+            const imageData = ctx.createImageData(width, height);
+            const rgba = imageData.data;
+            
+            for (let i = 0; i < bgraData.length; i += 4) {
+                // BGRA -> RGBA: swap B and R channels
+                rgba[i]     = bgraData[i + 2];  // R <- B
+                rgba[i + 1] = bgraData[i + 1];  // G <- G
+                rgba[i + 2] = bgraData[i];      // B <- R
+                rgba[i + 3] = bgraData[i + 3];  // A <- A
+            }
+            
+            ctx.putImageData(imageData, 0, 0);
+            
+            // Convert to data URL for CSS cursor
+            const dataUrl = cursorCanvas.toDataURL('image/png');
+            
+            // Clamp hotspot to valid range
+            const hx = Math.max(0, Math.min(hotspotX, width - 1));
+            const hy = Math.max(0, Math.min(hotspotY, height - 1));
+            
+            // CSS cursor format: url(data:...), hotspot-x, hotspot-y, fallback
+            // Note: Some browsers limit cursor size to 128x128
+            this._canvas.style.cursor = `url(${dataUrl}) ${hx} ${hy}, auto`;
+        } catch (err) {
+            console.warn('[RDPClient] Failed to set custom cursor:', err);
+            this._canvas.style.cursor = 'default';
+        }
+    }
+    
+    /**
      * Initialize GFX worker canvas when connected
      */
     _initGfxWorkerCanvas(width, height) {
@@ -1382,6 +1429,31 @@ export class RDPClient {
             }
             if (matchMagic(bytes, Magic.AUDI)) {
                 this._handleAudioFrame(bytes);
+                return;
+            }
+            
+            // Pointer/cursor updates - handle on main thread (no GFX worker needed)
+            if (matchMagic(bytes, Magic.PPOS)) {
+                const msg = parsePointerPosition(bytes);
+                if (msg) {
+                    // Server-side cursor positioning (shadow cursor mode)
+                    // Most browsers don't allow setting cursor position
+                }
+                return;
+            }
+            if (matchMagic(bytes, Magic.PSYS)) {
+                const msg = parsePointerSystem(bytes);
+                if (msg) {
+                    // System pointer: 0=NULL (hide), 1=DEFAULT (arrow)
+                    this._canvas.style.cursor = msg.ptrType === 0 ? 'none' : 'default';
+                }
+                return;
+            }
+            if (matchMagic(bytes, Magic.PSET)) {
+                const msg = parsePointerSet(bytes);
+                if (msg) {
+                    this._setCustomCursor(msg.width, msg.height, msg.hotspotX, msg.hotspotY, msg.bgraData);
+                }
                 return;
             }
             

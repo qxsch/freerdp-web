@@ -35,6 +35,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - ⌨️ Full keyboard support with scan code translation
 - ⌨️ **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
 - 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
+- 🖱️ Server cursor support - Remote cursor updates with custom bitmaps and hotspots
 - 📺 Fullscreen mode with dynamic resolution
 - 📸 **Screenshot capture** - Save the current remote desktop view as an image
 - 🎨 **Customizable theming** - Built-in presets (dark, light, midnight, high-contrast) with full color/typography control
@@ -680,6 +681,24 @@ All GFX events are encoded with a 4-byte ASCII magic header:
 | `S2CH` | surfaceToCache | magic(4) + frameId(4) + surfaceId(2) + cacheSlot(2) + x(2) + y(2) + w(2) + h(2) | 20 bytes |
 | `C2SF` | cacheToSurface | magic(4) + frameId(4) + surfaceId(2) + cacheSlot(2) + dstX(2) + dstY(2) | 16 bytes |
 | `EVCT` | evictCache | magic(4) + frameId(4) + cacheSlot(2) | 10 bytes |
+
+#### Pointer/Cursor Updates
+
+| Magic | Event | Layout | Total Size |
+|-------|-------|--------|------------|
+| `PPOS` | pointerPosition | magic(4) + x(2) + y(2) | 8 bytes |
+| `PSYS` | pointerSystem | magic(4) + ptrType(1) | 5 bytes |
+| `PSET` | pointerSet | magic(4) + width(2) + height(2) + hotspotX(2) + hotspotY(2) + dataLen(4) + bgraData | 16 bytes + data |
+
+**Pointer System Types (`PSYS`):**
+- `0` = PTR_NULL - Hide cursor
+- `1` = PTR_DEFAULT - Show default arrow cursor
+
+**Pointer Set (`PSET`):**
+- Contains custom cursor bitmap as BGRA32 pixel data
+- `hotspotX/Y` define the click point offset within the cursor image
+- Frontend converts BGRA → RGBA and creates CSS cursor via canvas.toDataURL()
+- Maximum cursor size depends on browser (typically 128×128 or 256×256)
 
 #### INIT Settings Flags
 

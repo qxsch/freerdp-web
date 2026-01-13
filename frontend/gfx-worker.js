@@ -1278,7 +1278,7 @@ async function handleBinaryMessage(data) {
         case 'initSettings':
             applyInitSettings(msg);
             break;
-            
+
         case 'videoFrame':
             // Execute immediately in arrival order (strict ordering like FreeRDP)
             if (msg.codecId === CODEC_ID.PROGRESSIVE || msg.codecId === CODEC_ID.PROGRESSIVE_V2) {

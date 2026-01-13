@@ -46,6 +46,11 @@ export const Magic = {
     
     // Initialization
     INIT: new Uint8Array([0x49, 0x4E, 0x49, 0x54]),  // "INIT" - initSettings
+    
+    // Pointer/Cursor
+    PPOS: new Uint8Array([0x50, 0x50, 0x4F, 0x53]),  // "PPOS" - pointerPosition
+    PSYS: new Uint8Array([0x50, 0x53, 0x59, 0x53]),  // "PSYS" - pointerSystem
+    PSET: new Uint8Array([0x50, 0x53, 0x45, 0x54]),  // "PSET" - pointerSet
 };
 
 // ============================================================================
@@ -443,6 +448,56 @@ export function parseInitSettings(data) {
 }
 
 /**
+ * Parse pointerPosition message
+ * Layout: PPOS(4) + x(2) + y(2) = 8 bytes
+ */
+export function parsePointerPosition(data) {
+    if (data.length < 8) return null;
+    return {
+        type: 'pointerPosition',
+        x: readU16LE(data, 4),
+        y: readU16LE(data, 6)
+    };
+}
+
+/**
+ * Parse pointerSystem message  
+ * Layout: PSYS(4) + type(1) = 5 bytes
+ */
+export function parsePointerSystem(data) {
+    if (data.length < 5) return null;
+    return {
+        type: 'pointerSystem',
+        ptrType: data[4]  // 0=hidden, 1=default
+    };
+}
+
+/**
+ * Parse pointerSet message
+ * Layout: PSET(4) + width(2) + height(2) + hotspotX(2) + hotspotY(2) + 
+ *         dataLen(4) + bgra_data(variable) = 16 + dataLen bytes
+ */
+export function parsePointerSet(data) {
+    if (data.length < 16) return null;
+    const width = readU16LE(data, 4);
+    const height = readU16LE(data, 6);
+    const hotspotX = readU16LE(data, 8);
+    const hotspotY = readU16LE(data, 10);
+    const dataLen = readU32LE(data, 12);
+    
+    if (data.length < 16 + dataLen) return null;
+    
+    return {
+        type: 'pointerSet',
+        width,
+        height,
+        hotspotX,
+        hotspotY,
+        bgraData: data.subarray(16, 16 + dataLen)
+    };
+}
+
+/**
  * Parse H.264 video frame (legacy format from existing implementation)
  * Layout: H264(4) + frameId(4) + surfaceId(2) + codecId(2) + frameType(1) + 
  *         destX(2) + destY(2) + destW(2) + destH(2) + nalSize(4) + chromaNalSize(4) + data
@@ -523,6 +578,9 @@ export function parseMessage(data) {
         case 'CAPS': return parseCapsConfirm(data);
         case 'INIT': return parseInitSettings(data);
         case 'H264': return parseH264Frame(data);
+        case 'PPOS': return parsePointerPosition(data);
+        case 'PSYS': return parsePointerSystem(data);
+        case 'PSET': return parsePointerSet(data);
         default: return null;
     }
 }

@@ -53,6 +53,11 @@ class Magic:
     
     # Initialization
     INIT = b'INIT'  # initSettings (RDP session settings from freerdp_settings_get_bool)
+    
+    # Pointer/Cursor
+    PPOS = b'PPOS'  # pointerPosition
+    PSYS = b'PSYS'  # pointerSystem (null/default)
+    PSET = b'PSET'  # pointerSet (cursor bitmap)
 
 
 # ============================================================================
@@ -557,6 +562,62 @@ def build_h264_frame(frame_id: int, surface_id: int, codec_id: int,
 # ============================================================================
 # Message Parsers (browser → server)
 # ============================================================================
+
+def build_pointer_position(x: int, y: int) -> bytes:
+    """
+    Build pointerPosition message.
+    
+    Layout: PPOS(4) + x(2) + y(2) = 8 bytes
+    
+    Args:
+        x: Cursor X position
+        y: Cursor Y position
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sHH', Magic.PPOS, x, y)
+
+
+def build_pointer_system(ptr_type: int) -> bytes:
+    """
+    Build pointerSystem message.
+    
+    Layout: PSYS(4) + type(1) = 5 bytes
+    
+    Args:
+        ptr_type: 0=hidden, 1=default
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sB', Magic.PSYS, ptr_type)
+
+
+def build_pointer_set(width: int, height: int, hotspot_x: int, hotspot_y: int,
+                      bgra_data: bytes) -> bytes:
+    """
+    Build pointerSet message with cursor bitmap.
+    
+    Layout: PSET(4) + width(2) + height(2) + hotspotX(2) + hotspotY(2) + 
+            dataLen(4) + bgra_data(variable) = 16 + dataLen bytes
+    
+    Args:
+        width: Cursor width in pixels
+        height: Cursor height in pixels
+        hotspot_x: Hotspot X coordinate
+        hotspot_y: Hotspot Y coordinate
+        bgra_data: BGRA32 pixel data (width * height * 4 bytes)
+    
+    Returns:
+        Binary message ready to send via WebSocket
+    """
+    return struct.pack('<4sHHHHI',
+                       Magic.PSET,
+                       width, height,
+                       hotspot_x, hotspot_y,
+                       len(bgra_data)) + bgra_data
+
 
 def parse_frame_ack(data: bytes) -> Optional[dict]:
     """

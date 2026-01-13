@@ -30,7 +30,8 @@ from wire_format import (
     build_map_surface_to_output, build_webp_tile, build_h264_frame,
     build_reset_graphics, parse_frame_ack, get_message_type,
     build_caps_confirm, build_init_settings,
-    build_clearcodec_tile
+    build_clearcodec_tile,
+    build_pointer_position, build_pointer_system, build_pointer_set
 )
 
 logger = logging.getLogger('rdp-bridge')
@@ -135,6 +136,9 @@ RDP_GFX_EVENT_EVICT_CACHE = 12
 RDP_GFX_EVENT_RESET_GRAPHICS = 13
 RDP_GFX_EVENT_CAPS_CONFIRM = 14
 RDP_GFX_EVENT_INIT_SETTINGS = 15
+RDP_GFX_EVENT_POINTER_POSITION = 16
+RDP_GFX_EVENT_POINTER_SYSTEM = 17
+RDP_GFX_EVENT_POINTER_SET = 18
 
 
 class RdpGfxEvent(Structure):
@@ -169,6 +173,16 @@ class RdpGfxEvent(Structure):
         ('init_color_depth', c_uint32),  # ColorDepth setting
         ('init_flags_low', c_uint32),    # Boolean settings packed as bitfield (bits 0-31)
         ('init_flags_high', c_uint32),   # Reserved for future settings (bits 32-63)
+        # Pointer/cursor fields (for POINTER_POSITION, POINTER_SYSTEM, POINTER_SET)
+        ('pointer_x', c_uint16),          # Pointer X position
+        ('pointer_y', c_uint16),          # Pointer Y position
+        ('pointer_hotspot_x', c_uint16),  # Hotspot X offset
+        ('pointer_hotspot_y', c_uint16),  # Hotspot Y offset
+        ('pointer_width', c_uint16),      # Cursor width
+        ('pointer_height', c_uint16),     # Cursor height
+        ('pointer_system_type', c_uint8), # System pointer type (0=NULL, 1=DEFAULT)
+        ('pointer_data', c_void_p),       # BGRA cursor bitmap data
+        ('pointer_data_size', c_uint32),  # Size of cursor data
     ]
 
 
@@ -741,6 +755,26 @@ class RDPBridge:
                 if chroma_data:
                     message.write(chroma_data)
                 return message.getvalue()
+            return None
+        elif event.type == RDP_GFX_EVENT_POINTER_POSITION:
+            # Pointer position update
+            return build_pointer_position(event.pointer_x, event.pointer_y)
+        elif event.type == RDP_GFX_EVENT_POINTER_SYSTEM:
+            # System pointer (NULL=0 or DEFAULT=1)
+            return build_pointer_system(event.pointer_system_type)
+        elif event.type == RDP_GFX_EVENT_POINTER_SET:
+            # Custom cursor bitmap (BGRA data)
+            if event.pointer_data and event.pointer_data_size > 0:
+                bgra_data = ctypes.string_at(event.pointer_data, event.pointer_data_size)
+                # Free the C-allocated buffer now that we've copied it
+                self._lib.rdp_free_gfx_event_data(event.pointer_data)
+                return build_pointer_set(
+                    event.pointer_width,
+                    event.pointer_height,
+                    event.pointer_hotspot_x,
+                    event.pointer_hotspot_y,
+                    bgra_data
+                )
             return None
         else:
             # Unhandled event type

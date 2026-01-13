@@ -107,6 +107,11 @@ typedef enum {
     RDP_GFX_EVENT_RESET_GRAPHICS,   /* Reset graphics (13) - new dimensions */
     RDP_GFX_EVENT_CAPS_CONFIRM,     /* Server capability confirmation (14) */
     RDP_GFX_EVENT_INIT_SETTINGS,    /* Initialization settings from FreeRDP (15) */
+    
+    /* Pointer/Cursor events */
+    RDP_GFX_EVENT_POINTER_POSITION, /* Cursor position update (16) */
+    RDP_GFX_EVENT_POINTER_SYSTEM,   /* System pointer (null/default) (17) */
+    RDP_GFX_EVENT_POINTER_SET,      /* Set/show a cursor (bitmap data) (18) */
 } RdpGfxEventType;
 
 /* GFX event for Python consumption */
@@ -141,6 +146,17 @@ typedef struct {
     uint32_t init_color_depth;      /* ColorDepth setting */
     uint32_t init_flags_low;        /* Boolean settings packed as bitfield (bits 0-31) */
     uint32_t init_flags_high;       /* Reserved for future settings (bits 32-63) */
+    
+    /* Pointer/Cursor fields */
+    uint16_t pointer_x;             /* Cursor X position (for POINTER_POSITION) */
+    uint16_t pointer_y;             /* Cursor Y position (for POINTER_POSITION) */
+    uint16_t pointer_hotspot_x;     /* Hotspot X (for POINTER_SET) */
+    uint16_t pointer_hotspot_y;     /* Hotspot Y (for POINTER_SET) */
+    uint16_t pointer_width;         /* Cursor width in pixels */
+    uint16_t pointer_height;        /* Cursor height in pixels */
+    uint8_t pointer_system_type;    /* 0=null/hidden, 1=default (for POINTER_SYSTEM) */
+    uint8_t* pointer_data;          /* BGRA32 cursor image (caller frees) */
+    uint32_t pointer_data_size;     /* Size of pointer_data in bytes */
 } RdpGfxEvent;
 
 /* Opaque session handle */

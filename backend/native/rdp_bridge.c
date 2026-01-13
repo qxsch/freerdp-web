@@ -36,6 +36,7 @@
 #include <freerdp/codec/planar.h>
 #include <freerdp/codec/progressive.h>
 #include <freerdp/codec/color.h>
+#include <freerdp/graphics.h>
 #include <opus/opus.h>
 #include <winpr/crt.h>
 #include <winpr/synch.h>
@@ -991,6 +992,125 @@ void rdp_destroy(RdpSession* session)
 }
 
 /* ============================================================================
+ * Pointer/Cursor Callbacks
+ * 
+ * FreeRDP sends cursor updates via the graphics subsystem. We convert the
+ * cursor bitmap to BGRA32 format and queue it for streaming to the browser.
+ * ============================================================================ */
+
+/* Extended pointer structure with pre-converted BGRA data */
+typedef struct {
+    rdpPointer base;        /* Must be first - inherited from rdpPointer */
+    uint8_t* bgra_data;     /* Pre-converted BGRA32 image */
+    uint32_t bgra_size;     /* Size of bgra_data */
+} BridgePointer;
+
+/* Pointer::New - Convert cursor data to BGRA32 */
+static BOOL bridge_pointer_new(rdpContext* context, rdpPointer* pointer)
+{
+    BridgePointer* bp = (BridgePointer*)pointer;
+    
+    uint32_t width = pointer->width;
+    uint32_t height = pointer->height;
+    uint32_t stride = width * 4;  /* BGRA32 = 4 bytes/pixel */
+    bp->bgra_size = stride * height;
+    bp->bgra_data = (uint8_t*)calloc(1, bp->bgra_size);
+    
+    if (!bp->bgra_data)
+        return FALSE;
+    
+    /* Convert XOR/AND masks to BGRA32 using FreeRDP codec */
+    if (!freerdp_image_copy_from_pointer_data(
+            bp->bgra_data, PIXEL_FORMAT_BGRA32, stride,
+            0, 0, width, height,
+            pointer->xorMaskData, pointer->lengthXorMask,
+            pointer->andMaskData, pointer->lengthAndMask,
+            pointer->xorBpp, NULL)) {
+        free(bp->bgra_data);
+        bp->bgra_data = NULL;
+        return FALSE;
+    }
+    
+    return TRUE;
+}
+
+/* Pointer::Free - Clean up BGRA data */
+static void bridge_pointer_free(rdpContext* context, rdpPointer* pointer)
+{
+    BridgePointer* bp = (BridgePointer*)pointer;
+    if (bp && bp->bgra_data) {
+        free(bp->bgra_data);
+        bp->bgra_data = NULL;
+    }
+}
+
+/* Pointer::Set - Queue cursor bitmap for frontend */
+static BOOL bridge_pointer_set(rdpContext* context, const rdpPointer* pointer)
+{
+    BridgeContext* bctx = (BridgeContext*)context;
+    const BridgePointer* bp = (const BridgePointer*)pointer;
+    
+    if (!bp || !bp->bgra_data) return FALSE;
+    
+    /* Copy BGRA data for event queue (Python will free) */
+    uint8_t* data_copy = (uint8_t*)malloc(bp->bgra_size);
+    if (!data_copy) return FALSE;
+    memcpy(data_copy, bp->bgra_data, bp->bgra_size);
+    
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_POINTER_SET;
+    event.pointer_width = pointer->width;
+    event.pointer_height = pointer->height;
+    event.pointer_hotspot_x = pointer->xPos;
+    event.pointer_hotspot_y = pointer->yPos;
+    event.pointer_data = data_copy;
+    event.pointer_data_size = bp->bgra_size;
+    
+    gfx_queue_event(bctx, &event);
+    return TRUE;
+}
+
+/* Pointer::SetNull - Hide cursor */
+static BOOL bridge_pointer_set_null(rdpContext* context)
+{
+    BridgeContext* bctx = (BridgeContext*)context;
+    
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_POINTER_SYSTEM;
+    event.pointer_system_type = 0;  /* Null/hidden */
+    
+    gfx_queue_event(bctx, &event);
+    return TRUE;
+}
+
+/* Pointer::SetDefault - Show default cursor */
+static BOOL bridge_pointer_set_default(rdpContext* context)
+{
+    BridgeContext* bctx = (BridgeContext*)context;
+    
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_POINTER_SYSTEM;
+    event.pointer_system_type = 1;  /* Default system cursor */
+    
+    gfx_queue_event(bctx, &event);
+    return TRUE;
+}
+
+/* Pointer::SetPosition - Update cursor position (optional, server-side cursor) */
+static BOOL bridge_pointer_set_position(rdpContext* context, UINT32 x, UINT32 y)
+{
+    BridgeContext* bctx = (BridgeContext*)context;
+    
+    RdpGfxEvent event = {0};
+    event.type = RDP_GFX_EVENT_POINTER_POSITION;
+    event.pointer_x = (uint16_t)x;
+    event.pointer_y = (uint16_t)y;
+    
+    gfx_queue_event(bctx, &event);
+    return TRUE;
+}
+
+/* ============================================================================
  * Deferred GDI Pipeline Initialization
  * ============================================================================ */
 
@@ -1313,6 +1433,21 @@ static BOOL bridge_post_connect(freerdp* instance)
     }
     
     rdpGdi* gdi = context->gdi;
+    
+    /* Register pointer/cursor callbacks for remote cursor support.
+     * FreeRDP will call these when the server sends cursor updates. */
+    {
+        rdpPointer pointer_proto = { 0 };
+        pointer_proto.size = sizeof(BridgePointer);
+        pointer_proto.New = bridge_pointer_new;
+        pointer_proto.Free = bridge_pointer_free;
+        pointer_proto.Set = bridge_pointer_set;
+        pointer_proto.SetNull = bridge_pointer_set_null;
+        pointer_proto.SetDefault = bridge_pointer_set_default;
+        pointer_proto.SetPosition = bridge_pointer_set_position;
+        graphics_register_pointer(context->graphics, &pointer_proto);
+        fprintf(stderr, "[rdp_bridge] Pointer callbacks registered\n");
+    }
     
     /* Check if server supports GFX */
     {
