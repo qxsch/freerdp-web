@@ -39,7 +39,7 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 🖱️ Server cursor support - Remote cursor updates with custom bitmaps and hotspots
 - 📺 Fullscreen mode with dynamic resolution
 - 📸 **Screenshot capture** - Save the current remote desktop view as an image
-- 🎨 **Customizable theming** - Built-in presets (dark, light, midnight, high-contrast) with full color/typography control
+- 🎨 **Customizable theming** - Built-in presets (dark, light, midnight, high-contrast) and shadow dom for robustness
 - 📊 Latency monitoring (ping/pong)
 - 🩺 Health check endpoint (`/health`)
 - 🐳 Docker support with multi-stage builds
