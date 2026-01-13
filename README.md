@@ -761,7 +761,7 @@ EOF
 docker run -d \
     -p 8765:8765 \
     -v $(pwd)/security:/app/security:ro \
-    qxsch/freerdpwebbackend:latest
+    qxsch/freerdpweb-backend:latest
 ```
 
 Or in `docker-compose.yml`:
@@ -769,7 +769,7 @@ Or in `docker-compose.yml`:
 ```yaml
 services:
   backend:
-    image: qxsch/freerdpwebbackend:latest
+    image: qxsch/freerdpweb-backend:latest
     ports:
       - "8765:8765"
     volumes:
@@ -781,7 +781,7 @@ You can also use a custom path with the environment variable:
 ```yaml
 services:
   backend:
-    image: qxsch/freerdpwebbackend:latest
+    image: qxsch/freerdpweb-backend:latest
     ports:
       - "8765:8765"
     volumes:
@@ -795,7 +795,7 @@ services:
 Create a custom Docker image with the policy baked in:
 
 ```dockerfile
-FROM qxsch/freerdpwebbackend:latest
+FROM qxsch/freerdpweb-backend:latest
 
 RUN mkdir -p /app/security/
 COPY rdp-bridge-policy.json /app/security/
