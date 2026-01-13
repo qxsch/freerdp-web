@@ -1120,9 +1120,6 @@ export class RDPClient {
                 this._canvas.width = width;
                 this._canvas.height = height;
 
-                // Progressive is enabled when WASM is available
-                const progressiveEnabled = this._wasmAvailable;
-                
                 this._sendMessage({
                     type: 'connect',
                     host: credentials.host,
@@ -1130,11 +1127,10 @@ export class RDPClient {
                     username: credentials.user,
                     password: credentials.pass,
                     width,
-                    height,
-                    progressiveEnabled
+                    height
                 });
                 
-                console.log('[RDPClient] Connect request - Progressive:', progressiveEnabled);
+                console.log('[RDPClient] Connect request');
             };
 
             this._ws.onmessage = (e) => this._handleMessage(e);
