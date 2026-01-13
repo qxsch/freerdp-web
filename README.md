@@ -5,14 +5,14 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 ## Architecture
 
 ```
-┌───────────────────────────────┐                                         
-│           Browser             │                                         
-│  ┌─────────┐  ┌────────────┐  │     WebSocket       ┌─────────────────┐     RDP/GFX    ┌─────────┐
-│  │ Main    │  │ GFX Worker │  │ ◄─────────────────► │  Python Proxy   │ ◄────────────► │ Windows │
-│  │ Thread  │  │ (Offscreen │  │  Wire Format Proto  │ (Native FreeRDP)│  AVC444/AVC420 │   OS    │
-│  │ (Audio) │  │  Canvas)   │  │  H264+SURF+TILE+... │                 │                │         │
-│  └─────────┘  └────────────┘  │                     └─────────────────┘                └─────────┘
-└───────────────────────────────┘                                         
+┌───────────────────────────────────────────────────────┐                                         
+│                      Browser                          │                                         
+│  ┌─────────────┐  ┌────────────┐  ┌─────────────────┐ │     WebSocket       ┌─────────────────┐     RDP/GFX    ┌─────────┐
+│  │ Main Thread │  │ GFX Worker │  │  AudioWorklet   │ │ ◄─────────────────► │  Python Proxy   │ ◄────────────► │ Windows │
+│  │  (WS, Opus  │  │ (Offscreen │  │  (Low-latency   │ │  Wire Format Proto  │ (Native FreeRDP)│  AVC444/AVC420 │   OS    │
+│  │   Decoder)  │  │  Canvas)   │  │   Ring Buffer)  │ │  H264+SURF+TILE+... │                 │                │         │
+│  └─────────────┘  └────────────┘  └─────────────────┘ │                     └─────────────────┘                └─────────┘
+└───────────────────────────────────────────────────────┘                                         
 ```
 
 ### Components
@@ -31,7 +31,8 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - 🎯 **Client-side GFX compositor** - Surface management, tile decoding, frame composition
 - 🧮 **Progressive codec WASM decoder** - RFX Progressive tiles decoded in WebAssembly (pthreads)
 - 🎨 **ClearCodec WASM decoder** - Clear codec tiles decoded in WebAssembly
-- 🔊 Native audio streaming with Opus encoding (per-session isolation)
+- 🔊 **Low-latency audio** with AudioWorklet + SharedArrayBuffer ring buffer (~5-20ms latency)
+- 🎵 Native audio streaming with Opus encoding (per-session isolation)
 - ⌨️ Full keyboard support with scan code translation
 - ⌨️ **Virtual on-screen keyboard** - Touch-friendly US layout with modifier support
 - 🖱️ Mouse support (move, click, drag, wheel - horizontal & vertical)
@@ -70,12 +71,16 @@ Browser-based Remote Desktop client using vanilla JavaScript frontend and a Pyth
 - **OffscreenCanvas** - Hardware-accelerated canvas in worker context (REQUIRED)
 - **WebCodecs VideoDecoder** for H.264 decoding in worker (hardware accelerated)
 - **WebCodecs AudioDecoder** for Opus decoding (main thread)
+- **AudioWorklet** - Low-latency audio playback with SharedArrayBuffer ring buffer
 - **Wire Format Parser** - Binary protocol with 4-byte ASCII magic headers
 - **nginx:alpine** for static file serving
 
 ### Browser Requirements
 - **OffscreenCanvas** support (REQUIRED - no fallback)
+- **SharedArrayBuffer** support (REQUIRED for low-latency audio via AudioWorklet)
 - **Chrome 94+** or **Edge 94+** or **Safari 26+** or **Firefox 130+** (OffscreenCanvas + WebCodecs)
+
+> **Note**: SharedArrayBuffer requires CORS isolation headers (`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`). These are already configured in the included `nginx.conf`.
 
 ## Quick Start with Docker (Recommended)
 
@@ -852,6 +857,7 @@ const client = new RDPClient(container, {
     ├── Dockerfile          # nginx:alpine image
     ├── index.html          # SPA entry point
     ├── rdp-client.js       # RDP client (Shadow DOM, WebSocket, audio)
+    ├── audio-worklet.js    # AudioWorklet processor (low-latency ring buffer)
     ├── gfx-worker.js       # GFX compositor worker (OffscreenCanvas, H.264, WASM)
     ├── wire-format.js      # Binary protocol parser
     ├── nginx.conf          # nginx configuration
@@ -885,18 +891,25 @@ The RDPGFX channel (MS-RDPEGFX) provides a client-side compositor with off-main-
                                            WebSocket Binary Messages             │
                                            (SURF, H264, TILE, WEBP, ...)         │
                                                                                  ▼
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                        Browser                                             │
-│  ┌───────────────────────┐           postMessage          ┌───────────────────────────┐    │
-│  │      Main Thread      │ ─────────────────────────────► │       GFX Worker          │    │
-│  │  • WebSocket receive  │                                │  • Wire format parsing    │    │
-│  │  • Audio decode/play  │ ◄───────────────────────────── │  • Surface management     │    │
-│  │  • Keyboard/mouse     │              frameAck          │  • H.264 VideoDecoder     │    │
-│  │  • UI events          │                                │  • Tile decoding          │    │
-│  └───────────────────────┘                                │  • Frame composition      │    │
-│                                                           │  • OffscreenCanvas render │    │
-│                                                           └───────────────────────────┘    │
-└────────────────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                   Browser                                                      │
+│  ┌───────────────────────┐           postMessage          ┌───────────────────────────┐                        │
+│  │      Main Thread      │ ─────────────────────────────► │       GFX Worker          │                        │
+│  │  • WebSocket receive  │                                │  • Wire format parsing    │                        │
+│  │  • Opus AudioDecoder  │ ◄───────────────────────────── │  • Surface management     │                        │
+│  │  • Keyboard/mouse     │              frameAck          │  • H.264 VideoDecoder     │                        │
+│  │  • UI events          │                                │  • Tile decoding          │                        │
+│  └──────────┬────────────┘                                │  • Frame composition      │                        │
+│             │ SharedArrayBuffer                           │  • OffscreenCanvas render │                        │
+│             │ (ring buffer)                               └───────────────────────────┘                        │
+│             ▼                                                                                                  │
+│  ┌───────────────────────┐                                                                                     │
+│  │     AudioWorklet      │  Low-latency audio thread (~5-20ms latency)                                         │
+│  │  • Ring buffer read   │  - Reads samples via Atomics from SharedArrayBuffer                                 │
+│  │  • 128-sample output  │  - Outputs 128 samples per process() call                                           │
+│  │  • Underrun detection │  - Outputs silence when buffer empty                                                │
+│  └───────────────────────┘                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Wire Format Protocol
@@ -1069,9 +1082,14 @@ flowchart TB
         subgraph MainThread["Main Thread"]
             WS_Client["WebSocket Client"]
             AudioDecoder["WebCodecs<br/>AudioDecoder"]
-            AudioCtx["AudioContext<br/>+ Speakers"]
             Input["Keyboard/Mouse<br/>Events"]
             CursorMgr["Cursor Manager<br/>(CSS cursor)"]
+        end
+        
+        subgraph AudioThread["AudioWorklet Thread"]
+            AudioWorklet["AudioWorklet<br/>Processor"]
+            RingBuffer["Ring Buffer<br/>(SharedArrayBuffer)"]
+            AudioOut["Audio Output<br/>(128 samples/frame)"]
         end
         
         subgraph GFXWorker["GFX Worker Thread"]
@@ -1162,13 +1180,15 @@ flowchart TB
     Compositor --> OffscreenCanvases
     OffscreenCanvases --> PrimaryCanvas
 
-    %% Audio flow (main thread)
+    %% Audio flow (main thread → AudioWorklet)
     FreeRDP --> Bridge
     Bridge --> Opus
     Opus --> WS_Server
     WS_Server -->|"OPUS frames"| WS_Client
     WS_Client --> AudioDecoder
-    AudioDecoder --> AudioCtx
+    AudioDecoder -->|"Atomics.store"| RingBuffer
+    RingBuffer -->|"Atomics.load"| AudioWorklet
+    AudioWorklet --> AudioOut
 
     %% Input flow
     Input --> WS_Client
@@ -1185,6 +1205,7 @@ flowchart TB
     style WindowsVM fill:#e8f5e9
     style Native fill:#ffecb3
     style MainThread fill:#bbdefb
+    style AudioThread fill:#f3e5f5
     style GFXWorker fill:#c8e6c9
     style GFX fill:#fff59d
     style Audio fill:#b3e5fc

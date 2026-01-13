@@ -759,14 +759,23 @@ export class RDPClient {
         this._lastRequestedWidth = 0;
         this._lastRequestedHeight = 0;
         
-        // Audio state
+        // Audio state - AudioWorklet low-latency system
         this._audioContext = null;
-        this._audioQueue = [];
-        this._isMuted = false;
         this._audioGainNode = null;
-        this._audioNextPlayTime = 0;
+        this._audioWorklet = null;           // AudioWorkletNode
+        this._audioWorkletReady = false;
+        this._audioWorkletWarned = false;    // Only warn once if worklet not ready
+        this._audioSharedBuffer = null;      // SharedArrayBuffer for ring buffer
+        this._audioControlView = null;       // Uint32Array for write index
+        this._audioDataView = null;          // Float32Array for audio samples
+        this._audioWriteIndex = 0;
+        this._audioBufferSize = 24000;       // ~500ms at 48kHz (samples per channel)
+        this._audioChannels = 2;
+        this._isMuted = false;
+        this._audioIsPlaying = false;        // Track if audio is currently playing
+        this._audioIdleTimer = null;         // Timer to detect audio silence
         
-        // Opus decoder
+        // Opus decoder (WebCodecs)
         this._opusDecoder = null;
         this._opusInitialized = false;
         this._opusSampleRate = 48000;
@@ -1244,6 +1253,10 @@ export class RDPClient {
         this._isMuted = muted;
         if (this._audioGainNode) {
             this._audioGainNode.gain.value = muted ? 0 : 1;
+        }
+        // Notify AudioWorklet
+        if (this._audioWorklet) {
+            this._audioWorklet.port.postMessage({ type: 'mute', data: { muted } });
         }
         this._el.btnMute.textContent = muted ? '🔇' : '🔊';
     }
@@ -1751,7 +1764,7 @@ export class RDPClient {
     // PRIVATE: AUDIO
     // --------------------------------------------------
 
-    _initAudio() {
+    async _initAudio() {
         if (this._audioContext) return;
         
         try {
@@ -1759,8 +1772,79 @@ export class RDPClient {
             this._audioGainNode = this._audioContext.createGain();
             this._audioGainNode.connect(this._audioContext.destination);
             this._audioGainNode.gain.value = this._isMuted ? 0 : 1;
+            
+            // Initialize AudioWorklet for low-latency playback
+            await this._initAudioWorklet();
         } catch (e) {
             console.error('[RDPClient] Audio init failed:', e);
+        }
+    }
+    
+    /**
+     * Initialize AudioWorklet with SharedArrayBuffer ring buffer
+     */
+    async _initAudioWorklet() {
+        if (this._audioWorklet) return;
+        
+        try {
+            // Check for SharedArrayBuffer support (requires CORS headers)
+            if (typeof SharedArrayBuffer === 'undefined') {
+                console.warn('[RDPClient] SharedArrayBuffer not available, audio may have higher latency');
+                return;
+            }
+            
+            // Load the AudioWorklet module
+            await this._audioContext.audioWorklet.addModule('audio-worklet.js');
+            
+            // Create SharedArrayBuffer for ring buffer
+            // Layout: [writeIndex(4), readIndex(4), bufferSize(4), channels(4), audioData...]
+            const controlBytes = 16; // 4 Uint32s
+            const audioBytes = this._audioBufferSize * this._audioChannels * 4; // Float32
+            this._audioSharedBuffer = new SharedArrayBuffer(controlBytes + audioBytes);
+            
+            // Create views into the shared buffer
+            this._audioControlView = new Uint32Array(this._audioSharedBuffer, 0, 4);
+            this._audioDataView = new Float32Array(this._audioSharedBuffer, controlBytes, 
+                                                   this._audioBufferSize * this._audioChannels);
+            
+            // Initialize control data
+            this._audioControlView[0] = 0; // writeIndex
+            this._audioControlView[1] = 0; // readIndex
+            this._audioControlView[2] = this._audioBufferSize;
+            this._audioControlView[3] = this._audioChannels;
+            this._audioWriteIndex = 0;
+            
+            // Create AudioWorkletNode
+            this._audioWorklet = new AudioWorkletNode(this._audioContext, 'rdp-audio-processor');
+            this._audioWorklet.connect(this._audioGainNode);
+            
+            // Handle messages from worklet
+            this._audioWorklet.port.onmessage = (event) => {
+                const { type } = event.data;
+                if (type === 'ready') {
+                    this._audioWorkletReady = true;
+                    console.log('[RDPClient] AudioWorklet ready');
+                } else if (type === 'stats') {
+                    // Optional: log stats for debugging
+                    // console.log('[RDPClient] Audio stats:', event.data);
+                }
+            };
+            
+            // Send init message with shared buffer
+            this._audioWorklet.port.postMessage({
+                type: 'init',
+                data: {
+                    sharedBuffer: this._audioSharedBuffer,
+                    bufferSize: this._audioBufferSize,
+                    channels: this._audioChannels
+                }
+            });
+            
+            console.log('[RDPClient] AudioWorklet initialized with', 
+                        this._audioBufferSize, 'sample ring buffer');
+        } catch (e) {
+            console.error('[RDPClient] AudioWorklet init failed:', e);
+            this._audioWorklet = null;
         }
     }
 
@@ -1843,58 +1927,83 @@ export class RDPClient {
             
             const numFrames = audioData.numberOfFrames;
             const numChannels = audioData.numberOfChannels;
-            const sampleRate = audioData.sampleRate;
             const format = audioData.format; // e.g., 'f32-planar', 'f32', 's16', etc.
             
-            const audioBuffer = this._audioContext.createBuffer(numChannels, numFrames, sampleRate);
+            // Log audio start
+            this._logAudioActivity('opus');
             
-            // Handle based on format
-            if (format && format.includes('planar')) {
-                // Planar format - copy each channel separately
-                for (let ch = 0; ch < numChannels; ch++) {
-                    const channelData = audioBuffer.getChannelData(ch);
-                    audioData.copyTo(channelData, { planeIndex: ch });
-                }
+            // If AudioWorklet is ready, write directly to ring buffer
+            if (this._audioWorkletReady && this._audioDataView) {
+                this._writeToRingBuffer(audioData, numFrames, numChannels, format);
             } else {
-                // Interleaved format - need to allocate proper buffer and de-interleave
-                const bytesPerSample = format === 's16' ? 2 : format === 's32' ? 4 : 4;
-                const totalBytes = numFrames * numChannels * bytesPerSample;
-                
-                let tempBuffer;
-                if (format === 's16') {
-                    tempBuffer = new Int16Array(numFrames * numChannels);
-                } else if (format === 's32') {
-                    tempBuffer = new Int32Array(numFrames * numChannels);
-                } else {
-                    // f32 or default
-                    tempBuffer = new Float32Array(numFrames * numChannels);
-                }
-                
-                audioData.copyTo(tempBuffer, { planeIndex: 0 });
-                
-                // De-interleave into channels
-                for (let ch = 0; ch < numChannels; ch++) {
-                    const channelData = audioBuffer.getChannelData(ch);
-                    for (let i = 0; i < numFrames; i++) {
-                        let sample = tempBuffer[i * numChannels + ch];
-                        // Normalize to float [-1, 1]
-                        if (format === 's16') {
-                            sample = sample / 32768.0;
-                        } else if (format === 's32') {
-                            sample = sample / 2147483648.0;
-                        }
-                        channelData[i] = sample;
-                    }
+                // AudioWorklet not available - audio will not play
+                if (!this._audioWorkletWarned) {
+                    console.warn('[RDPClient] AudioWorklet not ready - audio frames dropped');
+                    this._audioWorkletWarned = true;
                 }
             }
-            
-            this._queueAudioBuffer(audioBuffer);
         } catch (e) {
             console.error('[RDPClient] Audio error:', e);
         } finally {
             audioData.close();
         }
     }
+    
+    /**
+     * Write decoded audio samples to the ring buffer for AudioWorklet
+     */
+    _writeToRingBuffer(audioData, numFrames, numChannels, format) {
+        const bufferSize = this._audioBufferSize;
+        const channels = this._audioChannels;
+        
+        // Prepare temp buffer for reading from AudioData
+        const tempChannels = [];
+        for (let ch = 0; ch < numChannels; ch++) {
+            tempChannels.push(new Float32Array(numFrames));
+        }
+        
+        // Copy audio data to temp buffers
+        if (format && format.includes('planar')) {
+            for (let ch = 0; ch < numChannels; ch++) {
+                audioData.copyTo(tempChannels[ch], { planeIndex: ch });
+            }
+        } else {
+            // Interleaved - extract to planar
+            let tempBuffer;
+            if (format === 's16') {
+                tempBuffer = new Int16Array(numFrames * numChannels);
+            } else if (format === 's32') {
+                tempBuffer = new Int32Array(numFrames * numChannels);
+            } else {
+                tempBuffer = new Float32Array(numFrames * numChannels);
+            }
+            audioData.copyTo(tempBuffer, { planeIndex: 0 });
+            
+            for (let ch = 0; ch < numChannels; ch++) {
+                for (let i = 0; i < numFrames; i++) {
+                    let sample = tempBuffer[i * numChannels + ch];
+                    if (format === 's16') sample = sample / 32768.0;
+                    else if (format === 's32') sample = sample / 2147483648.0;
+                    tempChannels[ch][i] = sample;
+                }
+            }
+        }
+        
+        // Write interleaved samples to ring buffer
+        let writeIdx = this._audioWriteIndex;
+        for (let i = 0; i < numFrames; i++) {
+            const bufferIdx = writeIdx % bufferSize;
+            for (let ch = 0; ch < channels; ch++) {
+                const srcCh = ch < numChannels ? ch : numChannels - 1;
+                this._audioDataView[bufferIdx * channels + ch] = tempChannels[srcCh][i];
+            }
+            writeIdx++;
+        }
+        
+        this._audioWriteIndex = writeIdx % bufferSize;
+        Atomics.store(this._audioControlView, 0, this._audioWriteIndex);
+    }
+
 
     _handleAudioFrame(bytes) {
         if (!this._audioContext || this._isMuted) return;
@@ -1916,70 +2025,113 @@ export class RDPClient {
             const numSamples = Math.floor(pcmData.length / (channels * bytesPerSample));
             if (numSamples === 0) return;
             
-            const audioBuffer = this._audioContext.createBuffer(channels, numSamples, sampleRate);
+            // Log audio start
+            this._logAudioActivity('pcm');
             
-            for (let ch = 0; ch < channels; ch++) {
-                const channelData = audioBuffer.getChannelData(ch);
-                for (let i = 0; i < numSamples; i++) {
-                    const sampleIndex = i * channels + ch;
-                    const byteOffset = sampleIndex * bytesPerSample;
-                    
-                    if (bits === 16) {
-                        const int16 = pcmData[byteOffset] | (pcmData[byteOffset + 1] << 8);
-                        channelData[i] = int16 > 32767 ? (int16 - 65536) / 32768 : int16 / 32768;
-                    } else if (bits === 8) {
-                        channelData[i] = (pcmData[byteOffset] - 128) / 128;
-                    }
+            // If AudioWorklet is ready, write directly to ring buffer
+            if (this._audioWorkletReady && this._audioDataView) {
+                this._writePcmToRingBuffer(pcmData, numSamples, channels, bits);
+            } else {
+                // AudioWorklet not available - audio will not play
+                if (!this._audioWorkletWarned) {
+                    console.warn('[RDPClient] AudioWorklet not ready - audio frames dropped');
+                    this._audioWorkletWarned = true;
                 }
             }
-            
-            this._queueAudioBuffer(audioBuffer);
         } catch (e) {
             console.error('[RDPClient] PCM audio error:', e);
         }
     }
-
-    _queueAudioBuffer(audioBuffer) {
-        const source = this._audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(this._audioGainNode);
+    
+    /**
+     * Write PCM audio samples to ring buffer for AudioWorklet
+     */
+    _writePcmToRingBuffer(pcmData, numSamples, srcChannels, bits) {
+        const bufferSize = this._audioBufferSize;
+        const dstChannels = this._audioChannels;
+        const bytesPerSample = bits / 8;
         
-        const currentTime = this._audioContext.currentTime;
-        const bufferDuration = audioBuffer.duration;
+        let writeIdx = this._audioWriteIndex;
         
-        this._audioQueue = this._audioQueue.filter(item => item.endTime > currentTime);
-        
-        let startTime;
-        if (this._audioNextPlayTime <= currentTime) {
-            startTime = currentTime + 0.1;
-        } else {
-            startTime = this._audioNextPlayTime;
+        for (let i = 0; i < numSamples; i++) {
+            const bufferIdx = writeIdx % bufferSize;
+            
+            for (let ch = 0; ch < dstChannels; ch++) {
+                const srcCh = ch < srcChannels ? ch : srcChannels - 1;
+                const sampleIndex = i * srcChannels + srcCh;
+                const byteOffset = sampleIndex * bytesPerSample;
+                
+                let sample;
+                if (bits === 16) {
+                    const int16 = pcmData[byteOffset] | (pcmData[byteOffset + 1] << 8);
+                    sample = int16 > 32767 ? (int16 - 65536) / 32768 : int16 / 32768;
+                } else if (bits === 8) {
+                    sample = (pcmData[byteOffset] - 128) / 128;
+                } else {
+                    sample = 0;
+                }
+                
+                this._audioDataView[bufferIdx * dstChannels + ch] = sample;
+            }
+            writeIdx++;
         }
         
-        const maxLatency = 0.5;
-        if (startTime > currentTime + maxLatency) {
-            startTime = currentTime + 0.1;
-        }
-        
-        source.start(startTime);
-        this._audioNextPlayTime = startTime + bufferDuration;
-        this._audioQueue.push({ endTime: this._audioNextPlayTime, source });
-        
-        while (this._audioQueue.length > 50) {
-            this._audioQueue.shift();
-        }
+        this._audioWriteIndex = writeIdx % bufferSize;
+        Atomics.store(this._audioControlView, 0, this._audioWriteIndex);
     }
 
-    _cleanupAudio() {
-        this._audioQueue = [];
-        this._audioNextPlayTime = 0;
+
+    /**
+     * Log audio activity - tracks when audio starts/stops
+     */
+    _logAudioActivity(codec) {
+        if (!this._audioIsPlaying) {
+            this._audioIsPlaying = true;
+            console.log(`[RDPClient] Audio started playing (codec: ${codec})`);
+        }
         
+        // Reset idle timer
+        if (this._audioIdleTimer) {
+            clearTimeout(this._audioIdleTimer);
+        }
+        this._audioIdleTimer = setTimeout(() => {
+            if (this._audioIsPlaying) {
+                this._audioIsPlaying = false;
+                console.log('[RDPClient] Audio stopped (idle for 5 seconds)');
+            }
+        }, 5000);
+    }
+
+
+    _cleanupAudio() {
+        // Clear idle timer
+        if (this._audioIdleTimer) {
+            clearTimeout(this._audioIdleTimer);
+            this._audioIdleTimer = null;
+        }
+        this._audioIsPlaying = false;
+        
+        // Clean up Opus decoder
         if (this._opusDecoder) {
             try { this._opusDecoder.close(); } catch (e) {}
             this._opusDecoder = null;
             this._opusInitialized = false;
         }
         
+        // Clean up AudioWorklet
+        if (this._audioWorklet) {
+            this._audioWorklet.port.postMessage({ type: 'reset' });
+            this._audioWorklet.disconnect();
+            this._audioWorklet = null;
+        }
+        this._audioWorkletReady = false;
+        this._audioWorkletWarned = false;
+        this._audioSharedBuffer = null;
+        this._audioControlView = null;
+        this._audioDataView = null;
+        this._audioWriteIndex = 0;
+        
+        // Clean up AudioContext
         if (this._audioContext) {
             this._audioContext.close();
             this._audioContext = null;
