@@ -772,8 +772,6 @@ export class RDPClient {
         this._audioBufferSize = 24000;       // ~500ms at 48kHz (samples per channel)
         this._audioChannels = 2;
         this._isMuted = false;
-        this._audioIsPlaying = false;        // Track if audio is currently playing
-        this._audioIdleTimer = null;         // Timer to detect audio silence
         
         // Opus decoder (WebCodecs)
         this._opusDecoder = null;
@@ -1929,9 +1927,6 @@ export class RDPClient {
             const numChannels = audioData.numberOfChannels;
             const format = audioData.format; // e.g., 'f32-planar', 'f32', 's16', etc.
             
-            // Log audio start
-            this._logAudioActivity('opus');
-            
             // If AudioWorklet is ready, write directly to ring buffer
             if (this._audioWorkletReady && this._audioDataView) {
                 this._writeToRingBuffer(audioData, numFrames, numChannels, format);
@@ -2025,9 +2020,6 @@ export class RDPClient {
             const numSamples = Math.floor(pcmData.length / (channels * bytesPerSample));
             if (numSamples === 0) return;
             
-            // Log audio start
-            this._logAudioActivity('pcm');
-            
             // If AudioWorklet is ready, write directly to ring buffer
             if (this._audioWorkletReady && this._audioDataView) {
                 this._writePcmToRingBuffer(pcmData, numSamples, channels, bits);
@@ -2081,36 +2073,7 @@ export class RDPClient {
     }
 
 
-    /**
-     * Log audio activity - tracks when audio starts/stops
-     */
-    _logAudioActivity(codec) {
-        if (!this._audioIsPlaying) {
-            this._audioIsPlaying = true;
-            console.log(`[RDPClient] Audio started playing (codec: ${codec})`);
-        }
-        
-        // Reset idle timer
-        if (this._audioIdleTimer) {
-            clearTimeout(this._audioIdleTimer);
-        }
-        this._audioIdleTimer = setTimeout(() => {
-            if (this._audioIsPlaying) {
-                this._audioIsPlaying = false;
-                console.log('[RDPClient] Audio stopped (idle for 5 seconds)');
-            }
-        }, 5000);
-    }
-
-
     _cleanupAudio() {
-        // Clear idle timer
-        if (this._audioIdleTimer) {
-            clearTimeout(this._audioIdleTimer);
-            this._audioIdleTimer = null;
-        }
-        this._audioIsPlaying = false;
-        
         // Clean up Opus decoder
         if (this._opusDecoder) {
             try { this._opusDecoder.close(); } catch (e) {}
