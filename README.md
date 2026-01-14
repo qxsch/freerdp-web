@@ -189,10 +189,75 @@ await client.connect({
 | `mouseThrottleMs` | number | `16` | Mouse move event throttle (~60fps) |
 | `resizeDebounceMs` | number | `2000` | Resize debounce delay |
 | `keepConnectionModalOpen` | boolean | `false` | Keep connection modal open when not connected |
+| `loadingSpinnerOpensModal` | boolean | `true` | Clicking on the loading area opens the connection modal |
 | `minWidth` | number | `0` | Minimum canvas width in pixels (0 = no minimum, scrollbar appears if container is smaller) |
 | `minHeight` | number | `0` | Minimum canvas height in pixels (0 = no minimum, scrollbar appears if container is smaller) |
 | `theme` | object | `null` | Theme configuration (see Theming section) |
 | `securityPolicy` | object | `null` | Security policy for connection restrictions (see Security Policy section) |
+| `visibleTopBarButtons` | object | `{ connect: true, disconnect: true, screenshot: true, fullscreen: true }` | Control visibility of top bar buttons |
+| `additionalTopBarButtons` | array | `[]` | Custom buttons (max 4) added before built-in controls |
+
+#### visibleTopBarButtons Options
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `connect` | boolean | `true` | Show/hide the Connect button |
+| `disconnect` | boolean | `true` | Show/hide the Disconnect button |
+| `screenshot` | boolean | `true` | Show/hide the Screenshot button (📷) |
+| `fullscreen` | boolean | `true` | Show/hide the Fullscreen button (⛶) |
+
+```javascript
+// Example: Hide screenshot and fullscreen buttons
+const client = new RDPClient(container, {
+    wsUrl: 'ws://localhost:8765',
+    visibleTopBarButtons: {
+        connect: true,
+        disconnect: true,
+        screenshot: false,
+        fullscreen: false
+    }
+});
+```
+
+#### additionalTopBarButtons Options
+
+Add up to 4 custom buttons to the top bar. Buttons are inserted before the built-in controls (Connect, Disconnect, etc.).
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `name` | string | Yes | Button label text (also used as tooltip) |
+| `click` | function | Yes | Callback function invoked when button is clicked |
+
+**Security Note**: Click callbacks are isolated and cannot access RDPClient internals. The callback receives a simple object `{ buttonName: string }` as its only argument.
+
+```javascript
+// Example: Add custom buttons (remove Connect button and add Reconnect button)
+const client = new RDPClient(container, {
+    wsUrl: 'ws://localhost:8765',
+    visibleTopBarButtons: {
+        connect: false
+    },
+    loadingSpinnerOpensModal: false,
+    additionalTopBarButtons: [
+        {
+            name: 'Reconnect',
+            click: async () => {
+                // disconnect if connected
+                if (client.isConnected()) {
+                    await client.disconnect();
+                }
+                // then connect
+                await client.connect({
+                    host: '1.2.3.4',
+                    port: 3389,
+                    user: 'user1',
+                    pass: 'passwd'
+                });
+            }
+        },
+    ]
+});
+```
 
 ### Security Policy
 

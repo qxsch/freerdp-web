@@ -611,14 +611,21 @@ export class RDPClient {
      * @param {boolean} [options.showBottomBar=true] - Show bottom status bar
      * @param {number} [options.reconnectDelay=3000] - Reconnection delay in ms
      * @param {boolean} [options.keepConnectionModalOpen=false] - Keep connection modal open when disconnected (cannot be closed)
+     * @param {boolean} [options.loadingSpinnerOpensModal=true] - Whether clicking the loading area opens the connection modal
      * @param {number} [options.minWidth=0] - Minimum canvas width in pixels (0 = no minimum, scrollbar appears if container is smaller)
      * @param {number} [options.minHeight=0] - Minimum canvas height in pixels (0 = no minimum, scrollbar appears if container is smaller)
      * @param {import('./rdp-themes.js').RDPTheme} [options.theme] - Theme configuration
      * @param {import('./rdp-security.js').SecurityPolicy} [options.securityPolicy] - Security policy for connection restrictions
+     * @param {Object} [options.visibleTopBarButtons] - Control visibility of top bar buttons
+     * @param {boolean} [options.visibleTopBarButtons.connect=true] - Show Connect button
+     * @param {boolean} [options.visibleTopBarButtons.disconnect=true] - Show Disconnect button
+     * @param {boolean} [options.visibleTopBarButtons.screenshot=true] - Show Screenshot button
+     * @param {boolean} [options.visibleTopBarButtons.fullscreen=true] - Show Fullscreen button
+     * @param {Array<{name: string, click: function}>} [options.additionalTopBarButtons=[]] - Custom buttons (max 4) added before built-in controls
      */
     constructor(container, options = {}) {
         // Extract security policy before spreading options (we don't store it in this.options)
-        const { securityPolicy, ...restOptions } = options;
+        const { securityPolicy, additionalTopBarButtons, ...restOptions } = options;
         
         this.options = {
             wsUrl: 'ws://localhost:8765',
@@ -628,11 +635,23 @@ export class RDPClient {
             mouseThrottleMs: 16,
             resizeDebounceMs: 2000,
             keepConnectionModalOpen: false,
+            loadingSpinnerOpensModal: true,
             minWidth: 0,    // Minimum canvas width (0 = no minimum, scrollbar appears if container is smaller)
             minHeight: 0,   // Minimum canvas height (0 = no minimum, scrollbar appears if container is smaller)
             theme: null,
+            visibleTopBarButtons: {
+                connect: true,
+                disconnect: true,
+                screenshot: true,
+                fullscreen: true,
+                ...restOptions.visibleTopBarButtons
+            },
             ...restOptions
         };
+        
+        // Validate and freeze additional top bar buttons (max 4)
+        // Deep copy to prevent external mutation, callbacks stored separately
+        this._additionalButtonConfigs = this._validateAdditionalButtons(additionalTopBarButtons || []);
         
         // Initialize security policy as private frozen field
         // Deep frozen by default to prevent tampering
@@ -838,10 +857,114 @@ export class RDPClient {
             keyboardResize: $('.rdp-keyboard-resize'),
         };
         
+        // Apply button visibility based on visibleTopBarButtons option
+        const btns = this.options.visibleTopBarButtons;
+        if (!btns.connect) this._el.btnConnect.style.display = 'none';
+        if (!btns.disconnect) this._el.btnDisconnect.style.display = 'none';
+        if (!btns.screenshot) this._el.btnScreenshot.style.display = 'none';
+        if (!btns.fullscreen) this._el.btnFullscreen.style.display = 'none';
+        
+        // Create additional custom buttons at the start of controls
+        this._createAdditionalButtons();
+        
         this._canvas = this._el.canvas;
         
         // Initialize GFX worker - OffscreenCanvas is required
         this._initGfxWorker();
+    }
+    
+    /**
+     * Validate and sanitize additional button configurations
+     * @param {Array} buttons - Raw button config array
+     * @returns {Array} Validated and frozen button configs with callbacks stored separately
+     * @private
+     */
+    _validateAdditionalButtons(buttons) {
+        if (!Array.isArray(buttons)) {
+            console.warn('[RDPClient] additionalTopBarButtons must be an array, ignoring');
+            return [];
+        }
+        
+        const MAX_BUTTONS = 4;
+        const validated = [];
+        
+        for (let i = 0; i < Math.min(buttons.length, MAX_BUTTONS); i++) {
+            const btn = buttons[i];
+            
+            // Validate required properties
+            if (!btn || typeof btn !== 'object') {
+                console.warn(`[RDPClient] additionalTopBarButtons[${i}] is not an object, skipping`);
+                continue;
+            }
+            
+            if (typeof btn.name !== 'string' || btn.name.trim() === '') {
+                console.warn(`[RDPClient] additionalTopBarButtons[${i}].name must be a non-empty string, skipping`);
+                continue;
+            }
+            
+            if (typeof btn.click !== 'function') {
+                console.warn(`[RDPClient] additionalTopBarButtons[${i}].click must be a function, skipping`);
+                continue;
+            }
+            
+            // Store config with callback reference (callbacks can't be frozen/cloned)
+            validated.push({
+                name: btn.name.trim(),
+                callback: btn.click  // Store original function reference
+            });
+        }
+        
+        if (buttons.length > MAX_BUTTONS) {
+            console.warn(`[RDPClient] additionalTopBarButtons limited to ${MAX_BUTTONS} buttons, ignoring extras`);
+        }
+        
+        return validated;
+    }
+    
+    /**
+     * Create additional custom buttons in the top bar controls
+     * Buttons are inserted at the beginning of .rdp-controls
+     * Click handlers are isolated to prevent access to RDPClient internals
+     * @private
+     */
+    _createAdditionalButtons() {
+        if (!this._additionalButtonConfigs || this._additionalButtonConfigs.length === 0) {
+            return;
+        }
+        
+        const controlsContainer = this._shadow.querySelector('.rdp-controls');
+        if (!controlsContainer) {
+            console.warn('[RDPClient] Could not find .rdp-controls container');
+            return;
+        }
+        
+        // Create buttons in reverse order so they appear in original order when prepended
+        const fragment = document.createDocumentFragment();
+        
+        for (const config of this._additionalButtonConfigs) {
+            const btn = document.createElement('button');
+            btn.className = 'rdp-btn rdp-btn-additional';
+            btn.textContent = config.name;
+            btn.title = config.name;
+            
+            // Isolate callback - call with null context and catch errors
+            // This prevents the user's callback from accessing 'this' (RDPClient)
+            const userCallback = config.callback;
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                try {
+                    // Call with null context, pass only button name for identification
+                    userCallback.call(null, { buttonName: config.name });
+                } catch (err) {
+                    console.error('[RDPClient] Additional button callback error:', err);
+                }
+            });
+            
+            fragment.appendChild(btn);
+        }
+        
+        // Insert all buttons at the start of controls
+        controlsContainer.prepend(fragment);
     }
     
     /**
@@ -1037,12 +1160,14 @@ export class RDPClient {
         this._el.btnFullscreen.addEventListener('click', () => this._toggleFullscreen());
         
         // Loading area - click to open modal if not connected/connecting
-        this._el.loading.addEventListener('click', () => {
-            if (!this._isConnected && !this._pendingConnect) {
-                this._showModal();
-            }
-        });
-        this._el.loading.style.cursor = 'pointer';
+        if (this.options.loadingSpinnerOpensModal) {
+            this._el.loading.addEventListener('click', () => {
+                if (!this._isConnected && !this._pendingConnect) {
+                    this._showModal();
+                }
+            });
+            this._el.loading.style.cursor = 'pointer';
+        }
         
         // Modal
         this._el.modalConnect.addEventListener('click', () => this._handleModalConnect());
