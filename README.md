@@ -265,6 +265,8 @@ The RDP client supports a security policy to restrict which destinations users c
 
 The security policy is **immutable by design** - it uses JavaScript private class fields and deep freezing to prevent tampering after initialization.
 
+**Want to learn more?** See the complete [Security Policy Guide](./CREATING-SECURITY-POLICY.md) for detailed explanations, examples, and best practices.
+
 #### Quick Start
 
 ```javascript
