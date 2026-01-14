@@ -960,25 +960,25 @@ The RDPGFX channel (MS-RDPEGFX) provides a client-side compositor with off-main-
                                            WebSocket Binary Messages             │
                                            (SURF, H264, TILE, WEBP, ...)         │
                                                                                  ▼
-┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                   Browser                                                      │
-│  ┌───────────────────────┐           postMessage          ┌───────────────────────────┐                        │
-│  │      Main Thread      │ ─────────────────────────────► │       GFX Worker          │                        │
-│  │  • WebSocket receive  │                                │  • Wire format parsing    │                        │
-│  │  • Opus AudioDecoder  │ ◄───────────────────────────── │  • Surface management     │                        │
-│  │  • Keyboard/mouse     │              frameAck          │  • H.264 VideoDecoder     │                        │
-│  │  • UI events          │                                │  • Tile decoding          │                        │
-│  └──────────┬────────────┘                                │  • Frame composition      │                        │
-│             │ SharedArrayBuffer                           │  • OffscreenCanvas render │                        │
-│             │ (ring buffer)                               └───────────────────────────┘                        │
-│             ▼                                                                                                  │
-│  ┌───────────────────────┐                                                                                     │
-│  │     AudioWorklet      │  Low-latency audio thread (~5-20ms latency)                                         │
-│  │  • Ring buffer read   │  - Reads samples via Atomics from SharedArrayBuffer                                 │
-│  │  • 128-sample output  │  - Outputs 128 samples per process() call                                           │
-│  │  • Underrun detection │  - Outputs silence when buffer empty                                                │
-│  └───────────────────────┘                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                   Browser                                │
+│  ┌───────────────────────┐           postMessage          ┌───────────────────────────┐  │
+│  │      Main Thread      │ ─────────────────────────────► │       GFX Worker          │  │
+│  │  • WebSocket receive  │                                │  • Wire format parsing    │  │
+│  │  • Opus AudioDecoder  │ ◄───────────────────────────── │  • Surface management     │  │
+│  │  • Keyboard/mouse     │              frameAck          │  • H.264 VideoDecoder     │  │
+│  │  • UI events          │                                │  • Tile decoding          │  │
+│  └──────────┬────────────┘                                │  • Frame composition      │  │
+│             │ SharedArrayBuffer                           │  • OffscreenCanvas render │  │
+│             │ (ring buffer)                               └───────────────────────────┘  │
+│             ▼                                                                            │
+│  ┌───────────────────────┐                                                               │
+│  │     AudioWorklet      │  Low-latency audio thread (~5-20ms latency)                   │
+│  │  • Ring buffer read   │  - Reads samples via Atomics from SharedArrayBuffer           │
+│  │  • 128-sample output  │  - Outputs 128 samples per process() call                     │
+│  │  • Underrun detection │  - Outputs silence when buffer empty                          │
+│  └───────────────────────┘                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Wire Format Protocol
