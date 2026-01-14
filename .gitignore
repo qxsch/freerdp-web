@@ -3,4 +3,5 @@
 /.github/agents/*.md
 /edge-console.log
 /wasmbuild/*
+/frontendbuild.zip
 /frontend/index2.html
