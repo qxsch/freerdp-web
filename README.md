@@ -945,21 +945,21 @@ The RDPGFX channel (MS-RDPEGFX) provides a client-side compositor with off-main-
 
 ### GFX Event Streaming Architecture
 ```
-┌─────────────┐    AVC444/420     ┌─────────────────┐    Wire Format    ┌──────────────────┐
-│  Windows VM │ ──────────────►   │  Native Bridge  │ ─────────────────►│  GFX Event Queue │
-│   (Desktop) │   GFX Commands    │  (C Library)    │   SURF/TILE/H264  │  (Thread-safe)   │
-└─────────────┘                   └─────────────────┘                   └──────────────────┘
-                                         │                                       │
-                                         │ FFmpeg Transcode                      │
-                                         │ (AVC444 → AVC420)                     ▼
-                                         │                              ┌──────────────────┐
-                                         │                              │  Python Backend  │
-                                         └──────────────────────────────│  (WebSocket)     │
-                                                                        └──────────────────┘
-                                                                                 │
-                                           WebSocket Binary Messages             │
-                                           (SURF, H264, TILE, WEBP, ...)         │
-                                                                                 ▼
+┌─────────────┐    AVC444/420  ┌─────────────────┐    Wire Format    ┌──────────────────┐
+│  Windows VM │ ──────────────►│  Native Bridge  │ ─────────────────►│  GFX Event Queue │
+│   (Desktop) │   GFX Commands │  (C Library)    │   SURF/TILE/H264  │  (Thread-safe)   │
+└─────────────┘                └─────────────────┘                   └──────────────────┘
+                                      │                                       │
+                                      │ FFmpeg Transcode                      │
+                                      │ (AVC444 → AVC420)                     ▼
+                                      │                              ┌──────────────────┐
+                                      │                              │  Python Backend  │
+                                      └──────────────────────────────│  (WebSocket)     │
+                                                                     └──────────────────┘
+                                                                              │
+                                        WebSocket Binary Messages             │
+                                        (SURF, H264, TILE, WEBP, ...)         │
+                                                                              ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
 │                                                   Browser                                │
 │  ┌───────────────────────┐           postMessage          ┌───────────────────────────┐  │
