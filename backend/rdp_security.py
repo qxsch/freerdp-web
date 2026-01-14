@@ -446,13 +446,7 @@ def load_security_policy_from_env() -> RDPSecurityPolicy:
     
     if regex_patterns:
         policy_data['allowedDestinationRegex'] = regex_patterns
-        logger.debug(f"[RDPSecurityPolicy] Loaded {len(regex_patterns)} regex patterns from environment")
-    
-    if policy_data:
-        logger.info(f"[RDPSecurityPolicy] Loaded security policy from environment variables")
-    else:
-        logger.debug(f"[RDPSecurityPolicy] No security policy found in environment variables")
-    
+        
     return create_security_policy(policy_data)
 
 
