@@ -826,6 +826,10 @@ export class RDPClient {
         
         // Event callbacks
         this._eventHandlers = {};
+        
+        // Disconnect state
+        this._pendingDisconnect = null;
+        this._disconnectTimeout = null;
     }
 
     _bindElements() {
@@ -1283,13 +1287,47 @@ export class RDPClient {
 
     /**
      * Disconnect from the RDP server
+     * @returns {Promise<void>} Resolves when disconnection is complete
      */
     disconnect() {
-        if (this._ws) {
+        return new Promise((resolve) => {
+            // If already disconnected or no WebSocket, resolve immediately
+            if (!this._ws || this._ws.readyState === WebSocket.CLOSED) {
+                if (this._isConnected) {
+                    this._handleDisconnect();
+                }
+                resolve();
+                return;
+            }
+            
+            // If disconnect already in progress, chain to existing promise
+            if (this._pendingDisconnect) {
+                this._pendingDisconnect.then(resolve);
+                return;
+            }
+            
+            // Store pending disconnect resolver
+            let resolveDisconnect;
+            this._pendingDisconnect = new Promise((r) => { resolveDisconnect = r; });
+            this._pendingDisconnect.resolve = resolveDisconnect;
+            this._pendingDisconnect.then(resolve);
+            
+            // Send disconnect message to server
             this._sendMessage({ type: 'disconnect' });
+            
+            // Close WebSocket (will trigger onclose -> _handleDisconnect)
             this._ws.close();
-        }
-        this._handleDisconnect();
+            
+            // Timeout fallback - force cleanup after 3 seconds
+            this._disconnectTimeout = setTimeout(() => {
+                if (this._pendingDisconnect) {
+                    console.warn('[RDPClient] Disconnect timeout, forcing cleanup');
+                    this._handleDisconnect();
+                    this._pendingDisconnect.resolve();
+                    this._pendingDisconnect = null;
+                }
+            }, 3000);
+        });
     }
 
     /**
@@ -1547,9 +1585,10 @@ export class RDPClient {
 
     /**
      * Destroy the client and clean up resources
+     * @returns {Promise<void>} Resolves when destruction is complete
      */
-    destroy() {
-        this.disconnect();
+    async destroy() {
+        await this.disconnect();
         if (this._gfxWorker) {
             this._gfxWorker.terminate();
             this._gfxWorker = null;
@@ -1797,6 +1836,18 @@ export class RDPClient {
         // Auto-show modal when keepConnectionModalOpen is enabled
         if (this.options.keepConnectionModalOpen) {
             this._showModal();
+        }
+        
+        // Clear disconnect timeout
+        if (this._disconnectTimeout) {
+            clearTimeout(this._disconnectTimeout);
+            this._disconnectTimeout = null;
+        }
+        
+        // Resolve pending disconnect promise
+        if (this._pendingDisconnect) {
+            this._pendingDisconnect.resolve();
+            this._pendingDisconnect = null;
         }
     }
     

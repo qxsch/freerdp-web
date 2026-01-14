@@ -429,6 +429,7 @@ void* rdp_get_session_audio_context(void* session_ptr)
 
 #define LOG_BUFFER_SIZE 4096
 
+#if ENABLE_VERBOSE_SETTINGS_LOG
 static void log_settings(rdpSettings* settings, const char* phase)
 {
     char buf[LOG_BUFFER_SIZE];
@@ -499,6 +500,14 @@ static void log_settings(rdpSettings* settings, const char* phase)
     
     log_stderr(buf);
 }
+#else
+/* Stub when verbose logging is disabled */
+static void log_settings(rdpSettings* settings, const char* phase)
+{
+    (void)settings;
+    (void)phase;
+}
+#endif /* ENABLE_VERBOSE_SETTINGS_LOG */
 
 /**
  * Queue init settings event for frontend (mirrors log_settings)
@@ -561,6 +570,7 @@ static void queue_init_settings(BridgeContext* ctx, rdpSettings* settings)
             color_depth, flags_low);
 }
 
+#if ENABLE_VERBOSE_SETTINGS_LOG
 static void log_caps_confirm(UINT32 version, UINT32 flags)
 {
     char buf[LOG_BUFFER_SIZE];
@@ -632,6 +642,14 @@ static void log_caps_confirm(UINT32 version, UINT32 flags)
     
     log_stderr(buf);
 }
+#else
+/* Stub when verbose logging is disabled */
+static void log_caps_confirm(UINT32 version, UINT32 flags)
+{
+    (void)version;
+    (void)flags;
+}
+#endif /* ENABLE_VERBOSE_SETTINGS_LOG */
 
 /* ============================================================================
  * Session Lifecycle
@@ -784,7 +802,7 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE)) goto fail;
     if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, FALSE)) goto fail;
     
-    /* Log all settings for troubleshooting */
+    /* Log all settings for troubleshooting - and also send to the gfx_queue */
     log_settings(settings, "rdp_create");
 
     /* Add rdpsnd to STATIC channel collection with sys:bridge */

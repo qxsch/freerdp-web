@@ -8,6 +8,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Build shared library
 set(BUILD_SHARED_LIBS ON)
 
+# Option to enable verbose settings/caps logging (disabled by default)
+option(ENABLE_VERBOSE_SETTINGS_LOG "Enable verbose logging of RDP settings and capabilities" OFF)
+
 # Find FreeRDP3 packages
 find_package(PkgConfig REQUIRED)
 
@@ -86,6 +89,11 @@ target_compile_options(rdp_bridge PRIVATE
     -Wextra
     -O2
 )
+
+# Compile definitions
+if(ENABLE_VERBOSE_SETTINGS_LOG)
+    target_compile_definitions(rdp_bridge PRIVATE ENABLE_VERBOSE_SETTINGS_LOG=1)
+endif()
 
 # Set library properties
 set_target_properties(rdp_bridge PROPERTIES
