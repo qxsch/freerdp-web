@@ -547,6 +547,7 @@ document.body.style.background = themes.midnight.colors.background;
 | `'resize'` | `{ width, height }` | Resolution changed |
 | `'latency'` | `{ latencyMs }` | Latency measurement updated (every 5 seconds) |
 | `'error'` | `{ message }` | Error occurred |
+| `'mute'` | `{ muted }` | Audio mute state changed |
 | `'keyboardShow'` | - | Virtual keyboard was shown |
 | `'keyboardHide'` | - | Virtual keyboard was hidden |
 

@@ -1257,6 +1257,7 @@ export class RDPClient {
             this._audioWorklet.port.postMessage({ type: 'mute', data: { muted } });
         }
         this._el.btnMute.textContent = muted ? '🔇' : '🔊';
+        this._emit('mute', { muted });
     }
 
     /**

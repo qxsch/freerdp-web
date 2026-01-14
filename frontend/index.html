@@ -287,6 +287,10 @@ client.setTheme({
             console.log(`Resolution changed to ${width}x${height}`);
         });
 
+        client.on('mute', ({ muted }) => {
+            console.log('Audio mute state changed:', muted);
+        });
+
 
         // --------------------------------------------
         // from here we have just demo UI Related stuff
