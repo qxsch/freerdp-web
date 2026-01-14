@@ -1,3 +1,7 @@
+param(
+    [switch]$AsZipFile
+)
+
 # current path of the script
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -67,6 +71,27 @@ foreach($dir in Get-ChildItem -Path $wasmBuildDir -Recurse -Directory | Where-Ob
 
 Remove-Item (Join-Path $wasmBuildDir "Dockerfile") -Force
 Remove-Item (Join-Path $wasmBuildDir "nginx.conf") -Force
+if(Test-Path (Join-Path $wasmBuildDir ".gitignore")) {
+    Remove-Item (Join-Path $wasmBuildDir ".gitignore") -Force
+}
+if(Test-Path (Join-Path $wasmBuildDir "index2.html")) {
+    Remove-Item (Join-Path $wasmBuildDir "index2.html") -Force
+}
+
+if($AsZipFile) {
+    $zipPath = Join-Path $scriptDir "frontendbuild.zip"
+    if(Test-Path $zipPath) {
+        Write-Host "Removing existing zip file..."
+        Remove-Item -Force $zipPath
+    }
+    Write-Host "Creating zip archive of wasmbuild directory..."
+    Get-ChildItem -Path $wasmBuildDir | Compress-Archive -DestinationPath $zipPath
+    Remove-Item -Recurse -Force $wasmBuildDir
+    Write-Host -ForegroundColor Green "WASM build completed. Output is zipped at 'frontendbuild.zip'."
+}
+else {
+    Write-Host -ForegroundColor Green "WASM build completed. Output is in the 'wasmbuild' directory."
+}
 
 Write-Host -ForegroundColor Green "WASM build completed. Output is in the 'wasmbuild' directory."
 Write-Host -ForegroundColor Green " - do not forget the set the appropriate headers for .wasm files when serving via HTTP."
