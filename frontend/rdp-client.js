@@ -186,6 +186,10 @@ const STYLES = `
     text-align: center;
 }
 
+.rdp-loading p {
+    color: #ccc;
+}
+
 .rdp-spinner {
     width: 36px;
     height: 36px;
