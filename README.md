@@ -290,6 +290,19 @@ const client = new RDPClient(container, {
 
 > **Note**: If no security policy is provided, or if all arrays are empty, all connections are allowed. When at least one rule is defined, only destinations matching at least one rule will be permitted.
 
+#### Backend Security Policy (Environment Variables Fallback)
+
+The backend primarily loads security policies from a JSON file (see [Security Policy Guide](./CREATING-SECURITY-POLICY.md)). As a fallback when no file-based policy exists, the backend can load policies from environment variables:
+
+```bash
+export SECURITY_ALLOWED_HOSTNAMES="*.internal.mycompany.com, *.prod.mycompany.com"
+export SECURITY_ALLOWED_IPV4_CIDRS="10.0.0.0/8, 172.16.0.0/12"
+export SECURITY_ALLOWED_DEST_REGEX="^jumpbox\\.dmz\\.mycompany\\.com:3389$"
+export SECURITY_ALLOWED_DEST_REGEX_1="^backup\\.corp:3389$"
+```
+
+> ⚠️ **Not Recommended**: Environment variable configuration is provided only as a fallback. **The file-based approach is highly recommended** for production deployments. See [CREATING-SECURITY-POLICY.md](./CREATING-SECURITY-POLICY.md) for details.
+
 #### Hostname Glob Patterns
 
 The `allowedHostnames` option supports full glob pattern matching:

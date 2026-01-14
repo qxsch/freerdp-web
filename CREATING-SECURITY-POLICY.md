@@ -348,6 +348,52 @@ COPY rdp-bridge-policy.json /app/security/
 
 Build and run:
 
+### Option 3: Environment Variables (Not Recommended)
+
+> ⚠️ **Warning**: Environment variable configuration is provided as a fallback for scenarios where file-based configuration is not possible. **The file-based approach (Option 1 or 2) is highly recommended** for production deployments as it provides better auditability, version control, and separation of concerns.
+
+The backend can load security policies from environment variables **only when no file-based policy exists or the file-based policy is empty**. File-based policies always take priority.
+
+#### Environment Variables
+
+| Variable | Format | Description |
+|----------|--------|-------------|
+| `SECURITY_ALLOWED_HOSTNAMES` | Comma-separated | Hostname glob patterns (whitespace is trimmed) |
+| `SECURITY_ALLOWED_IPV4_CIDRS` | Comma-separated | IPv4 CIDR ranges (whitespace is trimmed) |
+| `SECURITY_ALLOWED_DEST_REGEX` | Single regex-pattern | Destination regex pattern |
+| `SECURITY_ALLOWED_DEST_REGEX_N` | Single regex-pattern | Additional regex patterns where N is a number (e.g., `_1`, `_2`) |
+
+#### Example
+
+```bash
+# In docker-compose.yml or docker run
+export SECURITY_ALLOWED_HOSTNAMES="*.internal.mycompany.com, *.prod.mycompany.com, *.dev.mycompany.com"
+export SECURITY_ALLOWED_IPV4_CIDRS="10.0.0.0/8, 172.16.0.0/12"
+export SECURITY_ALLOWED_DEST_REGEX="^jumpbox\\.dmz\\.mycompany\\.com:3389$"
+export SECURITY_ALLOWED_DEST_REGEX_1="^backup\\.corp:3389$"
+export SECURITY_ALLOWED_DEST_REGEX_2="^monitoring\\.corp:3389$"
+```
+
+Or in `docker-compose.yml`:
+
+```yaml
+services:
+  backend:
+    image: qxsch/freerdpwebbackend:latest
+    ports:
+      - "8765:8765"
+    environment:
+      - SECURITY_ALLOWED_HOSTNAMES=*.internal.mycompany.com, *.prod.mycompany.com
+      - SECURITY_ALLOWED_IPV4_CIDRS=10.0.0.0/8, 172.16.0.0/12
+      - SECURITY_ALLOWED_DEST_REGEX=^jumpbox\\.dmz\\.mycompany\\.com:3389$$
+```
+
+#### Important Notes
+
+1. **File-based policies always have priority** — If a valid policy file exists with rules, environment variables are ignored
+2. **Multiple regex patterns** — Use numbered variables (`SECURITY_ALLOWED_DEST_REGEX_1`, `_2`, etc.) for additional patterns
+3. **Escaping** — Remember to escape backslashes properly for your shell (use `\\` in most cases)
+
 ```bash
 # Create your policy file
 cat > rdp-bridge-policy.json << 'EOF'

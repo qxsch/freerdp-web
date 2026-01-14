@@ -387,13 +387,85 @@ def get_security_policy_path() -> str:
     return os.environ.get(SECURITY_POLICY_PATH_ENV, DEFAULT_SECURITY_POLICY_PATH)
 
 
+def load_security_policy_from_env() -> RDPSecurityPolicy:
+    """
+    Load security policy from environment variables.
+    
+    Environment variables:
+        SECURITY_ALLOWED_HOSTNAMES: Comma-separated list of hostname glob patterns
+        SECURITY_ALLOWED_IPV4_CIDRS: Comma-separated list of IPv4 CIDR ranges
+        SECURITY_ALLOWED_DEST_REGEX: A destination regex pattern
+        SECURITY_ALLOWED_DEST_REGEX_N: Additional regex patterns where N is a number (e.g., _1, _2, etc.)
+    
+    Each entry in comma-separated lists will be trimmed of whitespace.
+    
+    Returns:
+        Security policy instance
+    """
+    policy_data: Dict[str, Any] = {}
+    
+    # Load allowed hostnames (comma-separated, trimmed)
+    hostnames_env = os.environ.get('SECURITY_ALLOWED_HOSTNAMES', '').strip()
+    if hostnames_env:
+        hostnames = [h.strip() for h in hostnames_env.split(',') if h.strip()]
+        if hostnames:
+            policy_data['allowedHostnames'] = hostnames
+    
+    # Load allowed IPv4 CIDRs (comma-separated, trimmed)
+    cidrs_env = os.environ.get('SECURITY_ALLOWED_IPV4_CIDRS', '').strip()
+    if cidrs_env:
+        cidrs = [c.strip() for c in cidrs_env.split(',') if c.strip()]
+        if cidrs:
+            policy_data['allowedIpv4Cidrs'] = cidrs
+    
+    # Load allowed destination regex patterns
+    # First check SECURITY_ALLOWED_DEST_REGEX, then SECURITY_ALLOWED_DEST_REGEX_N
+    regex_patterns: List[str] = []
+    
+    # Check base regex variable
+    base_regex = os.environ.get('SECURITY_ALLOWED_DEST_REGEX', '').strip()
+    if base_regex:
+        regex_patterns.append(base_regex)
+    
+    # Check numbered regex variables (SECURITY_ALLOWED_DEST_REGEX_1, _2, etc.)
+    regex_pattern = re.compile(r'^SECURITY_ALLOWED_DEST_REGEX_(\d+)$')
+    numbered_vars: List[Tuple[int, str]] = []
+    
+    for env_key, env_value in os.environ.items():
+        match = regex_pattern.match(env_key)
+        if match:
+            num = int(match.group(1))
+            value = env_value.strip()
+            if value:
+                numbered_vars.append((num, value))
+    
+    # Sort by number and add to patterns
+    numbered_vars.sort(key=lambda x: x[0])
+    for _, pattern in numbered_vars:
+        regex_patterns.append(pattern)
+    
+    if regex_patterns:
+        policy_data['allowedDestinationRegex'] = regex_patterns
+        logger.debug(f"[RDPSecurityPolicy] Loaded {len(regex_patterns)} regex patterns from environment")
+    
+    if policy_data:
+        logger.info(f"[RDPSecurityPolicy] Loaded security policy from environment variables")
+    else:
+        logger.debug(f"[RDPSecurityPolicy] No security policy found in environment variables")
+    
+    return create_security_policy(policy_data)
+
+
 # Singleton instance for global use
 _global_security_policy: Optional[RDPSecurityPolicy] = None
 
 
 def get_security_policy() -> RDPSecurityPolicy:
     """
-    Get the global security policy instance, loading from file if not already loaded.
+    Get the global security policy instance.
+    
+    First loads from file. If the file-based policy has no rules,
+    falls back to loading from environment variables.
     
     Returns:
         The global security policy instance
@@ -401,16 +473,31 @@ def get_security_policy() -> RDPSecurityPolicy:
     global _global_security_policy
     if _global_security_policy is None:
         _global_security_policy = load_security_policy_from_file()
+        # If file-based policy is empty, try environment variables as fallback
+        if not _global_security_policy.has_rules():
+            env_policy = load_security_policy_from_env()
+            if env_policy.has_rules():
+                logger.info("[RDPSecurityPolicy] Using environment-based policy as fallback")
+                _global_security_policy = env_policy
     return _global_security_policy
 
 
 def reload_security_policy() -> RDPSecurityPolicy:
     """
-    Reload the global security policy from file.
+    Reload the global security policy.
+    
+    First loads from file. If the file-based policy has no rules,
+    falls back to loading from environment variables.
     
     Returns:
         The newly loaded security policy instance
     """
     global _global_security_policy
     _global_security_policy = load_security_policy_from_file()
+    # If file-based policy is empty, try environment variables as fallback
+    if not _global_security_policy.has_rules():
+        env_policy = load_security_policy_from_env()
+        if env_policy.has_rules():
+            logger.info("[RDPSecurityPolicy] Using environment-based policy as fallback")
+            _global_security_policy = env_policy
     return _global_security_policy
