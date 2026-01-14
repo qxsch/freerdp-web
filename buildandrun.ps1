@@ -4,14 +4,26 @@ param(
     [string]$image = "",
     [switch]$NoCache,
     [switch]$SmartChache,
-    [switch]$JustRun
+    [switch]$JustRun,
+    [switch]$JustBuild,
+    [switch]$PullLatestBaseImage
 )
 
-if($JustRun -and $NoCache) {
-    throw "Cannot use -JustRun and -NoCache together."
+if($JustRun -and ($NoCache -or $SmartChache -or $PullLatestBaseImage)) {
+    throw "Cannot use -JustRun together with -NoCache or -SmartChache or -PullLatestBaseImage."
 }
 if($SmartChache -and $NoCache) {
     throw "Cannot use -SmartChache and -NoCache together."
+}
+if($SmartChache -and $PullLatestBaseImage) {
+    throw "Cannot use -SmartChache and -PullLatestBaseImage together."
+}
+if($PullLatestBaseImage -and ($NoCache -eq $false)) {
+    $NoCache = $true
+    Write-Host "Note: -PullLatestBaseImage implies -NoCache, so enabling -NoCache."
+}
+if($JustRun -and $JustBuild) {
+    throw "Cannot use -JustRun and -JustBuild together."
 }
 
 # current path of the script
@@ -25,9 +37,17 @@ if($image -eq "frontend") {
         try {
             if($NoCache) {
                 docker rmi rdp-frontend:latest | Out-Null
-                docker build --no-cache -t rdp-frontend .
-                if($LASTEXITCODE -ne 0) {
-                    throw "Docker build failed with exit code $LASTEXITCODE"
+                if($PullLatestBaseImage) {
+                    docker build --no-cache --pull -t rdp-frontend .
+                    if($LASTEXITCODE -ne 0) {
+                        throw "Docker build failed with exit code $LASTEXITCODE"
+                    }
+                }
+                else {
+                    docker build --no-cache -t rdp-frontend .
+                    if($LASTEXITCODE -ne 0) {
+                        throw "Docker build failed with exit code $LASTEXITCODE"
+                    }
                 }
             }
             else {
@@ -41,7 +61,9 @@ if($image -eq "frontend") {
             Set-Location $scriptDir
         }
     }
-    docker run --rm -it -p 8000:8000 --name rdp-frontend rdp-frontend
+    if(-not $JustBuild) {
+        docker run --rm -it -p 8000:8000 --name rdp-frontend rdp-frontend
+    }
 }
 elseif($image -eq "backend") {
     Set-Location "$scriptDir/backend"
@@ -50,9 +72,17 @@ elseif($image -eq "backend") {
         try {
             if($NoCache) {
                 docker rmi rdp-backend:latest | Out-Null
-                docker build --no-cache -t rdp-backend .
-                if($LASTEXITCODE -ne 0) {
-                    throw "Docker build failed with exit code $LASTEXITCODE"
+                if($PullLatestBaseImage) {
+                    docker build --no-cache --pull -t rdp-backend .
+                    if($LASTEXITCODE -ne 0) {
+                        throw "Docker build failed with exit code $LASTEXITCODE"
+                    }
+                }
+                else {
+                    docker build --no-cache -t rdp-backend .
+                    if($LASTEXITCODE -ne 0) {
+                        throw "Docker build failed with exit code $LASTEXITCODE"
+                    }
                 }
             }
             else {
@@ -73,9 +103,11 @@ elseif($image -eq "backend") {
             Set-Location $scriptDir
         }
     }
-    # to test the security policy
-    # docker run --rm -it -p 8765:8765 -v "$scriptDir\backend\security:/app/security" --name rdp-backend  rdp-backend
-    docker run --rm -it -p 8765:8765 --name rdp-backend  rdp-backend
+    if(-not $JustBuild) {
+        # to test the security policy
+        # docker run --rm -it -p 8765:8765 -v "$scriptDir\backend\security:/app/security" --name rdp-backend  rdp-backend
+        docker run --rm -it -p 8765:8765 --name rdp-backend  rdp-backend
+    }
 }
 else {
     Write-Host "Please specify an image to build and run: -image frontend or -image backend"
