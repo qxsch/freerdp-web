@@ -141,6 +141,68 @@ const STYLES = `
 .rdp-btn:active { background: var(--rdp-btn-active-bg); color: var(--rdp-btn-active-text); }
 .rdp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* Overflow Menu */
+.rdp-overflow-container {
+    position: relative;
+}
+
+.rdp-btn-overflow {
+    display: none;
+    font-size: var(--rdp-font-size-small);
+    padding: 6px 10px;
+}
+
+.rdp-btn-overflow.visible {
+    display: inline-flex;
+}
+
+.rdp-overflow-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    background: var(--rdp-surface);
+    border: 1px solid var(--rdp-border);
+    border-radius: var(--rdp-border-radius);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    display: none;
+    flex-direction: column;
+    min-width: 140px;
+    z-index: 100;
+    padding: 4px 0;
+}
+
+.rdp-overflow-dropdown.open {
+    display: flex;
+}
+
+.rdp-overflow-dropdown .rdp-btn {
+    border-radius: 0;
+    text-align: left;
+    justify-content: flex-start;
+    white-space: nowrap;
+}
+
+.rdp-overflow-dropdown .rdp-btn:first-child {
+    border-radius: var(--rdp-border-radius) var(--rdp-border-radius) 0 0;
+}
+
+.rdp-overflow-dropdown .rdp-btn:last-child {
+    border-radius: 0 0 var(--rdp-border-radius) var(--rdp-border-radius);
+}
+
+.rdp-btn.rdp-collapsed {
+    display: none !important;
+}
+
+/* No word wrapping, single line text for buttons */
+.rdp-btn-no-wrap {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+}
+
 /* Screen Area */
 .rdp-screen-wrapper {
     flex: 1;
@@ -434,12 +496,16 @@ const TEMPLATE = `
             <span class="rdp-status-text">Disconnected</span>
         </div>
         <div class="rdp-controls">
-            <button class="rdp-btn rdp-btn-connect">Connect</button>
-            <button class="rdp-btn rdp-btn-disconnect" disabled>Disconnect</button>
-            <button class="rdp-btn rdp-btn-keyboard" disabled title="Toggle Virtual Keyboard">⌨️</button>
-            <button class="rdp-btn rdp-btn-mute" disabled title="Toggle Audio">🔊</button>
-            <button class="rdp-btn rdp-btn-screenshot" disabled title="Take Screenshot">📷</button>
-            <button class="rdp-btn rdp-btn-fullscreen">⛶</button>
+            <button class="rdp-btn rdp-btn-no-wrap rdp-btn-connect" data-collapse-priority="1">Connect</button>
+            <button class="rdp-btn rdp-btn-no-wrap rdp-btn-disconnect" data-collapse-priority="2" disabled>Disconnect</button>
+            <button class="rdp-btn rdp-btn-no-wrap rdp-btn-keyboard" data-collapse-priority="never" disabled title="Toggle Virtual Keyboard">⌨️</button>
+            <button class="rdp-btn rdp-btn-no-wrap rdp-btn-mute" data-collapse-priority="never" disabled title="Toggle Audio">🔊</button>
+            <button class="rdp-btn rdp-btn-no-wrap rdp-btn-screenshot" data-collapse-priority="never" disabled title="Take Screenshot">📷</button>
+            <button class="rdp-btn rdp-btn-no-wrap rdp-btn-fullscreen" data-collapse-priority="never">⛶</button>
+            <div class="rdp-overflow-container">
+                <button class="rdp-btn rdp-btn-overflow" title="More options">▼</button>
+                <div class="rdp-overflow-dropdown"></div>
+            </div>
         </div>
     </div>
 
@@ -623,13 +689,15 @@ export class RDPClient {
      * @param {Object} [options.visibleTopBarButtons] - Control visibility of top bar buttons
      * @param {boolean} [options.visibleTopBarButtons.connect=true] - Show Connect button
      * @param {boolean} [options.visibleTopBarButtons.disconnect=true] - Show Disconnect button
+     * @param {boolean} [options.visibleTopBarButtons.keyboard=true] - Show Keyboard button
+     * @param {boolean} [options.visibleTopBarButtons.mute=true] - Show Mute button
      * @param {boolean} [options.visibleTopBarButtons.screenshot=true] - Show Screenshot button
      * @param {boolean} [options.visibleTopBarButtons.fullscreen=true] - Show Fullscreen button
-     * @param {Array<{name: string, click: function}>} [options.additionalTopBarButtons=[]] - Custom buttons (max 4) added before built-in controls
+     * @param {Array<{name: string, click: function}>} [options.additionalTopBarButtons=[]] - Custom buttons (max 10) added before built-in controls. Buttons collapse into overflow menu when space is limited.
      */
     constructor(container, options = {}) {
         // Extract security policy before spreading options (we don't store it in this.options)
-        const { securityPolicy, additionalTopBarButtons, ...restOptions } = options;
+        const { securityPolicy, additionalTopBarButtons, visibleTopBarButtons, ...restOptions } = options;
         
         this.options = {
             wsUrl: 'ws://localhost:8765',
@@ -646,14 +714,16 @@ export class RDPClient {
             visibleTopBarButtons: {
                 connect: true,
                 disconnect: true,
+                keyboard: true,
+                mute: true,
                 screenshot: true,
                 fullscreen: true,
-                ...restOptions.visibleTopBarButtons
+                ...visibleTopBarButtons
             },
             ...restOptions
         };
         
-        // Validate and freeze additional top bar buttons (max 4)
+        // Validate and freeze additional top bar buttons (max 10)
         // Deep copy to prevent external mutation, callbacks stored separately
         this._additionalButtonConfigs = this._validateAdditionalButtons(additionalTopBarButtons || []);
         
@@ -667,6 +737,7 @@ export class RDPClient {
         this._applyMinDimensions();  // Apply min dimension CSS vars
         this._initState();
         this._bindElements();
+        this._initResponsiveToolbar();  // Setup responsive overflow handling
         this._setupEventListeners();
         
         // Auto-show modal on init when keepConnectionModalOpen is enabled
@@ -863,12 +934,18 @@ export class RDPClient {
             keyboardTitlebar: $('.rdp-keyboard-titlebar'),
             keyboardClose: $('.rdp-keyboard-close'),
             keyboardResize: $('.rdp-keyboard-resize'),
+            // Overflow menu elements
+            controls: $('.rdp-controls'),
+            btnOverflow: $('.rdp-btn-overflow'),
+            overflowDropdown: $('.rdp-overflow-dropdown'),
         };
         
         // Apply button visibility based on visibleTopBarButtons option
         const btns = this.options.visibleTopBarButtons;
         if (!btns.connect) this._el.btnConnect.style.display = 'none';
         if (!btns.disconnect) this._el.btnDisconnect.style.display = 'none';
+        if (!btns.keyboard) this._el.btnKeyboard.style.display = 'none';
+        if (!btns.mute) this._el.btnMute.style.display = 'none';
         if (!btns.screenshot) this._el.btnScreenshot.style.display = 'none';
         if (!btns.fullscreen) this._el.btnFullscreen.style.display = 'none';
         
@@ -893,7 +970,7 @@ export class RDPClient {
             return [];
         }
         
-        const MAX_BUTTONS = 4;
+        const MAX_BUTTONS = 10;
         const validated = [];
         
         for (let i = 0; i < Math.min(buttons.length, MAX_BUTTONS); i++) {
@@ -915,9 +992,20 @@ export class RDPClient {
                 continue;
             }
             
+            // Truncate name to 30 characters max
+            const MAX_NAME_LENGTH = 30;
+            let displayName = btn.name.trim();
+            const fullName = displayName;  // Store original for title attribute
+            
+            if (displayName.length > MAX_NAME_LENGTH) {
+                displayName = displayName.substring(0, MAX_NAME_LENGTH) + '...';
+                console.warn(`[RDPClient] additionalTopBarButtons[${i}].name exceeded ${MAX_NAME_LENGTH} characters, truncated to "${displayName}"`);
+            }
+            
             // Store config with callback reference (callbacks can't be frozen/cloned)
             validated.push({
-                name: btn.name.trim(),
+                name: displayName,
+                fullName: fullName,  // Original name for title tooltip
                 callback: btn.click  // Store original function reference
             });
         }
@@ -933,6 +1021,7 @@ export class RDPClient {
      * Create additional custom buttons in the top bar controls
      * Buttons are inserted at the beginning of .rdp-controls
      * Click handlers are isolated to prevent access to RDPClient internals
+     * Buttons get collapse priority based on their index (lower = collapses first)
      * @private
      */
     _createAdditionalButtons() {
@@ -949,11 +1038,16 @@ export class RDPClient {
         // Create buttons in reverse order so they appear in original order when prepended
         const fragment = document.createDocumentFragment();
         
+        // Priority starts at 10 for additional buttons (lower than built-in connect/disconnect)
+        // First additional button collapses first (priority 10), then 11, etc.
+        let priorityCounter = 10;
+        
         for (const config of this._additionalButtonConfigs) {
             const btn = document.createElement('button');
-            btn.className = 'rdp-btn rdp-btn-additional';
+            btn.className = 'rdp-btn rdp-btn-no-wrap';
             btn.textContent = config.name;
-            btn.title = config.name;
+            btn.title = config.fullName;  // Use full name for tooltip
+            btn.dataset.collapsePriority = String(priorityCounter++);
             
             // Isolate callback - call with null context and catch errors
             // This prevents the user's callback from accessing 'this' (RDPClient)
@@ -961,8 +1055,8 @@ export class RDPClient {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 try {
-                    // Call with null context, pass only button name for identification
-                    userCallback.call(null, { buttonName: config.name });
+                    // Call with null context, pass only button name for identification (use fullName)
+                    userCallback.call(null, { buttonName: config.fullName });
                 } catch (err) {
                     console.error('[RDPClient] Additional button callback error:', err);
                 }
@@ -973,6 +1067,220 @@ export class RDPClient {
         
         // Insert all buttons at the start of controls
         controlsContainer.prepend(fragment);
+    }
+    
+    /**
+     * Initialize responsive toolbar with overflow handling
+     * Sets up ResizeObserver to detect when buttons need to collapse into dropdown
+     * @private
+     */
+    _initResponsiveToolbar() {
+        // Track collapsed state
+        this._collapsedButtons = new Set();
+        this._overflowMenuOpen = false;
+        
+        // Get all collapsible buttons (those with data-collapse-priority that's not "never")
+        this._updateCollapsibleButtons();
+        
+        // Set up overflow button click handler
+        this._el.btnOverflow.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this._toggleOverflowMenu();
+        });
+        
+        // Close overflow menu when clicking outside
+        this._shadow.addEventListener('click', (e) => {
+            if (this._overflowMenuOpen && !e.target.closest('.rdp-overflow-container')) {
+                this._closeOverflowMenu();
+            }
+        });
+        
+        // Set up ResizeObserver on the topbar
+        const topbar = this._shadow.querySelector('.rdp-topbar');
+        if (topbar && typeof ResizeObserver !== 'undefined') {
+            this._toolbarResizeObserver = new ResizeObserver(() => {
+                this._updateToolbarOverflow();
+            });
+            this._toolbarResizeObserver.observe(topbar);
+            
+            // Initial check
+            requestAnimationFrame(() => this._updateToolbarOverflow());
+        }
+    }
+    
+    /**
+     * Update the list of collapsible buttons based on data-collapse-priority
+     * Should be called after adding/removing buttons
+     * @private
+     */
+    _updateCollapsibleButtons() {
+        const controls = this._el.controls;
+        if (!controls) return;
+        
+        // Get all buttons with collapse priority (not "never")
+        this._collapsibleButtons = Array.from(
+            controls.querySelectorAll('.rdp-btn[data-collapse-priority]')
+        ).filter(btn => btn.dataset.collapsePriority !== 'never')
+         .sort((a, b) => {
+             // Higher priority number = collapses first
+             const priorityA = parseInt(a.dataset.collapsePriority, 10) || 0;
+             const priorityB = parseInt(b.dataset.collapsePriority, 10) || 0;
+             return priorityB - priorityA;  // Descending order (highest first to collapse)
+         });
+    }
+    
+    /**
+     * Calculate if toolbar is overflowing and collapse/expand buttons accordingly
+     * @private
+     */
+    _updateToolbarOverflow() {
+        const controls = this._el.controls;
+        const topbar = this._shadow.querySelector('.rdp-topbar');
+        if (!controls || !topbar) return;
+        
+        const status = this._shadow.querySelector('.rdp-status');
+        const statusWidth = status ? status.offsetWidth : 0;
+        const topbarPadding = 32; // 16px padding on each side
+        const gap = 16; // gap between status and controls
+        const availableWidth = topbar.offsetWidth - statusWidth - topbarPadding - gap;
+        
+        // Temporarily show all buttons to measure
+        const wasCollapsed = new Set(this._collapsedButtons);
+        for (const btn of wasCollapsed) {
+            btn.classList.remove('rdp-collapsed');
+        }
+        this._el.btnOverflow.classList.remove('visible');
+        
+        // Measure controls width
+        let controlsWidth = controls.scrollWidth;
+        
+        // If controls fit, we're done
+        if (controlsWidth <= availableWidth) {
+            this._collapsedButtons.clear();
+            this._syncOverflowDropdown();
+            return;
+        }
+        
+        // Need to collapse buttons - start with highest priority (first to collapse)
+        this._collapsedButtons.clear();
+        const overflowBtnWidth = 40; // Approximate width of overflow button
+        
+        for (const btn of this._collapsibleButtons) {
+            // Check if button is visible (not hidden by visibleTopBarButtons)
+            if (btn.style.display === 'none') continue;
+            
+            // Check if we still need to collapse more
+            const currentWidth = this._measureVisibleControlsWidth();
+            if (currentWidth + (this._collapsedButtons.size > 0 ? overflowBtnWidth : 0) <= availableWidth) {
+                break;
+            }
+            
+            // Collapse this button
+            btn.classList.add('rdp-collapsed');
+            this._collapsedButtons.add(btn);
+        }
+        
+        // Show overflow button if we have collapsed buttons
+        this._syncOverflowDropdown();
+    }
+    
+    /**
+     * Measure the width of visible (non-collapsed) controls
+     * @returns {number} Width in pixels
+     * @private
+     */
+    _measureVisibleControlsWidth() {
+        const controls = this._el.controls;
+        let width = 0;
+        const gap = 8; // CSS gap between buttons
+        let visibleCount = 0;
+        
+        for (const child of controls.children) {
+            if (child.classList.contains('rdp-overflow-container')) continue;
+            if (child.classList.contains('rdp-collapsed')) continue;
+            if (child.style.display === 'none') continue;
+            
+            width += child.offsetWidth;
+            visibleCount++;
+        }
+        
+        // Add gaps between buttons
+        if (visibleCount > 1) {
+            width += (visibleCount - 1) * gap;
+        }
+        
+        return width;
+    }
+    
+    /**
+     * Sync the overflow dropdown with collapsed buttons
+     * @private
+     */
+    _syncOverflowDropdown() {
+        const dropdown = this._el.overflowDropdown;
+        if (!dropdown) return;
+        
+        // Clear dropdown
+        dropdown.innerHTML = '';
+        
+        if (this._collapsedButtons.size === 0) {
+            this._el.btnOverflow.classList.remove('visible');
+            this._closeOverflowMenu();
+            return;
+        }
+        
+        // Show overflow button
+        this._el.btnOverflow.classList.add('visible');
+        
+        // Add collapsed buttons to dropdown (in reverse order so first collapsed appears last)
+        const sortedButtons = Array.from(this._collapsedButtons).reverse();
+        
+        for (const originalBtn of sortedButtons) {
+            const dropdownBtn = document.createElement('button');
+            dropdownBtn.className = 'rdp-btn';
+            dropdownBtn.textContent = originalBtn.textContent;
+            dropdownBtn.title = originalBtn.title || originalBtn.textContent;
+            dropdownBtn.disabled = originalBtn.disabled;
+            
+            // Clone click behavior
+            dropdownBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this._closeOverflowMenu();
+                originalBtn.click();
+            });
+            
+            dropdown.appendChild(dropdownBtn);
+        }
+    }
+    
+    /**
+     * Toggle the overflow dropdown menu
+     * @private
+     */
+    _toggleOverflowMenu() {
+        if (this._overflowMenuOpen) {
+            this._closeOverflowMenu();
+        } else {
+            this._openOverflowMenu();
+        }
+    }
+    
+    /**
+     * Open the overflow dropdown menu
+     * @private
+     */
+    _openOverflowMenu() {
+        this._el.overflowDropdown.classList.add('open');
+        this._overflowMenuOpen = true;
+    }
+    
+    /**
+     * Close the overflow dropdown menu
+     * @private
+     */
+    _closeOverflowMenu() {
+        this._el.overflowDropdown.classList.remove('open');
+        this._overflowMenuOpen = false;
     }
     
     /**
@@ -1595,6 +1903,9 @@ export class RDPClient {
         }
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
+        }
+        if (this._toolbarResizeObserver) {
+            this._toolbarResizeObserver.disconnect();
         }
         this._shadow.innerHTML = '';
     }
