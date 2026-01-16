@@ -93,7 +93,6 @@ else {
     Write-Host -ForegroundColor Green "WASM build completed. Output is in the 'wasmbuild' directory."
 }
 
-Write-Host -ForegroundColor Green "WASM build completed. Output is in the 'wasmbuild' directory."
 Write-Host -ForegroundColor Green " - do not forget the set the appropriate headers for .wasm files when serving via HTTP."
 Write-Host -ForegroundColor Green " - For SharedArrayBuffer support, also set the following headers:"
 Write-Host -ForegroundColor Green "     -> Cross-Origin-Opener-Policy: same-origin"
