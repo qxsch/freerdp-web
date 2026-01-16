@@ -230,6 +230,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 COPY .env.example .env.example
 
+# copy license
+COPY LICENSE ./LICENSE
+
 # Create .env if not exists
 RUN cp -n .env.example .env 2>/dev/null || true
 

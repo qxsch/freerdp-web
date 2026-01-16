@@ -45,6 +45,9 @@ COPY gfx-worker.js /usr/share/nginx/html/
 COPY audio-worklet.js /usr/share/nginx/html/
 COPY favicons/ /usr/share/nginx/html/favicons/
 
+# copy license
+COPY LICENSE /usr/share/nginx/html/LICENSE
+
 # Inject build timestamp into gfx-worker.js
 RUN BUILD_TIME=$(date +%H:%M:%S) && \
     sed -i "s/__BUILD_TIME__/$BUILD_TIME/g" /usr/share/nginx/html/gfx-worker.js && \
