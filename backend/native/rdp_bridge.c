@@ -141,8 +141,11 @@ typedef struct {
      * Note: ClearCodec and Progressive are passed through to browser for WASM decoding */
     BITMAP_PLANAR_CONTEXT* planar_decoder;
     
-    /* GFX event queue for wire format streaming (Python consumption) */
-    RdpGfxEvent gfx_events[RDP_MAX_GFX_EVENTS];
+    /* GFX event queue for wire format streaming (Python consumption)
+     * Dynamically allocated: starts at RDP_GFX_EVENTS_INITIAL, grows by
+     * RDP_GFX_EVENTS_GROW up to RDP_MAX_GFX_EVENTS */
+    RdpGfxEvent* gfx_events;
+    int gfx_events_capacity;
     int gfx_event_write_idx;
     int gfx_event_read_idx;
     int gfx_event_count;
@@ -179,8 +182,9 @@ static UINT gfx_on_delete_encoding_context(RdpgfxClientContext* context, const R
 static UINT gfx_on_cache_import_reply(RdpgfxClientContext* context, const RDPGFX_CACHE_IMPORT_REPLY_PDU* reply);
 static UINT gfx_on_open(RdpgfxClientContext* context, BOOL* do_caps_advertise, BOOL* do_frame_acks);
 
-/* GFX event queue helper */
+/* GFX event queue helpers */
 static void gfx_queue_event(BridgeContext* ctx, const RdpGfxEvent* event);
+static void gfx_free_event_data(RdpGfxEvent* event);
 
 /* WebP tile encoding helper */
 static void queue_webp_tile(BridgeContext* ctx, uint16_t surface_id,
@@ -702,8 +706,9 @@ RdpSession* rdp_create(
     ctx->primary_surface_id = 0;
     memset(ctx->surfaces, 0, sizeof(ctx->surfaces));
     
-    /* Initialize GFX event queue for wire format streaming */
-    memset(ctx->gfx_events, 0, sizeof(ctx->gfx_events));
+    /* Initialize GFX event queue for wire format streaming (dynamic allocation) */
+    ctx->gfx_events_capacity = RDP_GFX_EVENTS_INITIAL;
+    ctx->gfx_events = (RdpGfxEvent*)calloc(ctx->gfx_events_capacity, sizeof(RdpGfxEvent));
     ctx->gfx_event_write_idx = 0;
     ctx->gfx_event_read_idx = 0;
     ctx->gfx_event_count = 0;
@@ -1004,6 +1009,18 @@ void rdp_destroy(RdpSession* session)
     if (ctx->opus_buffer) {
         free(ctx->opus_buffer);
         ctx->opus_buffer = NULL;
+    }
+    
+    /* Free any pending GFX event data (allocated buffers in unread events) */
+    if (ctx->gfx_events) {
+        while (ctx->gfx_event_count > 0) {
+            RdpGfxEvent* event = &ctx->gfx_events[ctx->gfx_event_read_idx];
+            gfx_free_event_data(event);
+            ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % ctx->gfx_events_capacity;
+            ctx->gfx_event_count--;
+        }
+        free(ctx->gfx_events);
+        ctx->gfx_events = NULL;
     }
     
     freerdp_client_context_free(context);
@@ -3151,21 +3168,57 @@ static const char* gfx_event_type_name(int type) {
 /* Internal helper: queue a GFX event (caller must NOT hold gfx_event_mutex) */
 static void gfx_queue_event(BridgeContext* ctx, const RdpGfxEvent* event)
 {
-    if (!ctx || !event) return;
+    if (!ctx || !event || !ctx->gfx_events) return;
     
     pthread_mutex_lock(&ctx->gfx_event_mutex);
     
-    if (ctx->gfx_event_count >= RDP_MAX_GFX_EVENTS) {
-        /* Queue full - drop oldest event */
-        RdpGfxEvent* dropped = &ctx->gfx_events[ctx->gfx_event_read_idx];
-        fprintf(stderr, "[GFX] WARNING: Queue overflow! Dropping event type=%d (%s) frame=%u\n",
-                dropped->type, gfx_event_type_name(dropped->type), dropped->frame_id);
-        ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % RDP_MAX_GFX_EVENTS;
-        ctx->gfx_event_count--;
+    /* Check if queue needs to grow */
+    if (ctx->gfx_event_count >= ctx->gfx_events_capacity) {
+        if (ctx->gfx_events_capacity < RDP_MAX_GFX_EVENTS) {
+            /* Grow queue by RDP_GFX_EVENTS_GROW slots */
+            int new_capacity = ctx->gfx_events_capacity + RDP_GFX_EVENTS_GROW;
+            if (new_capacity > RDP_MAX_GFX_EVENTS) {
+                new_capacity = RDP_MAX_GFX_EVENTS;
+            }
+            
+            /* Allocate new buffer */
+            RdpGfxEvent* new_queue = (RdpGfxEvent*)calloc(new_capacity, sizeof(RdpGfxEvent));
+            if (new_queue) {
+                /* Copy existing events in order (linearize the ring buffer) */
+                int i;
+                for (i = 0; i < ctx->gfx_event_count; i++) {
+                    int src_idx = (ctx->gfx_event_read_idx + i) % ctx->gfx_events_capacity;
+                    new_queue[i] = ctx->gfx_events[src_idx];
+                }
+                
+                free(ctx->gfx_events);
+                ctx->gfx_events = new_queue;
+                ctx->gfx_events_capacity = new_capacity;
+                ctx->gfx_event_read_idx = 0;
+                ctx->gfx_event_write_idx = ctx->gfx_event_count;
+                
+                fprintf(stderr, "[GFX] Queue grown to %d slots (%d KB)\n",
+                        new_capacity, (int)(new_capacity * sizeof(RdpGfxEvent) / 1024));
+            } else {
+                /* Allocation failed - drop oldest event */
+                RdpGfxEvent* dropped = &ctx->gfx_events[ctx->gfx_event_read_idx];
+                fprintf(stderr, "[GFX] WARNING: Queue grow failed! Dropping event type=%d (%s) frame=%u\n",
+                        dropped->type, gfx_event_type_name(dropped->type), dropped->frame_id);
+                ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % ctx->gfx_events_capacity;
+                ctx->gfx_event_count--;
+            }
+        } else {
+            /* At max capacity - drop oldest event */
+            RdpGfxEvent* dropped = &ctx->gfx_events[ctx->gfx_event_read_idx];
+            fprintf(stderr, "[GFX] WARNING: Queue at max (%d)! Dropping event type=%d (%s) frame=%u\n",
+                    RDP_MAX_GFX_EVENTS, dropped->type, gfx_event_type_name(dropped->type), dropped->frame_id);
+            ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % ctx->gfx_events_capacity;
+            ctx->gfx_event_count--;
+        }
     }
     
     ctx->gfx_events[ctx->gfx_event_write_idx] = *event;
-    ctx->gfx_event_write_idx = (ctx->gfx_event_write_idx + 1) % RDP_MAX_GFX_EVENTS;
+    ctx->gfx_event_write_idx = (ctx->gfx_event_write_idx + 1) % ctx->gfx_events_capacity;
     ctx->gfx_event_count++;
     
     pthread_mutex_unlock(&ctx->gfx_event_mutex);
@@ -3196,7 +3249,7 @@ int rdp_gfx_get_event(RdpSession* session, RdpGfxEvent* event)
     }
     
     *event = ctx->gfx_events[ctx->gfx_event_read_idx];
-    ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % RDP_MAX_GFX_EVENTS;
+    ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % ctx->gfx_events_capacity;
     ctx->gfx_event_count--;
     
     pthread_mutex_unlock(&ctx->gfx_event_mutex);
@@ -3209,10 +3262,42 @@ void rdp_gfx_clear_events(RdpSession* session)
     BridgeContext* ctx = (BridgeContext*)session;
     
     pthread_mutex_lock(&ctx->gfx_event_mutex);
+    
+    /* Free any allocated data in pending events before clearing */
+    while (ctx->gfx_event_count > 0) {
+        RdpGfxEvent* event = &ctx->gfx_events[ctx->gfx_event_read_idx];
+        gfx_free_event_data(event);
+        ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % ctx->gfx_events_capacity;
+        ctx->gfx_event_count--;
+    }
+    
     ctx->gfx_event_write_idx = 0;
     ctx->gfx_event_read_idx = 0;
     ctx->gfx_event_count = 0;
     pthread_mutex_unlock(&ctx->gfx_event_mutex);
+}
+
+/* Helper to free all dynamically allocated data in a GFX event */
+static void gfx_free_event_data(RdpGfxEvent* event)
+{
+    if (!event) return;
+    
+    if (event->bitmap_data) {
+        free(event->bitmap_data);
+        event->bitmap_data = NULL;
+    }
+    if (event->nal_data) {
+        free(event->nal_data);
+        event->nal_data = NULL;
+    }
+    if (event->chroma_nal_data) {
+        free(event->chroma_nal_data);
+        event->chroma_nal_data = NULL;
+    }
+    if (event->pointer_data) {
+        free(event->pointer_data);
+        event->pointer_data = NULL;
+    }
 }
 
 void rdp_free_gfx_event_data(void* data)

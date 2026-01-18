@@ -928,21 +928,8 @@ class RDPBridge:
         # Audio health monitoring
         last_frame_time = asyncio.get_event_loop().time()
         consecutive_empty_polls = 0
-        max_empty_polls_before_warning = 500  # ~50ms of no audio at 0.1ms polling
-        stall_warning_logged = False
-        stall_diag_logged = False  # Detailed diagnostic logged once per stall
         error_count = 0
         max_errors_before_reset = 10
-        
-        # Audio buffer stats for diagnostics
-        audio_initialized = c_int()
-        audio_write_pos = ctypes.c_size_t()
-        audio_read_pos = ctypes.c_size_t()
-        audio_buffer_size = ctypes.c_size_t()
-        
-        # Log initial audio state after a short delay to let connection stabilize
-        startup_check_done = False
-        startup_check_time = asyncio.get_event_loop().time() + 3.0  # Check after 3 seconds
         
         # Target ~20ms between sends (Opus frame duration)
         target_interval = 0.018  # slightly less than 20ms to avoid underruns
@@ -953,61 +940,6 @@ class RDPBridge:
                 if not self._lib.rdp_has_opus_data(self._session):
                     consecutive_empty_polls += 1
                     
-                    # Startup check - log audio state after connection stabilizes
-                    if not startup_check_done and asyncio.get_event_loop().time() > startup_check_time:
-                        startup_check_done = True
-                        try:
-                            ret = self._lib.rdp_get_audio_stats(
-                                self._session,
-                                ctypes.byref(audio_initialized),
-                                ctypes.byref(audio_write_pos),
-                                ctypes.byref(audio_read_pos),
-                                ctypes.byref(audio_buffer_size)
-                            )
-                            if audio_initialized.value:
-                                logger.info(
-                                    f"Audio startup check: initialized=True, frames_sent={frames_sent}, "
-                                    f"buffer_data={audio_write_pos.value - audio_read_pos.value} bytes"
-                                )
-                            else:
-                                logger.warning(
-                                    f"Audio startup check: NOT INITIALIZED after 3s! "
-                                    f"frames_sent={frames_sent}, ret={ret}"
-                                )
-                        except Exception as e:
-                            logger.warning(f"Audio startup check failed: {e}")
-                    
-                    # Log warning if audio stream appears stalled (after initial startup)
-                    if frames_sent > 0 and consecutive_empty_polls >= max_empty_polls_before_warning:
-                        if not stall_warning_logged:
-                            elapsed = asyncio.get_event_loop().time() - last_frame_time
-                            if elapsed > 2.0:  # Only warn after 2+ seconds of silence
-                                logger.warning(
-                                    f"Audio stream may be stalled: no frames for {elapsed:.1f}s "
-                                    f"(sent {frames_sent} frames total)"
-                                )
-                                stall_warning_logged = True
-                        
-                        # Log detailed diagnostics once per stall event
-                        if not stall_diag_logged:
-                            try:
-                                ret = self._lib.rdp_get_audio_stats(
-                                    self._session,
-                                    ctypes.byref(audio_initialized),
-                                    ctypes.byref(audio_write_pos),
-                                    ctypes.byref(audio_read_pos),
-                                    ctypes.byref(audio_buffer_size)
-                                )
-                                logger.warning(
-                                    f"Audio buffer diagnostics: ret={ret}, initialized={audio_initialized.value}, "
-                                    f"write_pos={audio_write_pos.value}, read_pos={audio_read_pos.value}, "
-                                    f"buffer_size={audio_buffer_size.value}, "
-                                    f"data_available={audio_write_pos.value - audio_read_pos.value}"
-                                )
-                            except Exception as diag_err:
-                                logger.warning(f"Failed to get audio stats: {diag_err}")
-                            stall_diag_logged = True
-                    
                     # Adaptive sleep: back off when idle to reduce CPU usage
                     if consecutive_empty_polls < 100:
                         await asyncio.sleep(0.0001)  # 0.1ms for responsiveness
@@ -1017,15 +949,7 @@ class RDPBridge:
                         await asyncio.sleep(0.005)   # 5ms for extended idle
                     continue
                 
-                # Mark startup check done on first successful frame
-                startup_check_done = True
-                
-                # Reset counters when we get data
-                if stall_warning_logged:
-                    logger.info(f"Audio stream resumed after stall (frames_sent was {frames_sent})")
                 consecutive_empty_polls = 0
-                stall_warning_logged = False
-                stall_diag_logged = False  # Reset diagnostic flag so we log again on next stall
                 error_count = 0  # Reset error count on successful data
                 
                 # Get audio format

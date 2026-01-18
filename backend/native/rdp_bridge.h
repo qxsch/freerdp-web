@@ -18,7 +18,9 @@ extern "C" {
 
 /* GFX pipeline constants */
 #define RDP_MAX_GFX_SURFACES 256
-#define RDP_MAX_GFX_EVENTS 16384  /* Max pending GFX lifecycle events - larger to prevent overflow */
+#define RDP_GFX_EVENTS_INITIAL 2048   /* Initial GFX event queue size (~295 KB) */
+#define RDP_GFX_EVENTS_GROW 1024      /* Grow queue in 1024-slot increments */
+#define RDP_MAX_GFX_EVENTS 16384      /* Max GFX event queue size (~2.3 MB) */
 
 /* Session registry limits (compile-time defaults, runtime configurable) */
 #define RDP_MAX_SESSIONS_DEFAULT 100

@@ -801,8 +801,10 @@ All binary messages use a 4-byte ASCII magic header for efficient parsing:
 | `WS_HOST` | `0.0.0.0` | WebSocket bind address |
 | `WS_PORT` | `8765` | WebSocket port |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
-| `RDP_MAX_SESSIONS` | `100` | Maximum concurrent RDP sessions (range: 2-1000) |
+| `RDP_MAX_SESSIONS` | `100` | Maximum concurrent RDP sessions (range: 2-1000)<br>**approx. 2.6MB - 4.8MB (with transcoding) memory per active session is required** |
 | `RDP_BRIDGE_SECURITY_POLICY_PATH` | `/app/security/rdp-bridge-policy.json` | Path to the security policy JSON file |
+| `SECURITY_ALLOWED_HOSTNAMES` | `*.crop.domain, other.host.domain` | Comma-separated Hostname glob patterns<br>**fallback if no policy file is present**  |
+| `SECURITY_ALLOWED_IPV4_CIDRS` | `10.0.0.0/34, 10.1.2.3/32` | Comma-separated IPv4 CIDR ranges<br>**fallback if no policy file is present** |
 
 ### Backend Security Policy
 
