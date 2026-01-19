@@ -2,6 +2,8 @@
 
 Browser-based Remote Desktop client using vanilla JavaScript frontend and a Python WebSocket proxy with native FreeRDP3 integration.
 
+It is a works for me project, but looking forward to any contributors.
+
 ## Architecture
 
 ```
