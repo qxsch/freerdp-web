@@ -240,6 +240,13 @@ RUN cp -n .env.example .env 2>/dev/null || true
 ENV LD_LIBRARY_PATH=/opt/freerdp3/lib:/usr/local/lib
 ENV FREERDP_LIBRARY_PATH=/opt/freerdp3/lib/freerdp3
 
+# Configure glibc malloc to return memory to OS more aggressively
+# MALLOC_TRIM_THRESHOLD_: trim arena when this much free (default 128KB, set to 32KB)
+# MALLOC_MMAP_THRESHOLD_: use mmap for allocations above this (default 128KB, set to 64KB)
+# These settings help reduce memory fragmentation in long-running processes
+ENV MALLOC_TRIM_THRESHOLD_=32768
+ENV MALLOC_MMAP_THRESHOLD_=65536
+
 # Expose WebSocket port
 EXPOSE 8765
 

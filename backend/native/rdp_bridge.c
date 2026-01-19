@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <time.h>
+#include <malloc.h>  /* For malloc_trim() */
 
 /* FreeRDP3 headers */
 #include <freerdp/freerdp.h>
@@ -763,10 +764,16 @@ RdpSession* rdp_create(
     if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height)) goto fail;
     if (!freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, bpp)) goto fail;
     
-    /* SoftwareGdi is REQUIRED for the GFX pipeline to work properly.
-     * It enables FreeRDP's software GDI layer which the rdpgfx plugin hooks into.
-     * Without this, gdi_graphics_pipeline_init() fails and GFX channel won't open. */
+    /* WIRE-THROUGH MODE: Enable SoftwareGdi but with DeactivateClientDecoding.
+     * 
+     * SoftwareGdi=TRUE: FreeRDP expects this for proper internal state management.
+     * DeactivateClientDecoding=TRUE: Skips actual codec decoding in GDI layer.
+     * 
+     * The GDI layer still gets initialized (context->gdi exists), but the heavy
+     * codec operations are skipped. We handle graphics via GFX callbacks and
+     * pass raw frames to the frontend for browser-side decoding. */
     if (!freerdp_settings_set_bool(settings, FreeRDP_SoftwareGdi, TRUE)) goto fail;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_DeactivateClientDecoding, TRUE)) goto fail;
     
     /* Enable Dynamic Virtual Channels (DVCs) - REQUIRED for GFX pipeline.
      * Without this, drdynvc static channel won't load and no DVCs will connect. */
@@ -972,8 +979,13 @@ void rdp_disconnect(RdpSession* session)
     freerdp* instance = context->instance;
     BridgeContext* ctx = (BridgeContext*)context;
     
+    fprintf(stderr, "[rdp_bridge] rdp_disconnect called, state=%d\n", ctx->state);
+    
     if (ctx->state == RDP_STATE_CONNECTED || ctx->state == RDP_STATE_CONNECTING) {
+        fprintf(stderr, "[rdp_bridge] Calling freerdp_disconnect\n");
         freerdp_disconnect(instance);
+    } else {
+        fprintf(stderr, "[rdp_bridge] Skipping freerdp_disconnect (already disconnected)\n");
     }
     ctx->state = RDP_STATE_DISCONNECTED;
 }
@@ -983,6 +995,8 @@ void rdp_destroy(RdpSession* session)
     if (!session) return;
     rdpContext* context = (rdpContext*)session;
     BridgeContext* ctx = (BridgeContext*)context;
+    
+    fprintf(stderr, "[rdp_bridge] rdp_destroy: freeing session resources\n");
     
     /* Unregister from session registry BEFORE cleanup */
     session_registry_remove(context);
@@ -1023,7 +1037,12 @@ void rdp_destroy(RdpSession* session)
         ctx->gfx_events = NULL;
     }
     
+    fprintf(stderr, "[rdp_bridge] rdp_destroy: calling freerdp_client_context_free\n");
     freerdp_client_context_free(context);
+    
+    /* Force glibc to return freed memory to the OS */
+    malloc_trim(0);
+    fprintf(stderr, "[rdp_bridge] rdp_destroy: complete\n");
 }
 
 /* ============================================================================
@@ -1158,14 +1177,6 @@ static void maybe_init_gfx_pipeline(BridgeContext* bctx)
     pthread_mutex_unlock(&bctx->gfx_mutex);
     
     if (!needs_init || !gfx) {
-        return;
-    }
-    
-    rdpContext* context = (rdpContext*)bctx;
-    rdpGdi* gdi = context->gdi;
-    
-    if (!gdi) {
-        fprintf(stderr, "[rdp_bridge] Cannot init GFX pipeline: GDI not available\n");
         return;
     }
     
@@ -1445,32 +1456,24 @@ static BOOL bridge_post_connect(freerdp* instance)
         fprintf(stderr, "[rdp_bridge] WARNING: Channels object is NULL!\n");
     }
     
-    /* GDI Initialization Notes:
+    /* WIRE-THROUGH MODE with DeactivateClientDecoding:
      * 
-     * gdi_init() is called here but is NOT strictly required for GFX DVC channel
-     * operation. The RDPGFX channel connects independently through drdynvc.
-     * 
-     * We call gdi_init() currently because:
-     * 1. It provides convenient frame dimension tracking (gdi->width/height)
-     * 2. FreeRDP's GDI layer handles some internal state management
-     * 3. gdi_free() is called on disconnect, so init must be called for cleanup
-     * 
-     * ALTERNATIVE: Use FreeRDP_DeactivateClientDecoding setting to skip GDI
-     * codec registration entirely. We could then track dimensions solely from
-     * ResetGraphics PDU (already doing this in gfx_on_reset_graphics).
-     * 
-     * In wire-through mode, we don't use the GDI framebuffer or pixel data -
-     * all graphics flow via GFX events streamed to the browser frontend.
+     * We still call gdi_init() for proper FreeRDP internal state, but with
+     * DeactivateClientDecoding=TRUE, the heavy codec decoding is skipped.
+     * The GDI framebuffer is allocated, but we don't use it for actual decoding -
+     * all graphics flow as encoded events to the frontend.
      */
+    fprintf(stderr, "[rdp_bridge] PostConnect: gdi=%p before gdi_init\n", (void*)context->gdi);
     if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) {
-        snprintf(ctx->error_msg, MAX_ERROR_LEN, "GDI initialization failed");
+        fprintf(stderr, "[rdp_bridge] gdi_init failed\n");
         return FALSE;
     }
     
-    rdpGdi* gdi = context->gdi;
+    fprintf(stderr, "[rdp_bridge] PostConnect: GDI initialized (gdi=%p, cache=%p)\n",
+            (void*)context->gdi, (void*)context->cache);
     
     /* Register pointer/cursor callbacks for remote cursor support.
-     * FreeRDP will call these when the server sends cursor updates. */
+     * context->graphics is allocated during freerdp_context_new(), independently of GDI. */
     {
         rdpPointer pointer_proto = { 0 };
         pointer_proto.size = sizeof(BridgePointer);
@@ -1481,7 +1484,7 @@ static BOOL bridge_post_connect(freerdp* instance)
         pointer_proto.SetDefault = bridge_pointer_set_default;
         pointer_proto.SetPosition = bridge_pointer_set_position;
         graphics_register_pointer(context->graphics, &pointer_proto);
-        fprintf(stderr, "[rdp_bridge] Pointer callbacks registered\n");
+        fprintf(stderr, "[rdp_bridge] Pointer callbacks registered (no-GDI mode)\n");
     }
     
     /* Check if server supports GFX */
@@ -1500,22 +1503,13 @@ static BOOL bridge_post_connect(freerdp* instance)
     PubSub_SubscribeChannelConnected(context->pubSub, bridge_on_channel_connected);
     PubSub_SubscribeChannelDisconnected(context->pubSub, bridge_on_channel_disconnected);
     
-    /* Note: GFX pipeline initialization is handled via channel connection callback.
-     * The gdi_graphics_pipeline_init() requires RdpgfxClientContext which is
-     * obtained when the RDPGFX channel connects. For now, we rely on GDI mode
-     * with GFX pipeline enabled in settings - the actual pipeline init happens
-     * in bridge_on_channel_connected when RDPGFX channel connects. */
-    
     /* Set up desktop resize callback (needed for GFX ResetGraphics) */
     context->update->DesktopResize = bridge_desktop_resize;
     
-    /* Store frame dimensions for resize tracking */
-    ctx->frame_width = gdi->width;
-    ctx->frame_height = gdi->height;
-    
-    /* Note: Channel event subscription happens in pre_connect (required for static channels).
-     * DVCs (like RDPGFX) connect later when drdynvc capability exchange completes.
-     * GFX pipeline is enabled for H.264/progressive codec support. */
+    /* Initialize frame dimensions from settings.
+     * These will be updated by ResetGraphics PDU when GFX connects. */
+    ctx->frame_width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+    ctx->frame_height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
     
     /* WIRE-THROUGH MODE: No need to set needs_full_frame - GFX events will flow
      * after the GFX DVC connects and sends CreateSurface/StartFrame etc. */
@@ -1530,8 +1524,10 @@ static void bridge_post_disconnect(freerdp* instance)
 {
     rdpContext* context = instance->context;
     BridgeContext* ctx = (BridgeContext*)context;
+    rdpGdi* gdi = context->gdi;
     
-    fprintf(stderr, "[rdp_bridge] PostDisconnect: cleaning up session resources\n");
+    fprintf(stderr, "[rdp_bridge] PostDisconnect: cleaning up (gdi=%p, cache=%p)\n",
+            (void*)gdi, (void*)context->cache);
     
     /* Mark as disconnecting to prevent further GFX operations */
     ctx->gfx_disconnecting = true;
@@ -1540,11 +1536,19 @@ static void bridge_post_disconnect(freerdp* instance)
     PubSub_UnsubscribeChannelConnected(context->pubSub, bridge_on_channel_connected);
     PubSub_UnsubscribeChannelDisconnected(context->pubSub, bridge_on_channel_disconnected);
     
-    /* Clear GFX event queue to prevent stale events from being processed */
+    /* Free pending GFX event data before clearing the queue.
+     * Each event may have allocated bitmap_data, nal_data, etc. */
     pthread_mutex_lock(&ctx->gfx_event_mutex);
+    if (ctx->gfx_events) {
+        while (ctx->gfx_event_count > 0) {
+            RdpGfxEvent* event = &ctx->gfx_events[ctx->gfx_event_read_idx];
+            gfx_free_event_data(event);
+            ctx->gfx_event_read_idx = (ctx->gfx_event_read_idx + 1) % ctx->gfx_events_capacity;
+            ctx->gfx_event_count--;
+        }
+    }
     ctx->gfx_event_write_idx = 0;
     ctx->gfx_event_read_idx = 0;
-    ctx->gfx_event_count = 0;
     pthread_mutex_unlock(&ctx->gfx_event_mutex);
     
     /* Clear audio state */
@@ -1574,13 +1578,22 @@ static void bridge_post_disconnect(freerdp* instance)
     ctx->rdpsnd = NULL;
     ctx->state = RDP_STATE_DISCONNECTED;
     
+    /* Free AVC444 transcoder (FFmpeg decoder/encoder frames) */
+    cleanup_transcoder(ctx);
+    
     /* Free codec decoder */
     if (ctx->planar_decoder) {
         freerdp_bitmap_planar_context_free(ctx->planar_decoder);
         ctx->planar_decoder = NULL;
     }
     
+    /* Free GDI resources */
     gdi_free(instance);
+    
+    /* Force glibc to return freed memory to the OS.
+     * Without this, glibc keeps freed memory in its arena for reuse,
+     * which looks like a memory leak in container stats. */
+    malloc_trim(0);
     
     fprintf(stderr, "[rdp_bridge] PostDisconnect: cleanup complete\n");
 }
@@ -1696,9 +1709,8 @@ static void bridge_on_channel_disconnected(void* ctx, const ChannelDisconnectedE
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
         pthread_mutex_lock(&bctx->gfx_mutex);
-        if (bctx->gfx_active && context->gdi) {
-            gdi_graphics_pipeline_uninit(context->gdi, bctx->gfx);
-        }
+        /* NOTE: We skip gdi_graphics_pipeline_uninit() because we never called
+         * gdi_init() in pure GFX wire-through mode. */
         bctx->gfx = NULL;
         bctx->gfx_active = false;
         pthread_mutex_unlock(&bctx->gfx_mutex);
@@ -1710,18 +1722,16 @@ static BOOL bridge_desktop_resize(rdpContext* context)
     BridgeContext* ctx = (BridgeContext*)context;
     rdpGdi* gdi = context->gdi;
     
-    /* In wire-through GFX mode, dimension updates come from ResetGraphics PDU.
-     * This callback is called by FreeRDP's GDI layer during resize operations.
-     * We just track the dimensions for resize detection. */
-    
-    if (!gdi) {
-        fprintf(stderr, "[rdp_bridge] DesktopResize: GDI not available\n");
+    if (!gdi || !gdi_resize(gdi, gdi->width, gdi->height)) {
+        fprintf(stderr, "[rdp_bridge] gdi_resize failed\n");
         return FALSE;
     }
     
-    /* Update stored dimensions from current GDI state */
+    /* Update stored dimensions from GDI */
     ctx->frame_width = gdi->width;
     ctx->frame_height = gdi->height;
+    
+    fprintf(stderr, "[rdp_bridge] DesktopResize: %dx%d\n", gdi->width, gdi->height);
     
     /* In wire-through mode, the server will send ResetGraphics and fresh
      * surfaces after resize. No dirty rect tracking needed. */
