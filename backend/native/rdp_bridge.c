@@ -981,7 +981,11 @@ void rdp_disconnect(RdpSession* session)
     
     fprintf(stderr, "[rdp_bridge] rdp_disconnect called, state=%d\n", ctx->state);
     
-    if (ctx->state == RDP_STATE_CONNECTED || ctx->state == RDP_STATE_CONNECTING) {
+    /* Call freerdp_disconnect for CONNECTED, CONNECTING, or ERROR states.
+     * ERROR state can occur when server terminates connection - we still need
+     * to call freerdp_disconnect to trigger PostDisconnect cleanup callback. */
+    if (ctx->state == RDP_STATE_CONNECTED || ctx->state == RDP_STATE_CONNECTING || 
+        ctx->state == RDP_STATE_ERROR) {
         fprintf(stderr, "[rdp_bridge] Calling freerdp_disconnect\n");
         freerdp_disconnect(instance);
     } else {
@@ -1035,6 +1039,21 @@ void rdp_destroy(RdpSession* session)
         }
         free(ctx->gfx_events);
         ctx->gfx_events = NULL;
+    }
+    
+    /* Free planar decoder (may already be freed in bridge_post_disconnect, but safe to check) */
+    if (ctx->planar_decoder) {
+        freerdp_bitmap_planar_context_free(ctx->planar_decoder);
+        ctx->planar_decoder = NULL;
+    }
+    
+    /* Ensure GDI resources are freed (may already be freed by bridge_post_disconnect).
+     * This is a safety net for server-initiated disconnects where PostDisconnect
+     * callback might not be called or might be called with incomplete cleanup. */
+    freerdp* instance = context->instance;
+    if (instance && context->gdi) {
+        fprintf(stderr, "[rdp_bridge] rdp_destroy: forcing gdi_free (gdi was still allocated)\n");
+        gdi_free(instance);
     }
     
     fprintf(stderr, "[rdp_bridge] rdp_destroy: calling freerdp_client_context_free\n");

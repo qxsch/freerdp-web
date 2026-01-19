@@ -571,6 +571,13 @@ class RDPBridge:
             
         except Exception as e:
             logger.error(f"Connection error: {e}")
+            # Clean up any partially-created session
+            if self._session and self._lib:
+                try:
+                    self._lib.rdp_destroy(self._session)
+                except Exception:
+                    pass
+                self._session = None
             return False
     
     async def resize(self, width: int, height: int) -> bool:
@@ -896,6 +903,20 @@ class RDPBridge:
         
         logger.info(f"Frame streaming ended after {self._frame_count} frames")
         
+        # Server-initiated disconnect: clean up native resources immediately
+        # This prevents memory leaks when the RDP server terminates but the
+        # WebSocket client is still connected (e.g., server reboot/shutdown).
+        # Don't wait for disconnect() to be called from server.py's finally block.
+        if disconnect_reason and self._session and self._lib:
+            logger.info(f"Server-initiated disconnect: cleaning up native session")
+            try:
+                self._lib.rdp_disconnect(self._session)
+                self._lib.rdp_destroy(self._session)
+            except Exception as e:
+                logger.error(f"Error cleaning up native session: {e}")
+            finally:
+                self._session = None
+        
         # Notify WebSocket client about disconnect
         if disconnect_reason and self.websocket:
             try:
@@ -936,6 +957,11 @@ class RDPBridge:
         
         while self.running:
             try:
+                # Check if session is still valid (may be destroyed by _stream_frames on server disconnect)
+                if not self._session:
+                    logger.debug("Audio streaming: session destroyed, exiting")
+                    break
+                    
                 # Check if Opus data is available
                 if not self._lib.rdp_has_opus_data(self._session):
                     consecutive_empty_polls += 1
@@ -1017,24 +1043,34 @@ class RDPBridge:
         logger.info(f"Native audio streaming ended after {frames_sent} frames")
     
     async def disconnect(self):
-        """Disconnect from the RDP server"""
+        """Disconnect from the RDP server.
+        
+        This method is idempotent - safe to call multiple times.
+        Native resources may already be freed by _stream_frames on server-initiated disconnect.
+        """
         self.running = False
         
         if self._frame_task:
             self._frame_task.cancel()
             try:
                 await self._frame_task
-            except asyncio.CancelledError:
-                pass
+            except (asyncio.CancelledError, Exception):
+                pass  # Task was cancelled or already finished with error
+            finally:
+                self._frame_task = None
         
         if self._audio_task:
             self._audio_task.cancel()
             try:
                 await self._audio_task
-            except asyncio.CancelledError:
-                pass
+            except (asyncio.CancelledError, Exception):
+                pass  # Task was cancelled or already finished with error
+            finally:
+                self._audio_task = None
         
+        # Clean up native session if not already cleaned up by _stream_frames
         if self._session and self._lib:
+            logger.debug("disconnect() cleaning up native session")
             self._lib.rdp_disconnect(self._session)
             self._lib.rdp_destroy(self._session)
             self._session = None
