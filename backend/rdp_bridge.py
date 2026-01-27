@@ -97,6 +97,12 @@ RDP_GFX_CODEC_AVC444v2 = 0x000E
 RDP_GFX_CODEC_PROGRESSIVE = 0x000C
 RDP_GFX_CODEC_PROGRESSIVE_V2 = 0x000D
 
+# Resolution limits - minimum and maximum allowed screen dimensions
+RDP_MIN_WIDTH = 640
+RDP_MAX_WIDTH = 4096
+RDP_MIN_HEIGHT = 480
+RDP_MAX_HEIGHT = 2304
+
 
 class RdpRect(Structure):
     """Rectangle structure for GFX frame positioning (matches C struct)"""
@@ -496,6 +502,10 @@ class RDPBridge:
     async def connect(self) -> bool:
         """Connect to the RDP server"""
         try:
+            # Clamp initial dimensions to allowed range
+            self.config.width = max(RDP_MIN_WIDTH, min(self.config.width, RDP_MAX_WIDTH))
+            self.config.height = max(RDP_MIN_HEIGHT, min(self.config.height, RDP_MAX_HEIGHT))
+            
             # Validate connection against security policy
             security_policy = get_security_policy()
             validation_result = security_policy.validate(self.config.host, self.config.port)
@@ -583,6 +593,10 @@ class RDPBridge:
     async def resize(self, width: int, height: int) -> bool:
         """Resize the RDP session"""
         try:
+            # Clamp dimensions to allowed range
+            width = max(RDP_MIN_WIDTH, min(width, RDP_MAX_WIDTH))
+            height = max(RDP_MIN_HEIGHT, min(height, RDP_MAX_HEIGHT))
+            
             # Skip if dimensions haven't changed
             if self.config.width == width and self.config.height == height:
                 logger.debug(f"Skipping redundant resize to {width}x{height}")
