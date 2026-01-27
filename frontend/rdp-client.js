@@ -1706,6 +1706,16 @@ export class RDPClient {
     }
 
     /**
+     * Send Backspace key press
+     * @param {number} [count=1] - Number of backspace keys to send
+     */
+    sendBackspace(count = 1) {
+        for (let i = 0; i < count; i++) {
+            this.sendKeyCombo('Backspace');
+        }
+    }
+
+    /**
      * Get current connection status
      * @returns {Object} Status object
      */
