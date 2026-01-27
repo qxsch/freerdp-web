@@ -87,8 +87,16 @@ let primaryCanvas = null;
 /** @type {OffscreenCanvasRenderingContext2D|null} Primary 2D context */
 let primaryCtx = null;
 
-/** @type {number|null} Primary surface ID (mapped to output) */
+/** @type {number|null} Primary surface ID (mapped to output) - legacy, kept for compatibility */
 let primarySurfaceId = null;
+
+/** 
+ * @type {Map<number, {outputX: number, outputY: number}>} 
+ * Surface ID → output position mapping
+ * Tracks all surfaces mapped to output with their (outputX, outputY) positions.
+ * Per MS-RDPEGFX: MapSurfaceToOutput specifies where a surface should be composited.
+ */
+const mappedSurfaces = new Map();
 
 /** @type {number|null} Current frame being processed */
 let currentFrameId = null;
@@ -278,15 +286,29 @@ function deleteSurface(surfaceId) {
         wasmModule._prog_delete_surface(progCtx, surfaceId);
     }
     
+    // Remove from output mapping
+    mappedSurfaces.delete(surfaceId);
+    
     if (primarySurfaceId === surfaceId) {
         primarySurfaceId = null;
     }
 }
 
 /**
- * Map surface to primary output
+ * Map surface to output at specified position
+ * Per MS-RDPEGFX 2.2.2.3: MapSurfaceToOutput maps a surface to the primary output
+ * at the specified (outputX, outputY) coordinates.
+ * 
+ * @param {number} surfaceId - Surface to map
+ * @param {number} outputX - X position on output (default 0)
+ * @param {number} outputY - Y position on output (default 0)
  */
-function mapSurfaceToPrimary(surfaceId) {
+function mapSurfaceToOutput(surfaceId, outputX = 0, outputY = 0) {
+    // Store mapping with position
+    mappedSurfaces.set(surfaceId, { outputX, outputY });
+    
+    // Keep legacy primarySurfaceId updated for backward compatibility
+    // (last mapped surface becomes primary)
     primarySurfaceId = surfaceId;
 }
 
@@ -1167,22 +1189,45 @@ async function endFrame(frameId) {
         console.warn(`[GFX Worker] Frame mismatch: expected ${currentFrameId}, got ${frameId}`);
     }
     
-    // Composite all surfaces that were updated in this frame to primary canvas
+    // Composite all mapped surfaces that were updated in this frame to primary canvas
+    // Per MS-RDPEGFX: Each mapped surface is drawn at its (outputX, outputY) position
     if (primaryCanvas && primaryCtx) {
         
-        // First try primarySurfaceId if set and was updated
-        if (primarySurfaceId !== null && frameUpdatedSurfaces.has(primarySurfaceId)) {
-            const surface = surfaces.get(primarySurfaceId);
-            if (surface) {
-                primaryCtx.drawImage(surface.canvas, 0, 0);
+        // Get all mapped surfaces that were updated, sorted by surface ID for consistent z-order
+        const updatedMappedSurfaces = [];
+        for (const surfaceId of frameUpdatedSurfaces) {
+            if (mappedSurfaces.has(surfaceId)) {
+                updatedMappedSurfaces.push(surfaceId);
+            }
+        }
+        
+        if (updatedMappedSurfaces.length > 0) {
+            // Sort by surface ID for consistent compositing order (lower IDs first)
+            updatedMappedSurfaces.sort((a, b) => a - b);
+            
+            for (const surfaceId of updatedMappedSurfaces) {
+                const surface = surfaces.get(surfaceId);
+                const mapping = mappedSurfaces.get(surfaceId);
+                if (surface && mapping) {
+                    // Draw surface at its mapped output position
+                    primaryCtx.drawImage(surface.canvas, mapping.outputX, mapping.outputY);
+                }
             }
         } else if (frameUpdatedSurfaces.size > 0) {
-            // Fallback: composite any updated surfaces (in order of surface ID)
-            const sortedSurfaces = Array.from(frameUpdatedSurfaces).sort((a, b) => a - b);
-            for (const surfaceId of sortedSurfaces) {
-                const surface = surfaces.get(surfaceId);
+            // Fallback for unmapped surfaces: try primarySurfaceId or any updated surface at (0,0)
+            // This handles edge cases where surfaces weren't explicitly mapped
+            if (primarySurfaceId !== null && frameUpdatedSurfaces.has(primarySurfaceId)) {
+                const surface = surfaces.get(primarySurfaceId);
                 if (surface) {
                     primaryCtx.drawImage(surface.canvas, 0, 0);
+                }
+            } else {
+                const sortedSurfaces = Array.from(frameUpdatedSurfaces).sort((a, b) => a - b);
+                for (const surfaceId of sortedSurfaces) {
+                    const surface = surfaces.get(surfaceId);
+                    if (surface) {
+                        primaryCtx.drawImage(surface.canvas, 0, 0);
+                    }
                 }
             }
         }
@@ -1232,7 +1277,7 @@ async function handleBinaryMessage(data) {
             break;
         
         case 'mapSurface':
-            mapSurfaceToPrimary(msg.surfaceId);
+            mapSurfaceToOutput(msg.surfaceId, msg.outputX || 0, msg.outputY || 0);
             break;
             
         case 'startFrame':
@@ -1391,17 +1436,18 @@ async function processMessage(event) {
             break;
             
         case 'mapSurface':
-            // Map a surface to primary output
-            mapSurfaceToPrimary(data.surfaceId);
+            // Map a surface to primary output at specified position
+            mapSurfaceToOutput(data.surfaceId, data.outputX || 0, data.outputY || 0);
             break;
             
         case 'reset':
             // Reset all state (e.g., on reconnect or session reset)
             resetCacheState();
-            // Clear all surfaces
+            // Clear all surfaces and mappings
             for (const surfaceId of surfaces.keys()) {
                 deleteSurface(surfaceId);
             }
+            mappedSurfaces.clear();
             console.log('[GFX Worker] Session reset complete');
             break;
             
