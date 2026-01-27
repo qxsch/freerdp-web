@@ -41,6 +41,7 @@ It is a works for me project, but looking forward to any contributors.
 - 🖱️ Server cursor support - Remote cursor updates with custom bitmaps and hotspots
 - 📺 Fullscreen mode with dynamic resolution
 - 📸 **Screenshot capture** - Save the current remote desktop view as an image
+- 🤖 **JS-Driven automation** - Programmatic keyboard and mouse control with screenshot functionality for RPA and testing
 - 🎨 **Customizable theming** - Built-in presets (dark, light, midnight, high-contrast) and shadow dom for robustness
 - 📊 Latency monitoring (ping/pong)
 - 🩺 Health check endpoint (`/health`)
