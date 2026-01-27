@@ -208,11 +208,15 @@
 
             <h2>Public API</h2>
             <ul class="api-list">
-                <li><code>connect(credentials)</code> - Connect to RDP server</li>
-                <li><code>disconnect()</code> - Disconnect session</li>
-                <li><code>sendKeys(keys, opts)</code> - Send keystrokes</li>
+                <li><code>connect(credentials)</code> - Connect to RDP server (async)</li>
+                <li><code>disconnect()</code> - Disconnect session (async)</li>
+                <li><code>sendKeys(keys, opts)</code> - Send keystrokes (async)</li>
                 <li><code>sendKeyCombo(combo)</code> - Send key combo</li>
                 <li><code>sendCtrlAltDel()</code> - Send Ctrl+Alt+Del</li>
+                <li><code>sendBackspace(count)</code> - Send backspaces (async)</li>
+                <li><code>sendMouseMove(x, y)</code> - Move mouse cursor</li>
+                <li><code>sendMouseClick(opts)</code> - Click mouse (async)</li>
+                <li><code>sendMouseScroll(opts)</code> - Scroll mouse</li>
                 <li><code>setTheme(config)</code> - Apply theme dynamically</li>
                 <li><code>getStatus()</code> - Get connection status</li>
                 <li><code>isConnected()</code> - Check if connected</li>
@@ -220,12 +224,17 @@
                 <li><code>getMuted()</code> - Get audio mute state</li>
                 <li><code>setMuted(bool)</code> - Set audio mute</li>
                 <li><code>getResolution()</code> - Get current resolution</li>
+                <li><code>getScreenshot(type, quality)</code> - Capture screenshot (async)</li>
+                <li><code>downloadScreenshot(type, quality)</code> - Download screenshot (async)</li>
                 <li><code>showKeyboard()</code> - Show virtual keyboard</li>
                 <li><code>hideKeyboard()</code> - Hide virtual keyboard</li>
                 <li><code>isKeyboardVisible()</code> - Check keyboard visibility</li>
+                <li><code>getSecurityPolicy()</code> - Get security policy (frozen)</li>
+                <li><code>validateDestination(host, port)</code> - Check if allowed</li>
+                <li><code>setMinDimensions(w, h)</code> - Set min canvas size</li>
                 <li><code>on(event, fn)</code> - Add event listener</li>
                 <li><code>off(event, fn)</code> - Remove listener</li>
-                <li><code>destroy()</code> - Cleanup resources</li>
+                <li><code>destroy()</code> - Cleanup resources (async)</li>
             </ul>
 
             <h2>Theming</h2>

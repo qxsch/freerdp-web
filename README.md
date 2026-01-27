@@ -597,10 +597,14 @@ document.body.style.background = themes.midnight.colors.background;
 | Method | Description |
 |--------|-------------|
 | `connect(credentials)` | Connect to RDP server. Returns a Promise. |
-| `disconnect()` | Disconnect the current session |
-| `sendKeys(keys, opts)` | Send keystrokes. Options: `{ ctrl, alt, shift, meta, delay }` |
+| `disconnect()` | Disconnect the current session. Returns a Promise. |
+| `sendKeys(keys, opts)` | Send keystrokes. Options: `{ ctrl, alt, shift, meta, delay }`. Returns a Promise. |
 | `sendKeyCombo(combo)` | Send key combination (e.g., `'Ctrl+Alt+Delete'`) |
 | `sendCtrlAltDel()` | Shortcut for `sendKeyCombo('Ctrl+Alt+Delete')` |
+| `sendBackspace(count)` | Send Backspace key press(es). Default count: 1. Returns a Promise. |
+| `sendMouseMove(x, y)` | Move mouse cursor to coordinates (shows visual cursor overlay) |
+| `sendMouseClick(opts)` | Perform mouse click. Options: `{ x, y, button, count, delay }`. Returns a Promise. |
+| `sendMouseScroll(opts)` | Perform mouse scroll. Options: `{ x, y, deltaX, deltaY }` |
 | `showKeyboard()` | Show the virtual on-screen keyboard |
 | `hideKeyboard()` | Hide the virtual on-screen keyboard |
 | `isKeyboardVisible()` | Returns `true` if virtual keyboard is visible |
@@ -615,10 +619,200 @@ document.body.style.background = themes.midnight.colors.background;
 | `getSecurityPolicy()` | Returns the frozen security policy object (read-only) |
 | `validateDestination(host, port)` | Check if destination is allowed. Returns `{ allowed, reason? }` |
 | `getScreenshot(type, quality)` | Capture screenshot. Returns `Promise<{ blob, width, height }>`. Type: `'png'` or `'jpg'` |
-| `downloadScreenshot(type, quality)` | Capture and download screenshot as `screenshot-YYYY-mm-dd--hh-mm.(png\|jpg)` |
+| `downloadScreenshot(type, quality)` | Capture and download screenshot as `screenshot-YYYY-mm-dd--hh-mm.(png\|jpg)`. Returns a Promise. |
 | `on(event, handler)` | Register an event handler |
 | `off(event, handler)` | Remove an event handler |
-| `destroy()` | Clean up resources and remove from DOM |
+| `destroy()` | Clean up resources and remove from DOM. Returns a Promise. |
+
+### Keyboard & Mouse Input Methods
+
+The RDP client provides programmatic methods for sending keyboard and mouse input to the remote desktop. These are useful for automation, scripting, or building custom UI controls.
+
+> **Visual Cursor**: When using `sendMouseMove`, `sendMouseClick`, or `sendMouseScroll`, a visual cursor overlay appears on the canvas to indicate the programmatic mouse position. This overlay automatically hides when the user moves their real mouse over the canvas.
+
+#### Keyboard Methods
+
+| Method | Async | Description |
+|--------|-------|---------
+----|
+| `sendKeys(keys, options)` | ✅ Yes | Send one or more keystrokes with optional modifiers |
+| `sendKeyCombo(combo)` | ❌ No | Send a key combination string (e.g., `'Ctrl+C'`) |
+| `sendCtrlAltDel()` | ❌ No | Send `Ctrl+Alt+Delete` |
+| `sendBackspace(count)` | ✅ Yes | Send Backspace key press(es) |
+
+##### sendKeys(keys, options)
+
+Send keystrokes to the remote desktop with optional modifier keys.
+
+```javascript
+// Send a single character
+await client.sendKeys('a');
+
+// Send multiple characters with delay between each
+await client.sendKeys('Hello World', { delay: 50 });
+
+// Send with modifiers (Ctrl+S to save)
+await client.sendKeys('s', { ctrl: true });
+
+// Send array of keys
+await client.sendKeys(['H', 'i', '!'], { delay: 100 });
+```
+
+**Options:**
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `ctrl` | boolean | `false` | Hold Ctrl while sending |
+| `alt` | boolean | `false` | Hold Alt while sending |
+| `shift` | boolean | `false` | Hold Shift while sending |
+| `meta` | boolean | `false` | Hold Meta/Win while sending |
+| `delay` | number | `0` | Delay in ms between keystrokes |
+
+##### sendKeyCombo(combo)
+
+Send a key combination using a simple string format.
+
+```javascript
+// Common shortcuts
+client.sendKeyCombo('Ctrl+C');        // Copy
+client.sendKeyCombo('Ctrl+V');        // Paste
+client.sendKeyCombo('Alt+Tab');       // Switch windows
+client.sendKeyCombo('Ctrl+Alt+Delete'); // Security attention
+client.sendKeyCombo('Win+R');         // Run dialog
+```
+
+##### sendCtrlAltDel()
+
+Convenience method for sending the `Ctrl+Alt+Delete` security attention sequence.
+
+```javascript
+client.sendCtrlAltDel();
+```
+
+##### sendBackspace(count)
+
+Send one or more Backspace key presses with a 20ms delay between each. This is an **async** method.
+
+```javascript
+// Single backspace
+await client.sendBackspace();
+
+// Delete 5 characters
+await client.sendBackspace(5);
+```
+
+#### Mouse Methods
+
+| Method | Async | Description |
+|--------|-------|-------------|
+| `sendMouseMove(x, y)` | ❌ No | Move cursor to coordinates |
+| `sendMouseClick(options)` | ✅ Yes | Perform mouse click(s) |
+| `sendMouseScroll(options)` | ❌ No | Perform scroll operation |
+
+##### sendMouseMove(x, y)
+
+Move the mouse cursor to specific coordinates in remote desktop pixels.
+
+```javascript
+// Move to position (100, 200)
+client.sendMouseMove(100, 200);
+
+// Move to center of screen
+const res = client.getResolution();
+client.sendMouseMove(res.width / 2, res.height / 2);
+```
+
+##### sendMouseClick(options)
+
+Perform mouse click(s) at the current or specified position. This is an **async** method that returns a Promise.
+
+```javascript
+// Left click at current cursor position
+await client.sendMouseClick();
+
+// Left click at specific coordinates
+await client.sendMouseClick({ x: 500, y: 300 });
+
+// Right click
+await client.sendMouseClick({ button: 'right' });
+
+// Double click
+await client.sendMouseClick({ x: 100, y: 100, count: 2 });
+
+// Middle click with custom delay between clicks
+await client.sendMouseClick({ button: 'middle', count: 3, delay: 100 });
+```
+
+**Options:**
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `x` | number | last position | X coordinate in remote pixels |
+| `y` | number | last position | Y coordinate in remote pixels |
+| `button` | string | `'left'` | Button: `'left'`, `'right'`, or `'middle'` |
+| `count` | number | `1` | Number of clicks (e.g., 2 for double-click) |
+| `delay` | number | `50` | Delay in ms between multiple clicks |
+
+##### sendMouseScroll(options)
+
+Perform a scroll operation at the current or specified position.
+
+```javascript
+// Scroll down at current position
+client.sendMouseScroll({ deltaY: 100 });
+
+// Scroll up
+client.sendMouseScroll({ deltaY: -100 });
+
+// Scroll at specific position
+client.sendMouseScroll({ x: 500, y: 300, deltaY: 50 });
+
+// Horizontal scroll (right)
+client.sendMouseScroll({ deltaX: 50 });
+
+// Horizontal scroll (left)
+client.sendMouseScroll({ deltaX: -50 });
+
+// Combined scroll
+client.sendMouseScroll({ deltaX: 20, deltaY: 100 });
+```
+
+**Options:**
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `x` | number | last position | X coordinate in remote pixels |
+| `y` | number | last position | Y coordinate in remote pixels |
+| `deltaX` | number | `0` | Horizontal scroll (positive = right) |
+| `deltaY` | number | `0` | Vertical scroll (positive = down) |
+
+#### Automation Example
+
+```javascript
+// Simple automation: Open Run dialog and type a command
+async function openNotepad(client) {
+    // Open Run dialog
+    client.sendKeyCombo('Win+R');
+    
+    // Wait for dialog to appear
+    await new Promise(r => setTimeout(r, 500));
+    
+    // Type command
+    await client.sendKeys('notepad', { delay: 30 });
+    
+    // Press Enter
+    client.sendKeyCombo('Enter');
+}
+
+// Click automation: Navigate a menu
+async function clickFileMenu(client) {
+    // Click on File menu (coordinates depend on application)
+    await client.sendMouseClick({ x: 30, y: 50 });
+    
+    // Wait for menu to open
+    await new Promise(r => setTimeout(r, 200));
+    
+    // Click on Save option
+    await client.sendMouseClick({ x: 50, y: 120 });
+}
+```
 
 ### Events
 

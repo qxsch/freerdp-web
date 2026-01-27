@@ -240,6 +240,25 @@ const STYLES = `
     max-height: 100%;
 }
 
+/* API Cursor Overlay - shown when using programmatic mouse API */
+.rdp-api-cursor {
+    position: absolute;
+    pointer-events: none;
+    z-index: 100;
+    display: none;
+    transform: translate(-2px, -2px);
+}
+
+.rdp-api-cursor.visible {
+    display: block;
+}
+
+.rdp-api-cursor-icon {
+    width: 24px;
+    height: 24px;
+    filter: drop-shadow(1px 1px 2px rgba(0, 0, 0, 0.7));
+}
+
 .rdp-loading {
     position: absolute;
     top: 50%;
@@ -516,6 +535,13 @@ const TEMPLATE = `
                 <p>Click Connect to start</p>
             </div>
             <canvas class="rdp-canvas" width="1280" height="720" style="display: none;"></canvas>
+            
+            <!-- API Cursor Overlay - shown when using programmatic mouse methods -->
+            <div class="rdp-api-cursor">
+                <svg class="rdp-api-cursor-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M4 4L10.5 20L12.5 13.5L19 11.5L4 4Z" fill="white" stroke="black" stroke-width="1.5" stroke-linejoin="round"/>
+                </svg>
+            </div>
             
             <!-- Virtual Keyboard Overlay -->
             <div class="rdp-keyboard-overlay">
@@ -884,6 +910,10 @@ export class RDPClient {
         this._screenshotRequests = new Map();
         this._screenshotRequestId = 0;
         
+        // API cursor state (for programmatic mouse control)
+        this._apiCursorVisible = false;
+        this._apiCursorPos = { x: 0, y: 0 };
+        
         // Virtual keyboard state
         this._keyboardVisible = false;
         this._keyboardModifiers = { ctrl: false, alt: false, shift: false, meta: false, altgr: false };
@@ -938,6 +968,8 @@ export class RDPClient {
             controls: $('.rdp-controls'),
             btnOverflow: $('.rdp-btn-overflow'),
             overflowDropdown: $('.rdp-overflow-dropdown'),
+            // API cursor overlay
+            apiCursor: $('.rdp-api-cursor'),
         };
         
         // Apply button visibility based on visibleTopBarButtons option
@@ -1708,11 +1740,142 @@ export class RDPClient {
     /**
      * Send Backspace key press
      * @param {number} [count=1] - Number of backspace keys to send
+     * @returns {Promise<void>} Resolves when all backspaces are sent
      */
-    sendBackspace(count = 1) {
+    async sendBackspace(count = 1) {
         for (let i = 0; i < count; i++) {
+            if (i > 0) {
+                await this._delay(20);
+            }
             this.sendKeyCombo('Backspace');
         }
+    }
+
+    // --------------------------------------------------
+    // PUBLIC API: PROGRAMMATIC MOUSE CONTROL
+    // --------------------------------------------------
+
+    /**
+     * Move the mouse cursor to a specific position
+     * Shows a visual cursor overlay until real mouse movement is detected
+     * @param {number} x - X coordinate in remote desktop pixels
+     * @param {number} y - Y coordinate in remote desktop pixels
+     * @returns {void}
+     * @throws {Error} If not connected
+     * @example
+     * client.sendMouseMove(100, 200);
+     */
+    sendMouseMove(x, y) {
+        if (!this._isConnected) throw new Error('Not connected');
+        
+        x = Math.round(x);
+        y = Math.round(y);
+        
+        this._sendMessage({ type: 'mouse', action: 'move', x, y });
+        this._showApiCursor(x, y);
+    }
+
+    /**
+     * Perform a mouse click at the current cursor position or specified coordinates
+     * Shows a visual cursor overlay until real mouse movement is detected
+     * @param {Object} [options={}] - Click options
+     * @param {number} [options.x] - X coordinate (if omitted, clicks at last API cursor position)
+     * @param {number} [options.y] - Y coordinate (if omitted, clicks at last API cursor position)
+     * @param {'left'|'right'|'middle'} [options.button='left'] - Mouse button to click
+     * @param {number} [options.count=1] - Number of clicks (e.g., 2 for double-click)
+     * @param {number} [options.delay=50] - Delay between clicks in ms (for multiple clicks)
+     * @returns {Promise<void>} Resolves when all clicks are complete
+     * @throws {Error} If not connected
+     * @example
+     * // Left click at current position
+     * await client.sendMouseClick();
+     * 
+     * // Right click at specific position
+     * await client.sendMouseClick({ x: 500, y: 300, button: 'right' });
+     * 
+     * // Double click
+     * await client.sendMouseClick({ x: 100, y: 100, count: 2 });
+     */
+    async sendMouseClick(options = {}) {
+        if (!this._isConnected) throw new Error('Not connected');
+        
+        const {
+            x = this._apiCursorPos.x,
+            y = this._apiCursorPos.y,
+            button = 'left',
+            count = 1,
+            delay = 50
+        } = options;
+        
+        const buttonCode = button === 'right' ? 2 : button === 'middle' ? 1 : 0;
+        const posX = Math.round(x);
+        const posY = Math.round(y);
+        
+        // Move to position first if coordinates provided
+        if (options.x !== undefined || options.y !== undefined) {
+            this._sendMessage({ type: 'mouse', action: 'move', x: posX, y: posY });
+        }
+        
+        this._showApiCursor(posX, posY);
+        
+        for (let i = 0; i < count; i++) {
+            if (i > 0) {
+                await this._delay(delay);
+            }
+            this._sendMessage({ type: 'mouse', action: 'down', button: buttonCode, x: posX, y: posY });
+            await this._delay(20);
+            this._sendMessage({ type: 'mouse', action: 'up', button: buttonCode, x: posX, y: posY });
+        }
+    }
+
+    /**
+     * Perform a mouse scroll at the current cursor position or specified coordinates
+     * Shows a visual cursor overlay until real mouse movement is detected
+     * @param {Object} [options={}] - Scroll options
+     * @param {number} [options.x] - X coordinate (if omitted, scrolls at last API cursor position)
+     * @param {number} [options.y] - Y coordinate (if omitted, scrolls at last API cursor position)
+     * @param {number} [options.deltaX=0] - Horizontal scroll amount (positive = right, negative = left)
+     * @param {number} [options.deltaY=0] - Vertical scroll amount (positive = down, negative = up)
+     * @returns {void}
+     * @throws {Error} If not connected
+     * @example
+     * // Scroll down at current position
+     * client.sendMouseScroll({ deltaY: 100 });
+     * 
+     * // Scroll up at specific position
+     * client.sendMouseScroll({ x: 500, y: 300, deltaY: -100 });
+     * 
+     * // Horizontal scroll
+     * client.sendMouseScroll({ deltaX: 50 });
+     */
+    sendMouseScroll(options = {}) {
+        if (!this._isConnected) throw new Error('Not connected');
+        
+        const {
+            x = this._apiCursorPos.x,
+            y = this._apiCursorPos.y,
+            deltaX = 0,
+            deltaY = 0
+        } = options;
+        
+        const posX = Math.round(x);
+        const posY = Math.round(y);
+        
+        // Move to position first if coordinates provided
+        if (options.x !== undefined || options.y !== undefined) {
+            this._sendMessage({ type: 'mouse', action: 'move', x: posX, y: posY });
+        }
+        
+        this._showApiCursor(posX, posY);
+        
+        this._sendMessage({
+            type: 'mouse',
+            action: 'wheel',
+            deltaX,
+            deltaY,
+            x: posX,
+            y: posY
+        });
     }
 
     /**
@@ -2608,6 +2771,51 @@ export class RDPClient {
     // PRIVATE: INPUT HANDLING
     // --------------------------------------------------
 
+    /**
+     * Simple delay helper for async operations
+     * @param {number} ms - Milliseconds to delay
+     * @returns {Promise<void>}
+     * @private
+     */
+    _delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * Show the API cursor overlay at the specified remote desktop coordinates
+     * @param {number} x - X coordinate in remote desktop pixels
+     * @param {number} y - Y coordinate in remote desktop pixels
+     * @private
+     */
+    _showApiCursor(x, y) {
+        this._apiCursorPos = { x, y };
+        this._apiCursorVisible = true;
+        
+        // Convert remote desktop coordinates to screen coordinates
+        const rect = this._canvas.getBoundingClientRect();
+        const scaleX = rect.width / this._canvas.width;
+        const scaleY = rect.height / this._canvas.height;
+        
+        // Calculate position relative to the screen container
+        const screenX = x * scaleX;
+        const screenY = y * scaleY;
+        
+        this._el.apiCursor.style.left = `${screenX}px`;
+        this._el.apiCursor.style.top = `${screenY}px`;
+        this._el.apiCursor.classList.add('visible');
+    }
+
+    /**
+     * Hide the API cursor overlay
+     * @private
+     */
+    _hideApiCursor() {
+        if (this._apiCursorVisible) {
+            this._apiCursorVisible = false;
+            this._el.apiCursor.classList.remove('visible');
+        }
+    }
+
     _getMousePos(e) {
         const rect = this._canvas.getBoundingClientRect();
         const scaleX = this._canvas.width / rect.width;
@@ -2620,6 +2828,9 @@ export class RDPClient {
 
     _handleMouseMove(e) {
         if (!this._isConnected) return;
+        
+        // Hide API cursor when real mouse moves
+        this._hideApiCursor();
         
         const now = Date.now();
         if (now - this._lastMouseSend < this.options.mouseThrottleMs) return;
