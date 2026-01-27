@@ -66,6 +66,26 @@
 #define RDP_MAX_SESSIONS_MIN 2
 #define RDP_MAX_SESSIONS_MAX 1000
 
+/* Forward declaration of internal FreeRDP cache structures.
+ * These are internal (FREERDP_LOCAL) in FreeRDP but we need them for
+ * pointer caching since DeactivateClientDecoding=TRUE skips the normal
+ * pointer_cache_register_callbacks() call. */
+typedef struct _BridgePointerCache {
+    UINT32 cacheSize;
+    rdpPointer** entries;
+    rdpContext* context;
+} BridgePointerCache;
+
+typedef struct _BridgeCache {
+    void* glyph;               /* rdpGlyphCache* - unused by us */
+    void* brush;               /* rdpBrushCache* - unused by us */
+    BridgePointerCache* pointer;
+    void* bitmap;              /* rdpBitmapCache* - unused by us */
+    void* offscreen;           /* rdpOffscreenCache* - unused by us */
+    void* palette;             /* rdpPaletteCache* - unused by us */
+    void* nine_grid;           /* rdpNineGridCache* - unused by us */
+} BridgeCache;
+
 /* Extended client context */
 typedef struct {
     rdpClientContext common;        /* Must be first */
@@ -1184,6 +1204,270 @@ static BOOL bridge_pointer_set_position(rdpContext* context, UINT32 x, UINT32 y)
 }
 
 /* ============================================================================
+ * Pointer Update Callbacks (rdpPointerUpdate -> rdpPointer dispatch)
+ * 
+ * These callbacks receive pointer PDUs from the RDP server and dispatch to
+ * our registered rdpPointer callbacks. We need to register these manually
+ * because DeactivateClientDecoding=TRUE skips pointer_cache_register_callbacks().
+ * ============================================================================ */
+
+/* Allocate a pointer using our registered prototype */
+static rdpPointer* Bridge_Pointer_Alloc(rdpContext* context)
+{
+    rdpGraphics* graphics = context->graphics;
+    rdpPointer* pointer = (rdpPointer*)calloc(1, graphics->Pointer_Prototype->size);
+    if (pointer) {
+        *pointer = *graphics->Pointer_Prototype;
+    }
+    return pointer;
+}
+
+/* Free a pointer and its resources */
+static void Bridge_Pointer_Free(rdpContext* context, rdpPointer* pointer)
+{
+    if (pointer) {
+        if (pointer->Free) {
+            pointer->Free(context, pointer);
+        }
+        free(pointer->andMaskData);
+        free(pointer->xorMaskData);
+        free(pointer);
+    }
+}
+
+/* Handle POINTER_POSITION_UPDATE PDU */
+static BOOL bridge_update_pointer_position(rdpContext* context,
+                                           const POINTER_POSITION_UPDATE* pointer_position)
+{
+    if (!context || !context->graphics || !context->graphics->Pointer_Prototype || !pointer_position)
+        return FALSE;
+
+    rdpPointer* pointer = context->graphics->Pointer_Prototype;
+    if (pointer->SetPosition) {
+        return pointer->SetPosition(context, pointer_position->xPos, pointer_position->yPos);
+    }
+    return TRUE;
+}
+
+/* Handle POINTER_SYSTEM_UPDATE PDU */
+static BOOL bridge_update_pointer_system(rdpContext* context,
+                                         const POINTER_SYSTEM_UPDATE* pointer_system)
+{
+    if (!context || !context->graphics || !context->graphics->Pointer_Prototype || !pointer_system)
+        return FALSE;
+
+    rdpPointer* pointer = context->graphics->Pointer_Prototype;
+    
+    switch (pointer_system->type) {
+        case SYSPTR_NULL:
+            if (pointer->SetNull)
+                return pointer->SetNull(context);
+            break;
+        case SYSPTR_DEFAULT:
+            if (pointer->SetDefault)
+                return pointer->SetDefault(context);
+            break;
+        default:
+            fprintf(stderr, "[rdp_bridge] Unknown system pointer type: 0x%08X\n", pointer_system->type);
+    }
+    return TRUE;
+}
+
+/* Handle POINTER_COLOR_UPDATE PDU (legacy color cursor) */
+static BOOL bridge_update_pointer_color(rdpContext* context,
+                                        const POINTER_COLOR_UPDATE* pointer_color)
+{
+    if (!context || !pointer_color)
+        return FALSE;
+
+    BridgeCache* cache = (BridgeCache*)context->cache;
+    rdpPointer* pointer = Bridge_Pointer_Alloc(context);
+    if (!pointer)
+        return FALSE;
+
+    pointer->xorBpp = 24;  /* Color pointer uses 24bpp */
+    pointer->xPos = pointer_color->hotSpotX;
+    pointer->yPos = pointer_color->hotSpotY;
+    pointer->width = pointer_color->width;
+    pointer->height = pointer_color->height;
+
+    /* Copy AND mask */
+    if (pointer_color->lengthAndMask > 0 && pointer_color->andMaskData) {
+        pointer->lengthAndMask = pointer_color->lengthAndMask;
+        pointer->andMaskData = (BYTE*)malloc(pointer_color->lengthAndMask);
+        if (!pointer->andMaskData) goto fail;
+        memcpy(pointer->andMaskData, pointer_color->andMaskData, pointer_color->lengthAndMask);
+    }
+
+    /* Copy XOR mask */
+    if (pointer_color->lengthXorMask > 0 && pointer_color->xorMaskData) {
+        pointer->lengthXorMask = pointer_color->lengthXorMask;
+        pointer->xorMaskData = (BYTE*)malloc(pointer_color->lengthXorMask);
+        if (!pointer->xorMaskData) goto fail;
+        memcpy(pointer->xorMaskData, pointer_color->xorMaskData, pointer_color->lengthXorMask);
+    }
+
+    /* Call New to convert to BGRA */
+    if (pointer->New && !pointer->New(context, pointer))
+        goto fail;
+
+    /* Store in cache */
+    if (cache && cache->pointer) {
+        BridgePointerCache* pointerCache = cache->pointer;
+        if (pointer_color->cacheIndex < pointerCache->cacheSize) {
+            Bridge_Pointer_Free(context, pointerCache->entries[pointer_color->cacheIndex]);
+            pointerCache->entries[pointer_color->cacheIndex] = pointer;
+        }
+    }
+
+    /* Set as current cursor */
+    if (pointer->Set)
+        return pointer->Set(context, pointer);
+    return TRUE;
+
+fail:
+    Bridge_Pointer_Free(context, pointer);
+    return FALSE;
+}
+
+/* Handle POINTER_NEW_UPDATE PDU (new cursor with specified bpp) */
+static BOOL bridge_update_pointer_new(rdpContext* context,
+                                      const POINTER_NEW_UPDATE* pointer_new)
+{
+    if (!context || !pointer_new)
+        return FALSE;
+
+    BridgeCache* cache = (BridgeCache*)context->cache;
+    rdpPointer* pointer = Bridge_Pointer_Alloc(context);
+    if (!pointer)
+        return FALSE;
+
+    pointer->xorBpp = pointer_new->xorBpp;
+    pointer->xPos = pointer_new->colorPtrAttr.hotSpotX;
+    pointer->yPos = pointer_new->colorPtrAttr.hotSpotY;
+    pointer->width = pointer_new->colorPtrAttr.width;
+    pointer->height = pointer_new->colorPtrAttr.height;
+
+    /* Copy AND mask */
+    if (pointer_new->colorPtrAttr.lengthAndMask > 0 && pointer_new->colorPtrAttr.andMaskData) {
+        pointer->lengthAndMask = pointer_new->colorPtrAttr.lengthAndMask;
+        pointer->andMaskData = (BYTE*)malloc(pointer_new->colorPtrAttr.lengthAndMask);
+        if (!pointer->andMaskData) goto fail;
+        memcpy(pointer->andMaskData, pointer_new->colorPtrAttr.andMaskData, pointer_new->colorPtrAttr.lengthAndMask);
+    }
+
+    /* Copy XOR mask */
+    if (pointer_new->colorPtrAttr.lengthXorMask > 0 && pointer_new->colorPtrAttr.xorMaskData) {
+        pointer->lengthXorMask = pointer_new->colorPtrAttr.lengthXorMask;
+        pointer->xorMaskData = (BYTE*)malloc(pointer_new->colorPtrAttr.lengthXorMask);
+        if (!pointer->xorMaskData) goto fail;
+        memcpy(pointer->xorMaskData, pointer_new->colorPtrAttr.xorMaskData, pointer_new->colorPtrAttr.lengthXorMask);
+    }
+
+    /* Call New to convert to BGRA */
+    if (pointer->New && !pointer->New(context, pointer))
+        goto fail;
+
+    /* Store in cache */
+    if (cache && cache->pointer) {
+        BridgePointerCache* pointerCache = cache->pointer;
+        if (pointer_new->colorPtrAttr.cacheIndex < pointerCache->cacheSize) {
+            Bridge_Pointer_Free(context, pointerCache->entries[pointer_new->colorPtrAttr.cacheIndex]);
+            pointerCache->entries[pointer_new->colorPtrAttr.cacheIndex] = pointer;
+        }
+    }
+
+    /* Set as current cursor */
+    if (pointer->Set)
+        return pointer->Set(context, pointer);
+    return TRUE;
+
+fail:
+    Bridge_Pointer_Free(context, pointer);
+    return FALSE;
+}
+
+/* Handle POINTER_LARGE_UPDATE PDU (large cursor, > 96x96) */
+static BOOL bridge_update_pointer_large(rdpContext* context,
+                                        const POINTER_LARGE_UPDATE* pointer_large)
+{
+    if (!context || !pointer_large)
+        return FALSE;
+
+    BridgeCache* cache = (BridgeCache*)context->cache;
+    rdpPointer* pointer = Bridge_Pointer_Alloc(context);
+    if (!pointer)
+        return FALSE;
+
+    pointer->xorBpp = pointer_large->xorBpp;
+    pointer->xPos = pointer_large->hotSpotX;
+    pointer->yPos = pointer_large->hotSpotY;
+    pointer->width = pointer_large->width;
+    pointer->height = pointer_large->height;
+
+    /* Copy AND mask */
+    if (pointer_large->lengthAndMask > 0 && pointer_large->andMaskData) {
+        pointer->lengthAndMask = pointer_large->lengthAndMask;
+        pointer->andMaskData = (BYTE*)malloc(pointer_large->lengthAndMask);
+        if (!pointer->andMaskData) goto fail;
+        memcpy(pointer->andMaskData, pointer_large->andMaskData, pointer_large->lengthAndMask);
+    }
+
+    /* Copy XOR mask */
+    if (pointer_large->lengthXorMask > 0 && pointer_large->xorMaskData) {
+        pointer->lengthXorMask = pointer_large->lengthXorMask;
+        pointer->xorMaskData = (BYTE*)malloc(pointer_large->lengthXorMask);
+        if (!pointer->xorMaskData) goto fail;
+        memcpy(pointer->xorMaskData, pointer_large->xorMaskData, pointer_large->lengthXorMask);
+    }
+
+    /* Call New to convert to BGRA */
+    if (pointer->New && !pointer->New(context, pointer))
+        goto fail;
+
+    /* Store in cache */
+    if (cache && cache->pointer) {
+        BridgePointerCache* pointerCache = cache->pointer;
+        if (pointer_large->cacheIndex < pointerCache->cacheSize) {
+            Bridge_Pointer_Free(context, pointerCache->entries[pointer_large->cacheIndex]);
+            pointerCache->entries[pointer_large->cacheIndex] = pointer;
+        }
+    }
+
+    /* Set as current cursor */
+    if (pointer->Set)
+        return pointer->Set(context, pointer);
+    return TRUE;
+
+fail:
+    Bridge_Pointer_Free(context, pointer);
+    return FALSE;
+}
+
+/* Handle POINTER_CACHED_UPDATE PDU (use cached cursor) */
+static BOOL bridge_update_pointer_cached(rdpContext* context,
+                                         const POINTER_CACHED_UPDATE* pointer_cached)
+{
+    if (!context || !pointer_cached)
+        return FALSE;
+
+    BridgeCache* cache = (BridgeCache*)context->cache;
+    if (!cache || !cache->pointer)
+        return FALSE;
+
+    BridgePointerCache* pointerCache = cache->pointer;
+    if (pointer_cached->cacheIndex >= pointerCache->cacheSize)
+        return FALSE;
+
+    rdpPointer* pointer = pointerCache->entries[pointer_cached->cacheIndex];
+    if (pointer && pointer->Set) {
+        return pointer->Set(context, pointer);
+    }
+
+    return FALSE;
+}
+
+/* ============================================================================
  * Deferred GDI Pipeline Initialization
  * ============================================================================ */
 
@@ -1504,6 +1788,25 @@ static BOOL bridge_post_connect(freerdp* instance)
         pointer_proto.SetPosition = bridge_pointer_set_position;
         graphics_register_pointer(context->graphics, &pointer_proto);
         fprintf(stderr, "[rdp_bridge] Pointer callbacks registered (no-GDI mode)\n");
+    }
+    
+    /* Register pointer UPDATE callbacks.
+     * Since we use DeactivateClientDecoding=TRUE, pointer_cache_register_callbacks()
+     * is not called by FreeRDP. We need to register these ourselves to receive
+     * pointer PDUs from the RDP server. */
+    {
+        rdpPointerUpdate* pointer = context->update->pointer;
+        if (pointer) {
+            pointer->PointerPosition = bridge_update_pointer_position;
+            pointer->PointerSystem = bridge_update_pointer_system;
+            pointer->PointerColor = bridge_update_pointer_color;
+            pointer->PointerNew = bridge_update_pointer_new;
+            pointer->PointerLarge = bridge_update_pointer_large;
+            pointer->PointerCached = bridge_update_pointer_cached;
+            fprintf(stderr, "[rdp_bridge] Pointer UPDATE callbacks registered\n");
+        } else {
+            fprintf(stderr, "[rdp_bridge] WARNING: pointer update is NULL!\n");
+        }
     }
     
     /* Check if server supports GFX */
