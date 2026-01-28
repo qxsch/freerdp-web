@@ -349,6 +349,10 @@ client.setTheme({
         });
 
         document.getElementById('btn-keyboard').addEventListener('click', () => {
+            if(client.isConnected() === false) {
+                alert('Not connected');
+                return;
+            }
             if (client.isKeyboardVisible()) {
                 client.hideKeyboard();
                 console.log('Keyboard hidden');
