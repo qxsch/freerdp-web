@@ -224,7 +224,7 @@ const client = new RDPClient(container, {
 
 #### additionalTopBarButtons Options
 
-Add up to 4 custom buttons to the top bar. Buttons are inserted before the built-in controls (Connect, Disconnect, etc.).
+Add up to 10 custom buttons to the top bar. Buttons are inserted before the built-in controls (Connect, Disconnect, etc.).
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
