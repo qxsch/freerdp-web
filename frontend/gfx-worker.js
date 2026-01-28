@@ -454,7 +454,7 @@ function decodeProgressiveTile(msg) {
     const inputPtr = wasmModule._malloc(payload.byteLength);
     wasmModule.HEAPU8.set(payload, inputPtr);
     
-    // Use parallel decompress when available for better performance
+    // Use parallel decode if available (clipRect handling is in JS after decode)
     let result;
     if (parallelDecompressAvailable) {
         result = wasmModule._prog_decompress_parallel(
@@ -480,14 +480,14 @@ function decodeProgressiveTile(msg) {
     
     // Use new batch tile tracking API for efficient iteration
     const updatedCount = wasmModule._prog_get_updated_tile_count(progCtx);
-    
+
     // Skip if no tiles were updated
     if (updatedCount === 0) {
         return;
     }
-    
+
     let tilesDrawn = 0;
-    
+
     // Get surface grid dimensions for index-to-coordinates conversion
     const gridWidth = Math.ceil(surface.width / 64);
     
@@ -504,7 +504,7 @@ function decodeProgressiveTile(msg) {
             const yIdx = Math.floor(tileIdx / gridWidth);
             const tileX = xIdx * 64;
             const tileY = yIdx * 64;
-            
+
             // Get tile pixel data
             const tileDataPtr = wasmModule._prog_get_tile_data(progCtx, actualSurfaceId, xIdx, yIdx);
             if (!tileDataPtr) {
@@ -533,11 +533,60 @@ function decodeProgressiveTile(msg) {
             copiedData.set(pixelData);
             
             const imageData = new ImageData(copiedData, 64, 64);
+
+            // Handle clipping based on per-tile clipRects
+            // Each tile has its own clipRects from when it was decoded (important for multi-region frames)
+            let tileWasDrawn = false;
+
+            // Get per-tile clipRect count (uses the clipRects from when this tile was decoded)
+            const tileClipRectCount = wasmModule._prog_get_tile_clip_rect_count ? 
+                wasmModule._prog_get_tile_clip_rect_count(progCtx, i) : 0;
             
-            // Draw tile to surface
-            surface.ctx.putImageData(imageData, tileX, tileY, 0, 0, tileW, tileH);
-            
-            tilesDrawn++;
+            // If count is 0, > 16 (too many to store), or undefined, draw the full tile
+            // This ensures tiles from regions with many clipRects (like full-screen wallpaper) draw correctly
+            if (tileClipRectCount === 0 || tileClipRectCount > 16) {
+                // No clipRects or too many - draw the full tile
+                surface.ctx.putImageData(imageData, tileX, tileY, 0, 0, tileW, tileH);
+                tileWasDrawn = true;
+            } else {
+                // For each clipRect, compute intersection with this tile and draw that portion
+                // This matches FreeRDP's approach: region16_intersect_rect followed by loop over nbUpdateRects
+                // Each clipRect can produce a separate draw operation for this tile
+                for (let ci = 0; ci < tileClipRectCount; ci++) {
+                    const cx = wasmModule._prog_get_tile_clip_rect_x(progCtx, i, ci);
+                    const cy = wasmModule._prog_get_tile_clip_rect_y(progCtx, i, ci);
+                    const cw = wasmModule._prog_get_tile_clip_rect_width(progCtx, i, ci);
+                    const ch = wasmModule._prog_get_tile_clip_rect_height(progCtx, i, ci);
+                    const crRight = cx + cw;
+                    const crBottom = cy + ch;
+                    
+                    // Check if this clipRect intersects the tile
+                    if (tileX < crRight && tileX + tileW > cx &&
+                        tileY < crBottom && tileY + tileH > cy) {
+                        // Calculate intersection rectangle
+                        const intersectLeft = Math.max(tileX, cx);
+                        const intersectTop = Math.max(tileY, cy);
+                        const intersectRight = Math.min(tileX + tileW, crRight);
+                        const intersectBottom = Math.min(tileY + tileH, crBottom);
+                        
+                        if (intersectRight > intersectLeft && intersectBottom > intersectTop) {
+                            // Calculate dirty rect within the 64x64 tile imageData
+                            const dirtyX = intersectLeft - tileX;
+                            const dirtyY = intersectTop - tileY;
+                            const dirtyW = intersectRight - intersectLeft;
+                            const dirtyH = intersectBottom - intersectTop;
+                            
+                            // putImageData(imageData, dx, dy, dirtyX, dirtyY, dirtyWidth, dirtyHeight)
+                            surface.ctx.putImageData(imageData, tileX, tileY, dirtyX, dirtyY, dirtyW, dirtyH);
+                            tileWasDrawn = true;
+                        }
+                    }
+                }
+            }
+
+            if (tileWasDrawn) {
+                tilesDrawn++;
+            }
         }
     } catch (e) {
         console.error(`[GFX Worker] Progressive tile loop error at tile ${tilesDrawn}:`, e);
@@ -617,7 +666,6 @@ function decodeClearCodecTile(msg) {
     // Create ImageData and draw to surface
     const imageData = new ImageData(copiedData, w, h);
     surface.ctx.putImageData(imageData, msg.x, msg.y);
-    
 }
 
 /**
@@ -1188,7 +1236,7 @@ async function endFrame(frameId) {
     if (currentFrameId !== frameId) {
         console.warn(`[GFX Worker] Frame mismatch: expected ${currentFrameId}, got ${frameId}`);
     }
-    
+
     // Composite all mapped surfaces that were updated in this frame to primary canvas
     // Per MS-RDPEGFX: Each mapped surface is drawn at its (outputX, outputY) position
     if (primaryCanvas && primaryCtx) {
@@ -1271,23 +1319,23 @@ async function handleBinaryMessage(data) {
         case 'createSurface':
             createSurface(msg.surfaceId, msg.width, msg.height, msg.format);
             break;
-            
+
         case 'deleteSurface':
             deleteSurface(msg.surfaceId);
             break;
-        
+
         case 'mapSurface':
             mapSurfaceToOutput(msg.surfaceId, msg.outputX || 0, msg.outputY || 0);
             break;
-            
+
         case 'startFrame':
             startFrame(msg.frameId);
             break;
-            
+
         case 'endFrame':
             await endFrame(msg.frameId);
             break;
-            
+
         case 'tile':
             // Execute immediately in arrival order (strict ordering like FreeRDP)
             if (msg.codec === 'progressive') {
@@ -1302,35 +1350,35 @@ async function handleBinaryMessage(data) {
                 console.warn(`[GFX Worker] Unknown tile codec: "${msg.codec}", surfaceId=${msg.surfaceId}, x=${msg.x}, y=${msg.y}`);
             }
             break;
-            
+
         case 'solidFill':
             applySolidFill(msg);
             break;
-            
+
         case 'surfaceToSurface':
             applySurfaceToSurface(msg);
             break;
-            
+
         case 'surfaceToCache':
             applySurfaceToCache(msg);
             break;
-            
+
         case 'cacheToSurface':
             applyCacheToSurface(msg);
             break;
-            
+
         case 'evictCache':
             applyEvictCache(msg);
             break;
-            
+
         case 'resetGraphics':
             applyResetGraphics(msg);
             break;
-            
+
         case 'capsConfirm':
             applyCapsConfirm(msg);
             break;
-            
+
         case 'initSettings':
             applyInitSettings(msg);
             break;
@@ -1353,7 +1401,7 @@ async function handleBinaryMessage(data) {
                 await decodeH264Frame(msg);
             }
             break;
-            
+
         default:
             console.warn('[GFX Worker] Unhandled message type:', msg.type);
             return false;

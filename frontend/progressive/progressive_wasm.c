@@ -401,6 +401,87 @@ static int parse_prog_quant_vals(const uint8_t* data, size_t size,
 }
 
 /**
+ * Check if a tile intersects with any clipping rectangle
+ * 
+ * Per MS-RDPEGFX 2.2.4.2, tiles should only be rendered within the clipping region.
+ * This prevents Progressive from overwriting other codec content (ClearCodec, etc).
+ * 
+ * @param ctx   Progressive context with clipRects
+ * @param tileX Tile X position in pixels
+ * @param tileY Tile Y position in pixels
+ * @return true if tile intersects any clipping rect, false otherwise
+ */
+static inline bool tile_intersects_clip(ProgressiveContext* ctx, uint16_t tileX, uint16_t tileY) {
+    /* Memory barrier to ensure we see the latest clipRects from main thread */
+    __sync_synchronize();
+    
+    /* If no clipping rects, assume full-screen update (intersects all) */
+    if (ctx->numClipRects == 0) {
+        return true;
+    }
+    
+    uint16_t tileRight = tileX + RFX_TILE_SIZE;
+    uint16_t tileBottom = tileY + RFX_TILE_SIZE;
+    
+    for (uint16_t i = 0; i < ctx->numClipRects; i++) {
+        const RfxRect* r = &ctx->clipRects[i];
+        uint16_t rectRight = r->x + r->width;
+        uint16_t rectBottom = r->y + r->height;
+        
+        /* Check for rectangle intersection */
+        if (tileX < rectRight && tileRight > r->x &&
+            tileY < rectBottom && tileBottom > r->y) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Add a tile to the updated tiles list with its current clipRects
+ * This stores the clipRects that were active when the tile was decoded,
+ * so JavaScript can use the correct clipRects for each tile (important when
+ * multiple regions with different clipRects are in one frame).
+ */
+static inline void add_updated_tile_with_cliprects(ProgressiveContext* ctx, uint32_t tileIdx) {
+    if (ctx->numUpdatedTiles >= RFX_MAX_TILES_PER_SURFACE) {
+        return;
+    }
+    
+    /* Store the tile index */
+    uint32_t tileListIdx = ctx->numUpdatedTiles;
+    ctx->updatedTileIndices[tileListIdx] = tileIdx;
+    
+    /* Store clipRect offset and count for this tile */
+    ctx->tileClipRectStart[tileListIdx] = (uint16_t)ctx->perTileClipRectsTotal;
+    
+    /* Store the ACTUAL clipRect count from the region
+     * If there are more than 16 clipRects, we signal JavaScript to draw the tile fully
+     * by storing the high count (it will check > 16 and draw fully) */
+    uint16_t actualCount = ctx->numClipRects;
+    
+    /* Copy current clipRects to per-tile buffer (limit to 16 per tile) */
+    uint16_t numToCopy = (actualCount <= 16) ? actualCount : 16;
+    
+    /* Check if we have room in the buffer */
+    if (ctx->perTileClipRectsTotal + numToCopy > RFX_MAX_TILES_PER_SURFACE * 8) {
+        /* No room - store 0 clipRects, tile will draw fully */
+        ctx->tileClipRectCount[tileListIdx] = 0;
+    } else {
+        /* Store the actual count (even if > 16, JS will handle it) */
+        ctx->tileClipRectCount[tileListIdx] = actualCount;
+        
+        for (uint16_t i = 0; i < numToCopy; i++) {
+            ctx->perTileClipRects[ctx->perTileClipRectsTotal + i] = ctx->clipRects[i];
+        }
+        ctx->perTileClipRectsTotal += numToCopy;
+    }
+    
+    ctx->numUpdatedTiles++;
+}
+
+/**
  * Decode a simple tile (non-progressive) - thread-safe version
  * 
  * Uses stack-allocated buffers for Y/Cb/Cr to avoid race conditions
@@ -436,10 +517,17 @@ static int decode_tile_simple(ProgressiveContext* ctx, RfxSurface* surface,
     RfxTile* tile = get_or_create_tile(surface, xIdx, yIdx);
     if (!tile) return -1;
     
-    /* Track tile index for batch updates */
-    uint32_t tileIdx = yIdx * surface->gridWidth + xIdx;
-    if (ctx->numUpdatedTiles < RFX_MAX_TILES_PER_SURFACE) {
-        ctx->updatedTileIndices[ctx->numUpdatedTiles++] = tileIdx;
+    /* Check if tile intersects with clipping region for rendering decision.
+     * We always decode the tile (for coefficient state), but only mark it
+     * dirty and add to update list if it should be rendered. */
+    uint16_t tileX = xIdx * RFX_TILE_SIZE;
+    uint16_t tileY = yIdx * RFX_TILE_SIZE;
+    bool shouldRender = tile_intersects_clip(ctx, tileX, tileY);
+    
+    /* Track tile index for batch updates - only if it should render */
+    if (shouldRender) {
+        uint32_t tileIdx = yIdx * surface->gridWidth + xIdx;
+        add_updated_tile_with_cliprects(ctx, tileIdx);
     }
     
     /* Get quantization values */
@@ -542,10 +630,8 @@ static int decode_tile_simple(ProgressiveContext* ctx, RfxSurface* surface,
     rfx_ycbcr_to_rgba(yBuffer, cbBuffer, crBuffer,
                       tile->data, RFX_TILE_SIZE * 4);
     
-
-    
     tile->pass = 1;
-    tile->dirty = true;
+    tile->dirty = shouldRender;  /* Only mark dirty if intersects clip region */
     tile->valid = true;  /* Tile now has valid decoded content */
     
     return 0;
@@ -587,10 +673,17 @@ static int decode_tile_first(ProgressiveContext* ctx, RfxSurface* surface,
     RfxTile* tile = get_or_create_tile(surface, xIdx, yIdx);
     if (!tile) return -1;
     
-    /* Track tile index for batch updates */
-    uint32_t tileIdx = yIdx * surface->gridWidth + xIdx;
-    if (ctx->numUpdatedTiles < RFX_MAX_TILES_PER_SURFACE) {
-        ctx->updatedTileIndices[ctx->numUpdatedTiles++] = tileIdx;
+    /* Check if tile intersects with clipping region for rendering decision.
+     * We always decode the tile (for coefficient state), but only mark it
+     * dirty and add to update list if it should be rendered. */
+    uint16_t tileX = xIdx * RFX_TILE_SIZE;
+    uint16_t tileY = yIdx * RFX_TILE_SIZE;
+    bool shouldRender = tile_intersects_clip(ctx, tileX, tileY);
+    
+    /* Track tile index for batch updates - only if it should render */
+    if (shouldRender) {
+        uint32_t tileIdx = yIdx * surface->gridWidth + xIdx;
+        add_updated_tile_with_cliprects(ctx, tileIdx);
     }
     
     /* Store quantization indices for progressive refinement */
@@ -757,7 +850,7 @@ static int decode_tile_first(ProgressiveContext* ctx, RfxSurface* surface,
     }
     
     tile->pass = 1;
-    tile->dirty = true;
+    tile->dirty = shouldRender;  /* Only mark dirty if intersects clip region */
     tile->valid = true;  /* Tile now has valid decoded content */
     
     return 0;
@@ -806,10 +899,17 @@ static int decode_tile_upgrade(ProgressiveContext* ctx, RfxSurface* surface,
         return -1;
     }
     
-    /* Track tile index for batch updates */
-    uint32_t tileIdx = yIdx * surface->gridWidth + xIdx;
-    if (ctx->numUpdatedTiles < RFX_MAX_TILES_PER_SURFACE) {
-        ctx->updatedTileIndices[ctx->numUpdatedTiles++] = tileIdx;
+    /* Check if tile intersects with clipping region for rendering decision.
+     * We always decode the tile (for coefficient state), but only mark it
+     * dirty and add to update list if it should be rendered. */
+    uint16_t tileX = xIdx * RFX_TILE_SIZE;
+    uint16_t tileY = yIdx * RFX_TILE_SIZE;
+    bool shouldRender = tile_intersects_clip(ctx, tileX, tileY);
+    
+    /* Track tile index for batch updates - only if it should render */
+    if (shouldRender) {
+        uint32_t tileIdx = yIdx * surface->gridWidth + xIdx;
+        add_updated_tile_with_cliprects(ctx, tileIdx);
     }
     
     /* Get current quantization values for this upgrade pass */
@@ -917,7 +1017,7 @@ static int decode_tile_upgrade(ProgressiveContext* ctx, RfxSurface* surface,
                       tile->data, RFX_TILE_SIZE * 4);
     
     tile->pass++;
-    tile->dirty = true;
+    tile->dirty = shouldRender;  /* Only mark dirty if intersects clip region */
     
     return 0;
 }
@@ -935,7 +1035,7 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
     uint8_t numProgQuant = data[4];
     uint8_t flags = data[5];
     uint16_t numTiles = read_u16_le(data + 6);
-    
+
     /* Store extrapolate flag in context for use by tile decoders
      * Bit 0 (0x01) = RFX_DWT_REDUCE_EXTRAPOLATE:
      * If extrapolate=1: LL3@4015 (81 coefficients, 9x9)
@@ -950,8 +1050,27 @@ static int decode_region(ProgressiveContext* ctx, RfxSurface* surface,
     
     size_t offset = 12;
     
-    /* Skip rectangles (8 bytes each) */
-    offset += numRects * 8;
+    /* Parse clipping rectangles (8 bytes each: x, y, width, height as UINT16)
+     * Per MS-RDPEGFX 2.2.4.2, tiles should only update the screen within these rects.
+     * This prevents Progressive from overwriting ClearCodec content outside the region. */
+    ctx->numClipRects = (numRects <= 256) ? numRects : 256;
+
+    for (uint16_t i = 0; i < ctx->numClipRects; i++) {
+        if (offset + 8 > size) {
+            ctx->numClipRects = i;
+            break;
+        }
+        ctx->clipRects[i].x = read_u16_le(data + offset);
+        ctx->clipRects[i].y = read_u16_le(data + offset + 2);
+        ctx->clipRects[i].width = read_u16_le(data + offset + 4);
+        ctx->clipRects[i].height = read_u16_le(data + offset + 6);
+        offset += 8;
+    }
+
+    /* Skip any remaining rectangles beyond our limit */
+    if (numRects > 256) {
+        offset += (numRects - 256) * 8;
+    }
     if (size < offset) return -1;
     
     /* Parse quantization values */
@@ -1037,6 +1156,7 @@ int prog_decompress(ProgressiveContext* ctx, const uint8_t* srcData,
     
     /* Reset updated tile tracking for new frame */
     ctx->numUpdatedTiles = 0;
+    ctx->perTileClipRectsTotal = 0;
     
     while (offset + 6 <= srcSize) {
         uint16_t blockType = read_u16_le(srcData + offset);
@@ -1258,6 +1378,107 @@ EMSCRIPTEN_KEEPALIVE
 uint32_t prog_get_updated_tile_count(ProgressiveContext* ctx) {
     if (!ctx) return 0;
     return ctx->numUpdatedTiles;
+}
+
+/**
+ * Get number of clipping rectangles from the last region
+ * Used for debugging the clipping fix
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_clip_rect_count(ProgressiveContext* ctx) {
+    if (!ctx) return 0;
+    return ctx->numClipRects;
+}
+
+/**
+ * Get clipping rectangle X coordinate by index
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_clip_rect_x(ProgressiveContext* ctx, uint16_t index) {
+    if (!ctx || index >= ctx->numClipRects) return 0;
+    return ctx->clipRects[index].x;
+}
+
+/**
+ * Get clipping rectangle Y coordinate by index
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_clip_rect_y(ProgressiveContext* ctx, uint16_t index) {
+    if (!ctx || index >= ctx->numClipRects) return 0;
+    return ctx->clipRects[index].y;
+}
+
+/**
+ * Get clipping rectangle width by index
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_clip_rect_width(ProgressiveContext* ctx, uint16_t index) {
+    if (!ctx || index >= ctx->numClipRects) return 0;
+    return ctx->clipRects[index].width;
+}
+
+/**
+ * Get clipping rectangle height by index
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_clip_rect_height(ProgressiveContext* ctx, uint16_t index) {
+    if (!ctx || index >= ctx->numClipRects) return 0;
+    return ctx->clipRects[index].height;
+}
+
+/**
+ * Get the number of clipRects for a specific tile in the updated list
+ * This returns the clipRects that were active when that tile was decoded,
+ * which may differ from the current ctx->clipRects if multiple regions were processed.
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_tile_clip_rect_count(ProgressiveContext* ctx, uint32_t tileListIndex) {
+    if (!ctx || tileListIndex >= ctx->numUpdatedTiles) return 0;
+    return ctx->tileClipRectCount[tileListIndex];
+}
+
+/**
+ * Get per-tile clipRect X coordinate
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_tile_clip_rect_x(ProgressiveContext* ctx, uint32_t tileListIndex, uint16_t clipRectIndex) {
+    if (!ctx || tileListIndex >= ctx->numUpdatedTiles) return 0;
+    if (clipRectIndex >= ctx->tileClipRectCount[tileListIndex]) return 0;
+    uint32_t offset = ctx->tileClipRectStart[tileListIndex] + clipRectIndex;
+    return ctx->perTileClipRects[offset].x;
+}
+
+/**
+ * Get per-tile clipRect Y coordinate
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_tile_clip_rect_y(ProgressiveContext* ctx, uint32_t tileListIndex, uint16_t clipRectIndex) {
+    if (!ctx || tileListIndex >= ctx->numUpdatedTiles) return 0;
+    if (clipRectIndex >= ctx->tileClipRectCount[tileListIndex]) return 0;
+    uint32_t offset = ctx->tileClipRectStart[tileListIndex] + clipRectIndex;
+    return ctx->perTileClipRects[offset].y;
+}
+
+/**
+ * Get per-tile clipRect width
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_tile_clip_rect_width(ProgressiveContext* ctx, uint32_t tileListIndex, uint16_t clipRectIndex) {
+    if (!ctx || tileListIndex >= ctx->numUpdatedTiles) return 0;
+    if (clipRectIndex >= ctx->tileClipRectCount[tileListIndex]) return 0;
+    uint32_t offset = ctx->tileClipRectStart[tileListIndex] + clipRectIndex;
+    return ctx->perTileClipRects[offset].width;
+}
+
+/**
+ * Get per-tile clipRect height
+ */
+EMSCRIPTEN_KEEPALIVE
+uint16_t prog_get_tile_clip_rect_height(ProgressiveContext* ctx, uint32_t tileListIndex, uint16_t clipRectIndex) {
+    if (!ctx || tileListIndex >= ctx->numUpdatedTiles) return 0;
+    if (clipRectIndex >= ctx->tileClipRectCount[tileListIndex]) return 0;
+    uint32_t offset = ctx->tileClipRectStart[tileListIndex] + clipRectIndex;
+    return ctx->perTileClipRects[offset].height;
 }
 
 /**
@@ -1483,9 +1704,30 @@ static int decode_region_parallel(ProgressiveContext* ctx, RfxSurface* surface,
     
     size_t offset = 12;
     
-    /* Skip rectangles (8 bytes each) */
-    offset += numRects * 8;
+    /* Parse clipping rectangles (8 bytes each: x, y, width, height as UINT16)
+     * Per MS-RDPEGFX 2.2.4.2, tiles should only update the screen within these rects.
+     * This prevents Progressive from overwriting ClearCodec content outside the region. */
+    ctx->numClipRects = (numRects <= 256) ? numRects : 256;
+    for (uint16_t i = 0; i < ctx->numClipRects; i++) {
+        if (offset + 8 > size) {
+            ctx->numClipRects = i;
+            break;
+        }
+        ctx->clipRects[i].x = read_u16_le(data + offset);
+        ctx->clipRects[i].y = read_u16_le(data + offset + 2);
+        ctx->clipRects[i].width = read_u16_le(data + offset + 4);
+        ctx->clipRects[i].height = read_u16_le(data + offset + 6);
+        offset += 8;
+    }
+    /* Skip any remaining rectangles beyond our limit */
+    if (numRects > 256) {
+        offset += (numRects - 256) * 8;
+    }
     if (size < offset) return -1;
+    
+    /* Memory barrier to ensure clipRects are visible to worker threads
+     * This is critical for parallel decoding with SharedArrayBuffer */
+    __sync_synchronize();
     
     /* Parse quantization values (must be done in main thread) */
     int quantBytes = parse_quant_vals(data + offset, size - offset, ctx->quantVals, numQuant);
@@ -1560,6 +1802,7 @@ int prog_decompress_parallel(ProgressiveContext* ctx, const uint8_t* srcData,
     
     /* Reset updated tile tracking for new frame */
     ctx->numUpdatedTiles = 0;
+    ctx->perTileClipRectsTotal = 0;
     
     while (offset + 6 <= srcSize) {
         uint16_t blockType = read_u16_le(srcData + offset);
@@ -1635,6 +1878,9 @@ int prog_decompress_parallel(ProgressiveContext* ctx, const uint8_t* srcData,
             case PROGRESSIVE_WBT_REGION:
                 /* Parse region and submit tiles for parallel decoding */
                 decode_region_parallel(ctx, surface, blockData, blockDataSize);
+                /* Wait for this region's tiles to complete BEFORE parsing next region,
+                 * because clipRects are stored in ctx and would be overwritten */
+                wait_for_tiles();
                 break;
         }
         

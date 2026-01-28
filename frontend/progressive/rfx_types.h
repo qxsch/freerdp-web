@@ -178,6 +178,19 @@ typedef struct {
     uint32_t numUpdatedTiles;
     uint32_t updatedTileIndices[RFX_MAX_TILES_PER_SURFACE];
     
+    /* Per-tile clipRect tracking - stores clipRects active when each tile was decoded
+     * This is necessary because multiple regions per frame can have different clipRects */
+    uint16_t tileClipRectStart[RFX_MAX_TILES_PER_SURFACE];  /* Start index in perTileClipRects */
+    uint16_t tileClipRectCount[RFX_MAX_TILES_PER_SURFACE];  /* Count of clipRects for this tile */
+    RfxRect perTileClipRects[RFX_MAX_TILES_PER_SURFACE * 8]; /* Buffer for all tile clipRects (8 per tile max) */
+    uint32_t perTileClipRectsTotal;  /* Total clipRects stored in buffer */
+    
+    /* Clipping rectangles for current region (per MS-RDPEGFX 2.2.4.2)
+     * Tiles are only rendered if they intersect with at least one clip rect.
+     * This prevents Progressive from overwriting ClearCodec content. */
+    RfxRect clipRects[256];
+    uint16_t numClipRects;
+    
     /* Temporary decode buffers */
     int16_t* yBuffer;   /* 64*64 */
     int16_t* cbBuffer;  /* 64*64 */
