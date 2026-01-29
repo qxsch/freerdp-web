@@ -33,6 +33,11 @@ import { Magic, matchMagic, parsePointerPosition, parsePointerSystem, parsePoint
 import { RDPSecurityPolicy } from './rdp-security.js';
 
 // ============================================================
+// BASE URL - Compute the directory containing this script for dynamic resource loading
+// ============================================================
+const RDP_CLIENT_BASE_URL = new URL('./', import.meta.url).href;
+
+// ============================================================
 // STYLES - Shadow DOM isolated styles (uses CSS custom properties for theming)
 // ============================================================
 const STYLES = `
@@ -1328,7 +1333,7 @@ export class RDPClient {
         }
         
         try {
-            this._gfxWorker = new Worker('./gfx-worker.js', { type: 'module' });
+            this._gfxWorker = new Worker(RDP_CLIENT_BASE_URL + 'gfx-worker.js', { type: 'module' });
             
             this._gfxWorker.onmessage = (event) => {
                 this._handleGfxWorkerMessage(event.data);
@@ -2457,7 +2462,7 @@ export class RDPClient {
             }
             
             // Load the AudioWorklet module
-            await this._audioContext.audioWorklet.addModule('audio-worklet.js');
+            await this._audioContext.audioWorklet.addModule(RDP_CLIENT_BASE_URL + 'audio-worklet.js');
             
             // Create SharedArrayBuffer for ring buffer
             // Layout: [writeIndex(4), readIndex(4), bufferSize(4), channels(4), audioData...]
